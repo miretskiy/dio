@@ -353,4 +353,4 @@ TMPDIR=/instance_storage go test ./... -v
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE).
