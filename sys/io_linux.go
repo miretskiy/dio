@@ -3,8 +3,10 @@
 package sys
 
 import (
+	"errors"
 	"os"
 	"runtime"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 
@@ -115,14 +117,29 @@ func Fadvise(f *os.File, offset Offset_t, length int64, hint FadviseHint) error 
 
 // CreateDirect creates path for writing. Always uses O_CREATE|O_WRONLY|O_TRUNC.
 // Pass [FlDirectIO] to add O_DIRECT; [FlDSync] / [FlSync] to add O_DSYNC / O_SYNC.
+// Falls back to buffered I/O if the filesystem rejects O_DIRECT.
 func CreateDirect(path string, flags OpenFlag) (*os.File, error) {
-	osFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC | flags.OpenFlags()
-	return os.OpenFile(path, osFlags, 0644)
+	return openDirect(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, flags)
 }
 
 // OpenDirect opens an existing file for reading with optional O_DIRECT.
+// Falls back to buffered I/O if the filesystem rejects O_DIRECT.
 func OpenDirect(path string, flags OpenFlag) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|flags.OpenFlags(), 0)
+	return openDirect(path, os.O_RDONLY, flags)
+}
+
+// openDirect opens path with baseFlags|flags.OpenFlags(), falling back to
+// baseFlags|(flags&^FlDirectIO).OpenFlags() on EINVAL/EOPNOTSUPP.
+func openDirect(path string, baseFlags int, flags OpenFlag) (*os.File, error) {
+	f, err := os.OpenFile(path, baseFlags|flags.OpenFlags(), 0644)
+	if err == nil || flags&FlDirectIO == 0 {
+		return f, err
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && (errno == syscall.EINVAL || errno == syscall.EOPNOTSUPP) {
+		return os.OpenFile(path, baseFlags|(flags&^FlDirectIO).OpenFlags(), 0644)
+	}
+	return nil, err
 }
 
 // CopyFileRange copies length bytes from srcFile at *srcOff to dstFile at
