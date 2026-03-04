@@ -88,6 +88,24 @@ func SyncFile(f *os.File, flags OpenFlag) error {
 	return nil
 }
 
+// Ftruncate sets the logical size of f to size bytes, releasing any extents
+// beyond that point back to the filesystem without moving the file position.
+//
+// The canonical use case is snapping an O_DIRECT file back to its true size
+// after the tail-padding trick: the last chunk is written block-aligned
+// (padded with zeros to the next 4 KiB boundary), and Ftruncate then sets
+// the logical EOF to the actual byte count, discarding the padding.
+//
+// Prefer this over syscall.Ftruncate(int(f.Fd()), size) directly. When the
+// caller has extracted a raw fd via f.Fd() for use with iosched.WriteAt, the
+// GC may finalise f — closing the file descriptor — before the call site if
+// nothing explicitly references f after f.Fd(). os.File.Truncate is a method
+// call on f, so the compiler guarantees f is live until Truncate returns;
+// no runtime.KeepAlive bookkeeping is required at the call site.
+func Ftruncate(f *os.File, size int64) error {
+	return f.Truncate(size)
+}
+
 // CreateAndAllocate creates path with flags and reserves allocSize bytes via Fallocate.
 func CreateAndAllocate(path string, flags OpenFlag, allocSize int64) (*os.File, error) {
 	f, err := CreateDirect(path, flags)
