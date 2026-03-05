@@ -19,6 +19,8 @@
 package mempool
 
 import (
+	"log/slog"
+	"time"
 	"fmt"
 	"sync/atomic"
 
@@ -95,6 +97,10 @@ func (b *MmapBuffer) Bytes() []byte { return b.raw }
 // Cap returns the size of the underlying allocation in bytes.
 func (b *MmapBuffer) Cap() int { return len(b.raw) }
 
+// IsPooled reports whether the buffer was acquired from a pool (true) or
+// allocated as a standalone one-off buffer via [NewMmapBuffer] (false).
+func (b *MmapBuffer) IsPooled() bool { return b.pool != nil }
+
 // AlignedBytes returns the smallest [align.BlockSize]-aligned prefix covering
 // off bytes of valid data: raw[:align.PageAlign(off)].
 // Returns nil for off ≤ 0.
@@ -165,6 +171,7 @@ type MmapPool struct {
 	poolSize    int64
 	name        string
 	outstanding atomic.Int64
+	slowWarn    time.Duration // 0 = disabled
 }
 
 // NewMmapPool creates a pool of capacity page-aligned buffers, each of
@@ -184,17 +191,62 @@ func NewMmapPool(name string, bufferSize int64, capacity int) *MmapPool {
 	return p
 }
 
+// SetSlowAcquireWarning enables a diagnostic log when Acquire blocks for
+// longer than d. Each time the threshold is crossed, a slog.Warn message is
+// emitted with the pool name and outstanding count, then Acquire resumes
+// waiting. Pass d=0 to disable (the default).
+//
+// This is invaluable for detecting an undersized pool in production: if
+// Acquire regularly blocks, the pool capacity or buffer size needs tuning.
+func (p *MmapPool) SetSlowAcquireWarning(d time.Duration) {
+	p.slowWarn = d
+}
+
 // Acquire blocks until a buffer is available and returns it with refCount=1.
 // The returned *MmapBuffer must eventually be released via [MmapBuffer.Unpin].
 //
 // Acquire panics if called on a closed pool.
+// If [SetSlowAcquireWarning] has been called, a warning is logged each time
+// the pool stays empty for longer than the configured duration.
 func (p *MmapPool) Acquire() *MmapBuffer {
-	raw := <-p.buffers // blocks until available; returns nil if pool is closed
-	if raw == nil {
-		panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
+	if p.slowWarn == 0 {
+		raw := <-p.buffers
+		if raw == nil {
+			panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
+		}
+		p.outstanding.Add(1)
+		return p.wrap(raw)
 	}
-	p.outstanding.Add(1)
-	return p.wrap(raw)
+	for {
+		select {
+		case raw := <-p.buffers:
+			if raw == nil {
+				panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
+			}
+			p.outstanding.Add(1)
+			return p.wrap(raw)
+		case <-time.After(p.slowWarn):
+			slog.Warn("mempool: Acquire blocked",
+				"pool", p.name,
+				"outstanding", p.outstanding.Load(),
+				"capacity", cap(p.buffers),
+				"threshold", p.slowWarn,
+			)
+		}
+	}
+}
+
+// AcquireAligned returns a buffer large enough to hold at least size bytes.
+// If size fits within the pool's slab size, a pooled buffer is returned.
+// Otherwise an unpooled [NewMmapBuffer] is allocated and returned directly.
+//
+// Use this when the required size varies and may occasionally exceed the
+// pool's standard slab (e.g. writing an oversized record).
+func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
+	if size <= p.poolSize {
+		return p.Acquire()
+	}
+	return NewMmapBuffer(size)
 }
 
 // TryAcquire returns a buffer immediately if one is available, or (nil, false)
