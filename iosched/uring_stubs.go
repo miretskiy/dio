@@ -14,18 +14,16 @@ func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
 }
 
 // URingScheduler is declared here so that code referencing the type compiles
-// on non-Linux. The struct is intentionally empty and unexported-inaccessible
-// since NewURingScheduler always errors.
+// on non-Linux. The struct is intentionally empty; NewURingScheduler always
+// errors.
 type URingScheduler struct{}
 
-func (s *URingScheduler) ReadAt(_ int, _ []byte, _ int64) (int, error) {
+func (s *URingScheduler) Submit(_ []Op) (Ticket, error) {
 	return 0, errors.New("iosched: io_uring requires Linux")
 }
 
-func (s *URingScheduler) WriteAt(_ int, _ []byte, _ int64) (int, error) {
+func (s *URingScheduler) Wait(_ Ticket, _ []Result) (int, error) {
 	return 0, errors.New("iosched: io_uring requires Linux")
 }
-
-func (s *URingScheduler) Stats() Stats { return Stats{} }
 
 func (s *URingScheduler) Close() error { return nil }

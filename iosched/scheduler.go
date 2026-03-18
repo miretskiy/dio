@@ -1,38 +1,56 @@
 // Package iosched provides pluggable I/O scheduling for positioned reads and writes.
 //
-// Two implementations are provided:
-//   - [PwriteScheduler]: synchronous pread/pwrite, zero overhead (default).
-//   - [URingScheduler]: asynchronous io_uring with sliding-window batching
-//     and optional SQPOLL (Linux only).
+// # Architecture
 //
-// Use [IOUringAvailable] to probe kernel support at runtime, then pick the
-// best available backend with [NewDefaultScheduler].
+// The primary user-facing type is [BlockingIO], which provides synchronous
+// ReadAt/WriteAt/Fsync methods on every platform. When io_uring is available
+// (Linux), it wraps a [URingScheduler] and routes each call through the async
+// Submit/Wait path. When io_uring is unavailable, it invokes POSIX syscalls
+// directly — no indirection, no group management.
+//
+// The [Scheduler] interface exposes the async Submit/Wait API for group-commit
+// scenarios: submit N writes from N goroutines, then Wait on all tickets. The
+// [URingScheduler] batches all enqueued SQEs into a single io_uring_enter.
+// Only [URingScheduler] implements Scheduler; it is Linux-only.
+//
+// Use [NewDefaultIO] to get the best available implementation for the host.
 package iosched
 
 import (
+	"errors"
 	"io"
-	"sync"
-	"time"
-
-	"github.com/HdrHistogram/hdrhistogram-go"
 )
 
-// IOScheduler abstracts positioned reads and writes for pluggable I/O backends.
+// Scheduler is the async I/O submission interface.
+//
+// Callers build [Op] values, call Submit, and call Wait to collect results.
+// Ops with [Op.Linked] or [Op.HardLinked] form SQE chains executed in order
+// by the kernel. Independent ops may complete in any order.
+//
+// Each [Ticket] must be passed to Wait exactly once; a second call returns
+// [ErrTicketConsumed].
+//
+// Buffers referenced by Ops must remain valid until the corresponding Wait
+// returns.
 //
 // Implementations must be safe for concurrent use by multiple goroutines.
-// Buffers passed to ReadAt/WriteAt must remain valid until the call returns.
-type IOScheduler interface {
-	// ReadAt performs a positioned read of len(buf) bytes from fd at offset.
-	ReadAt(fd int, buf []byte, offset int64) (int, error)
+type Scheduler interface {
+	// Submit enqueues ops and returns a completion Ticket. Does not block on
+	// I/O completion.
+	Submit(ops []Op) (Ticket, error)
 
-	// WriteAt performs a positioned write of len(buf) bytes to fd at offset.
-	WriteAt(fd int, buf []byte, offset int64) (int, error)
-
-	// Stats returns a snapshot of scheduler statistics.
-	Stats() Stats
+	// Wait blocks until all ops for the ticket complete, then writes results
+	// into the provided slice (len >= number of ops). Returns count written.
+	Wait(ticket Ticket, results []Result) (int, error)
 
 	io.Closer
 }
+
+// ErrTicketConsumed is returned by Wait when called more than once with the
+// same Ticket.
+var ErrTicketConsumed = errors.New("iosched: ticket already consumed")
+
+var errSchedulerClosed = errors.New("iosched: scheduler closed")
 
 // URingConfig configures the io_uring scheduler.
 type URingConfig struct {
@@ -46,70 +64,37 @@ type URingConfig struct {
 	SQPOLL bool
 }
 
-// Stats reports I/O scheduler statistics.
-type Stats struct {
-	// ReadLatency is a snapshot of read latency distribution (nanoseconds).
-	// May be nil if the scheduler was not constructed via its constructor.
-	ReadLatency *hdrhistogram.Histogram
-
-	// WriteLatency is a snapshot of write latency distribution (nanoseconds).
-	WriteLatency *hdrhistogram.Histogram
-
-	// Batching stats (non-zero for URingScheduler only).
-	Batches  int64   // number of SubmitAndWait calls
-	Requests int64   // total requests submitted
-	MaxBatch int64   // largest single batch observed
-	AvgBatch float64 // average batch size
+// resultStore holds result slots for one Submit call.
+// Inline covers ≤4 ops (the common case) with no heap allocation.
+type resultStore struct {
+	nOps   uint16
+	inline [4]Result
+	extra  []Result // allocated lazily for >4 ops
 }
 
-// ioLatency tracks per-operation latency using a mutex-protected HDR histogram.
-// Embedded by both PwriteScheduler and URingScheduler; initialized by
-// initLatency. The mutex cost (~50 ns) is negligible relative to disk I/O.
-type ioLatency struct {
-	mu        sync.Mutex
-	readHist  *hdrhistogram.Histogram
-	writeHist *hdrhistogram.Histogram
-}
-
-func (l *ioLatency) initLatency() {
-	l.readHist = hdrhistogram.New(1_000, 10_000_000_000, 3)
-	l.writeHist = hdrhistogram.New(1_000, 10_000_000_000, 3)
-}
-
-func (l *ioLatency) readSnapshot() *hdrhistogram.Histogram {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.readHist == nil {
-		return nil
+func (r *resultStore) init(nOps int) {
+	r.nOps = uint16(nOps)
+	if nOps > len(r.inline) {
+		need := nOps - len(r.inline)
+		if cap(r.extra) >= need {
+			r.extra = r.extra[:need]
+		} else {
+			r.extra = make([]Result, need)
+		}
 	}
-	return hdrhistogram.Import(l.readHist.Export())
 }
 
-func (l *ioLatency) writeSnapshot() *hdrhistogram.Histogram {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.writeHist == nil {
-		return nil
+func (r *resultStore) at(i int) *Result {
+	if i < len(r.inline) {
+		return &r.inline[i]
 	}
-	return hdrhistogram.Import(l.writeHist.Export())
+	return &r.extra[i-len(r.inline)]
 }
 
-func (l *ioLatency) recordRead(start time.Time) {
-	if l.readHist == nil {
-		return
+func (r *resultStore) copyTo(dst []Result) int {
+	n := int(r.nOps)
+	for i := 0; i < n && i < len(dst); i++ {
+		dst[i] = *r.at(i)
 	}
-	ns := time.Since(start).Nanoseconds()
-	l.mu.Lock()
-	l.readHist.RecordValue(ns)
-	l.mu.Unlock()
-}
-
-func (l *ioLatency) recordWrite(start time.Time) {
-	if l.writeHist == nil {
-		return
-	}
-	ns := time.Since(start).Nanoseconds()
-	l.mu.Lock()
-	l.writeHist.RecordValue(ns)
-	l.mu.Unlock()
+	return min(n, len(dst))
 }

@@ -30,7 +30,13 @@ func newURingSched(t *testing.T, cfg ...iosched.URingConfig) *iosched.URingSched
 	return s
 }
 
-func writeUringTestFile(t *testing.T, size int) (string, []byte) {
+func newURingIO(t *testing.T) *iosched.BlockingIO {
+	t.Helper()
+	s := newURingSched(t)
+	return iosched.NewBlockingIO(s)
+}
+
+func writeUringFile(t *testing.T, size int) (string, []byte) {
 	t.Helper()
 	data := make([]byte, size)
 	_, err := rand.Read(data)
@@ -48,129 +54,183 @@ func openRW(t *testing.T, path string) *os.File {
 	return f
 }
 
-// ─── Availability probe ───────────────────────────────────────────────────────
+// ── Basic Submit/Wait ─────────────────────────────────────────────────────────
 
-func TestURingScheduler_Available(t *testing.T) {
-	if !iosched.IOUringAvailable {
-		t.Skip("io_uring not available on this kernel")
-	}
-}
-
-// ─── ReadAt ──────────────────────────────────────────────────────────────────
-
-func TestURingScheduler_ReadAt_Basic(t *testing.T) {
-	sched := newURingSched(t)
-	path, data := writeUringTestFile(t, 4096)
+func TestURing_Submit_Read(t *testing.T) {
+	s := newURingSched(t)
+	path, data := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
 	buf := make([]byte, 4096)
-	n, err := sched.ReadAt(int(f.Fd()), buf, 0)
+	ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, 0)})
 	require.NoError(t, err)
-	require.Equal(t, 4096, n)
+
+	var res [1]iosched.Result
+	n, err := s.Wait(ticket, res[:])
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.NoError(t, res[0].Err)
+	require.Equal(t, 4096, res[0].N)
 	require.Equal(t, data, buf)
 }
 
-func TestURingScheduler_ReadAt_Offset(t *testing.T) {
-	sched := newURingSched(t)
-	path, data := writeUringTestFile(t, 8192)
-	f := openRW(t, path)
-
-	buf := make([]byte, 1024)
-	n, err := sched.ReadAt(int(f.Fd()), buf, 4096)
-	require.NoError(t, err)
-	require.Equal(t, 1024, n)
-	require.Equal(t, data[4096:4096+1024], buf)
-}
-
-func TestURingScheduler_ReadAt_EmptyBuf(t *testing.T) {
-	sched := newURingSched(t)
-	n, err := sched.ReadAt(0, nil, 0)
-	require.NoError(t, err)
-	require.Equal(t, 0, n)
-}
-
-func TestURingScheduler_ReadAt_Large(t *testing.T) {
-	sched := newURingSched(t)
-	const size = 1 << 20 // 1 MiB
-	path, data := writeUringTestFile(t, size)
-	f := openRW(t, path)
-
-	buf := make([]byte, size)
-	n, err := sched.ReadAt(int(f.Fd()), buf, 0)
-	require.NoError(t, err)
-	require.Equal(t, size, n)
-	require.Equal(t, data, buf)
-}
-
-// ─── WriteAt ─────────────────────────────────────────────────────────────────
-
-func TestURingScheduler_WriteAt_Basic(t *testing.T) {
-	sched := newURingSched(t)
-	path := filepath.Join(t.TempDir(), "uring-write.dat")
+func TestURing_Submit_Write(t *testing.T) {
+	s := newURingSched(t)
+	path := filepath.Join(t.TempDir(), "write.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0644))
 	f := openRW(t, path)
 
 	payload := make([]byte, 4096)
 	_, _ = rand.Read(payload)
 
-	n, err := sched.WriteAt(int(f.Fd()), payload, 0)
+	ticket, err := s.Submit([]iosched.Op{iosched.WriteOp(f, payload, 0)})
+	require.NoError(t, err)
+
+	var res [1]iosched.Result
+	_, err = s.Wait(ticket, res[:])
+	require.NoError(t, err)
+	require.NoError(t, res[0].Err)
+	require.Equal(t, 4096, res[0].N)
+
+	got := make([]byte, 4096)
+	ticket2, err := s.Submit([]iosched.Op{iosched.ReadOp(f, got, 0)})
+	require.NoError(t, err)
+	_, err = s.Wait(ticket2, res[:])
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+// ── Group commit: submit multiple tickets, wait on all ────────────────────────
+
+func TestURing_GroupCommit(t *testing.T) {
+	const chunks = 16
+	s := newURingSched(t)
+
+	path := filepath.Join(t.TempDir(), "gc.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, chunks*4096), 0644))
+	f := openRW(t, path)
+
+	payloads := make([][]byte, chunks)
+	tickets := make([]iosched.Ticket, chunks)
+	for i := range chunks {
+		payloads[i] = make([]byte, 4096)
+		_, _ = rand.Read(payloads[i])
+		var err error
+		tickets[i], err = s.Submit([]iosched.Op{
+			iosched.WriteOp(f, payloads[i], int64(i*4096)),
+		})
+		require.NoError(t, err)
+	}
+
+	for i, ticket := range tickets {
+		var res [1]iosched.Result
+		_, err := s.Wait(ticket, res[:])
+		require.NoError(t, err, "chunk %d", i)
+		require.NoError(t, res[0].Err, "chunk %d", i)
+		require.Equal(t, 4096, res[0].N, "chunk %d", i)
+	}
+
+	// Verify all writes.
+	for i := range chunks {
+		buf := make([]byte, 4096)
+		ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, int64(i*4096))})
+		require.NoError(t, err)
+		var res [1]iosched.Result
+		_, err = s.Wait(ticket, res[:])
+		require.NoError(t, err)
+		require.Equal(t, payloads[i], buf, "mismatch at chunk %d", i)
+	}
+}
+
+// ── Linked ops: write then fdatasync ─────────────────────────────────────────
+
+func TestURing_LinkedOps_WriteFdatasync(t *testing.T) {
+	s := newURingSched(t)
+	path := filepath.Join(t.TempDir(), "linked.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0644))
+	f := openRW(t, path)
+
+	payload := make([]byte, 4096)
+	_, _ = rand.Read(payload)
+
+	ops := []iosched.Op{
+		iosched.WriteOp(f, payload, 0).Linked(),
+		iosched.FdatasyncOp(f),
+	}
+	ticket, err := s.Submit(ops)
+	require.NoError(t, err)
+
+	var res [2]iosched.Result
+	n, err := s.Wait(ticket, res[:])
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+	require.NoError(t, res[0].Err, "write result")
+	require.Equal(t, 4096, res[0].N)
+	require.NoError(t, res[1].Err, "fdatasync result")
+}
+
+// ── Double-Wait returns ErrTicketConsumed ─────────────────────────────────────
+
+func TestURing_DoubleWait(t *testing.T) {
+	s := newURingSched(t)
+	path, _ := writeUringFile(t, 4096)
+	f := openRW(t, path)
+
+	buf := make([]byte, 4096)
+	ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, 0)})
+	require.NoError(t, err)
+
+	var res [1]iosched.Result
+	_, err = s.Wait(ticket, res[:])
+	require.NoError(t, err)
+
+	_, err = s.Wait(ticket, res[:])
+	require.ErrorIs(t, err, iosched.ErrTicketConsumed)
+}
+
+// ── BlockingIO wrapping URingScheduler ────────────────────────────────────────
+
+func TestURing_BlockingIO_ReadAt(t *testing.T) {
+	bio := newURingIO(t)
+	path, data := writeUringFile(t, 4096)
+	f := openRW(t, path)
+
+	buf := make([]byte, 4096)
+	n, err := bio.ReadAt(f, buf, 0)
+	require.NoError(t, err)
+	require.Equal(t, 4096, n)
+	require.Equal(t, data, buf)
+}
+
+func TestURing_BlockingIO_WriteAt(t *testing.T) {
+	bio := newURingIO(t)
+	path := filepath.Join(t.TempDir(), "write.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0644))
+	f := openRW(t, path)
+
+	payload := make([]byte, 4096)
+	_, _ = rand.Read(payload)
+	n, err := bio.WriteAt(f, payload, 0)
 	require.NoError(t, err)
 	require.Equal(t, 4096, n)
 
 	got := make([]byte, 4096)
-	nn, err := sched.ReadAt(int(f.Fd()), got, 0)
+	_, err = bio.ReadAt(f, got, 0)
 	require.NoError(t, err)
-	require.Equal(t, 4096, nn)
 	require.Equal(t, payload, got)
 }
 
-func TestURingScheduler_WriteAt_EmptyBuf(t *testing.T) {
-	sched := newURingSched(t)
-	n, err := sched.WriteAt(0, nil, 0)
-	require.NoError(t, err)
-	require.Equal(t, 0, n)
-}
+// ── Concurrent Submit/Wait ────────────────────────────────────────────────────
 
-// ─── Round-trip ───────────────────────────────────────────────────────────────
-
-func TestURingScheduler_RoundTrip(t *testing.T) {
-	sched := newURingSched(t)
-	const fileSize = 1 << 20 // 1 MiB
-	path := filepath.Join(t.TempDir(), "uring-rt.dat")
-	require.NoError(t, os.WriteFile(path, make([]byte, fileSize), 0644))
-	f := openRW(t, path)
-
-	written := make([]byte, fileSize)
-	_, _ = rand.Read(written)
-
-	// Write in 4 KiB chunks.
-	for off := 0; off < fileSize; off += 4096 {
-		n, err := sched.WriteAt(int(f.Fd()), written[off:off+4096], int64(off))
-		require.NoError(t, err, "WriteAt offset %d", off)
-		require.Equal(t, 4096, n)
-	}
-
-	// Read back and verify.
-	for off := 0; off < fileSize; off += 4096 {
-		buf := make([]byte, 4096)
-		n, err := sched.ReadAt(int(f.Fd()), buf, int64(off))
-		require.NoError(t, err, "ReadAt offset %d", off)
-		require.Equal(t, 4096, n)
-		require.Equal(t, written[off:off+4096], buf, "mismatch at offset %d", off)
-	}
-}
-
-// ─── Concurrent ──────────────────────────────────────────────────────────────
-
-func TestURingScheduler_Concurrent(t *testing.T) {
+func TestURing_Concurrent(t *testing.T) {
 	const (
 		fileSize          = 1 << 20
 		goroutines        = 64
 		readsPerGoroutine = 50
 		readSize          = 4096
 	)
-	sched := newURingSched(t)
-	path, data := writeUringTestFile(t, fileSize)
+	s := newURingSched(t)
+	path, data := writeUringFile(t, fileSize)
 	f := openRW(t, path)
 
 	var wg sync.WaitGroup
@@ -183,13 +243,22 @@ func TestURingScheduler_Concurrent(t *testing.T) {
 			buf := make([]byte, readSize)
 			for i := 0; i < readsPerGoroutine; i++ {
 				offset := int64((i * readSize) % (fileSize - readSize))
-				n, err := sched.ReadAt(int(f.Fd()), buf, offset)
+				ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, offset)})
 				if err != nil {
-					errs <- fmt.Errorf("read at %d: %w", offset, err)
+					errs <- fmt.Errorf("submit at %d: %w", offset, err)
 					return
 				}
-				if n != readSize {
-					errs <- fmt.Errorf("short read at %d: %d", offset, n)
+				var res [1]iosched.Result
+				if _, err := s.Wait(ticket, res[:]); err != nil {
+					errs <- fmt.Errorf("wait at %d: %w", offset, err)
+					return
+				}
+				if res[0].Err != nil {
+					errs <- fmt.Errorf("read at %d: %w", offset, res[0].Err)
+					return
+				}
+				if res[0].N != readSize {
+					errs <- fmt.Errorf("short read at %d: %d", offset, res[0].N)
 					return
 				}
 				for j := range buf {
@@ -209,103 +278,56 @@ func TestURingScheduler_Concurrent(t *testing.T) {
 	}
 }
 
-// ─── Close behaviour ─────────────────────────────────────────────────────────
+// ── Close behaviour ───────────────────────────────────────────────────────────
 
-func TestURingScheduler_CloseThenRead(t *testing.T) {
-	if !iosched.IOUringAvailable {
-		t.Skip("io_uring not available")
-	}
+func TestURing_CloseThenSubmit(t *testing.T) {
 	s, err := iosched.NewURingScheduler(iosched.URingConfig{})
 	require.NoError(t, err)
-
 	require.NoError(t, s.Close())
 
-	path, _ := writeUringTestFile(t, 4096)
-	f, err := os.Open(path)
-	require.NoError(t, err)
-	defer f.Close()
+	path := filepath.Join(t.TempDir(), "dummy.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0644))
+	f := openRW(t, path)
 
-	_, err = s.ReadAt(int(f.Fd()), make([]byte, 4096), 0)
-	require.Error(t, err, "ReadAt after Close must return an error")
+	buf := make([]byte, 4096)
+	_, err = s.Submit([]iosched.Op{iosched.ReadOp(f, buf, 0)})
+	require.Error(t, err)
 }
 
-func TestURingScheduler_CloseThenWrite(t *testing.T) {
-	if !iosched.IOUringAvailable {
-		t.Skip("io_uring not available")
-	}
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{})
-	require.NoError(t, err)
+// ── SQPOLL ────────────────────────────────────────────────────────────────────
 
-	require.NoError(t, s.Close())
-
-	_, err = s.WriteAt(0, make([]byte, 4096), 0)
-	require.Error(t, err, "WriteAt after Close must return an error")
-}
-
-// ─── SQPOLL ──────────────────────────────────────────────────────────────────
-
-func TestURingScheduler_SQPOLL(t *testing.T) {
-	if !iosched.IOUringAvailable {
-		t.Skip("io_uring not available")
-	}
+func TestURing_SQPOLL(t *testing.T) {
 	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 64, SQPOLL: true})
 	if err != nil {
 		t.Skipf("SQPOLL not available (may require CAP_SYS_NICE): %v", err)
 	}
 	defer s.Close()
 
-	path, data := writeUringTestFile(t, 4096)
+	path, data := writeUringFile(t, 4096)
 	f, err := os.Open(path)
 	require.NoError(t, err)
 	defer f.Close()
 
 	buf := make([]byte, 4096)
-	n, err := s.ReadAt(int(f.Fd()), buf, 0)
+	ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, 0)})
 	require.NoError(t, err)
-	require.Equal(t, 4096, n)
+
+	var res [1]iosched.Result
+	_, err = s.Wait(ticket, res[:])
+	require.NoError(t, err)
+	require.NoError(t, res[0].Err)
 	require.Equal(t, data, buf)
 }
 
-// ─── Interface compliance ─────────────────────────────────────────────────────
+// ── DefaultIO uses URingScheduler on Linux ────────────────────────────────────
 
-func TestURingScheduler_ImplementsInterface(t *testing.T) {
+func TestNewDefaultIO_UsesURing(t *testing.T) {
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{})
-	require.NoError(t, err)
-	defer s.Close()
-	var _ iosched.IOScheduler = s
-}
-
-// ─── Stats ────────────────────────────────────────────────────────────────────
-
-func TestURingScheduler_Stats(t *testing.T) {
-	sched := newURingSched(t)
-	path, _ := writeUringTestFile(t, 4096)
-	f := openRW(t, path)
-
-	buf := make([]byte, 4096)
-	_, err := sched.ReadAt(int(f.Fd()), buf, 0)
-	require.NoError(t, err)
-
-	stats := sched.Stats()
-	require.NotNil(t, stats.ReadLatency)
-	require.Equal(t, int64(1), stats.ReadLatency.TotalCount())
-	require.Equal(t, int64(1), stats.Requests)
-	require.Equal(t, int64(1), stats.Batches)
-}
-
-// ─── DefaultScheduler picks io_uring on Linux ─────────────────────────────────
-
-func TestNewDefaultScheduler_UsesURing(t *testing.T) {
-	if !iosched.IOUringAvailable {
-		t.Skip("io_uring not available")
-	}
-	sched, err := iosched.NewDefaultScheduler()
-	require.NoError(t, err)
-	defer sched.Close()
-
-	_, ok := sched.(*iosched.URingScheduler)
-	require.True(t, ok, "NewDefaultScheduler should return *URingScheduler when io_uring is available")
+	bio := iosched.NewDefaultIO()
+	defer bio.Close()
+	require.NotNil(t, bio.S)
+	_, ok := bio.S.(*iosched.URingScheduler)
+	require.True(t, ok)
 }

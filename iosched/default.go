@@ -1,15 +1,18 @@
 package iosched
 
-// NewDefaultScheduler returns the best available IOScheduler for the host.
+// NewDefaultIO returns a [BlockingIO] backed by the best available scheduler
+// for the host.
 //
-// On Linux with io_uring support: returns a [URingScheduler] with default config.
-// Otherwise: returns a [PwriteScheduler].
+// On Linux with io_uring support: wraps a [URingScheduler] with default config.
+// Otherwise: wraps nil, using direct POSIX syscalls.
 //
-// Callers that need more control (SQPOLL, custom ring depth) should construct
-// the scheduler directly.
-func NewDefaultScheduler() (IOScheduler, error) {
+// Callers that need more control (SQPOLL, custom ring depth, or direct access
+// to the async Submit/Wait API) should construct [URingScheduler] directly.
+func NewDefaultIO() *BlockingIO {
 	if IOUringAvailable {
-		return NewURingScheduler(URingConfig{})
+		if s, err := NewURingScheduler(URingConfig{}); err == nil {
+			return NewBlockingIO(s)
+		}
 	}
-	return NewPwriteScheduler()
+	return NewBlockingIO(nil)
 }
