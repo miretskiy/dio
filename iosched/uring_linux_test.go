@@ -12,7 +12,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/mempool"
 )
 
 func newURingSched(t *testing.T, cfg ...iosched.URingConfig) *iosched.URingScheduler {
@@ -236,12 +238,10 @@ func TestURing_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, goroutines)
 
-	for g := 0; g < goroutines; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range goroutines {
+		wg.Go(func() {
 			buf := make([]byte, readSize)
-			for i := 0; i < readsPerGoroutine; i++ {
+			for i := range readsPerGoroutine {
 				offset := int64((i * readSize) % (fileSize - readSize))
 				ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, offset)})
 				if err != nil {
@@ -268,7 +268,7 @@ func TestURing_Concurrent(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -317,6 +317,141 @@ func TestURing_SQPOLL(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, res[0].Err)
 	require.Equal(t, data, buf)
+}
+
+// ── RegisterDMASlab / fixed-buffer ops ───────────────────────────────────────
+
+// newSlabPool creates a test SlabPool (2 MiB / 4 KiB slots) and registers it
+// with the scheduler. The pool is closed in t.Cleanup after the scheduler.
+func newRegisteredPool(t *testing.T, s *iosched.URingScheduler) *mempool.SlabPool {
+	t.Helper()
+	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	require.NoError(t, err)
+
+	require.NoError(t, iosched.RegisterDMASlab(s, pool))
+	t.Cleanup(func() { pool.Close() }) // pool must outlive the scheduler
+	return pool
+}
+
+func TestURing_RegisterDMASlab(t *testing.T) {
+	s := newURingSched(t)
+	pool := newRegisteredPool(t, s)
+	require.Equal(t, align.BlockSize, pool.SlotSize())
+	require.Greater(t, pool.NumSlots(), 0)
+}
+
+func TestURing_FixedOp_WriteRead(t *testing.T) {
+	s := newURingSched(t)
+	pool := newRegisteredPool(t, s)
+
+	path := filepath.Join(t.TempDir(), "fixed.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
+	f := openRW(t, path)
+
+	payload := make([]byte, align.BlockSize)
+	_, _ = rand.Read(payload)
+
+	// Write via fixed buffer.
+	wslot, err := pool.Acquire()
+	require.NoError(t, err)
+	copy(wslot.Data, payload)
+
+	ticket, err := s.Submit([]iosched.Op{iosched.WriteFixedOp(f, wslot, 0)})
+	require.NoError(t, err)
+
+	var res [1]iosched.Result
+	_, err = s.Wait(ticket, res[:])
+	require.NoError(t, err)
+	require.NoError(t, res[0].Err)
+	require.Equal(t, align.BlockSize, res[0].N)
+	wslot.Release()
+
+	// Read back via fixed buffer.
+	rslot, err := pool.Acquire()
+	require.NoError(t, err)
+
+	ticket, err = s.Submit([]iosched.Op{iosched.ReadFixedOp(f, rslot, 0)})
+	require.NoError(t, err)
+
+	_, err = s.Wait(ticket, res[:])
+	require.NoError(t, err)
+	require.NoError(t, res[0].Err)
+	require.Equal(t, align.BlockSize, res[0].N)
+	require.Equal(t, payload, rslot.Data)
+	rslot.Release()
+}
+
+func TestURing_FixedOp_MultipleSlots(t *testing.T) {
+	const chunks = 8
+	s := newURingSched(t)
+	pool := newRegisteredPool(t, s)
+
+	path := filepath.Join(t.TempDir(), "fixed_multi.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, chunks*align.BlockSize), 0644))
+	f := openRW(t, path)
+
+	payloads := make([][]byte, chunks)
+	slots := make([]mempool.Slot, chunks)
+	tickets := make([]iosched.Ticket, chunks)
+
+	// Submit all writes concurrently.
+	for i := range chunks {
+		payloads[i] = make([]byte, align.BlockSize)
+		_, _ = rand.Read(payloads[i])
+
+		slots[i], _ = pool.Acquire()
+		copy(slots[i].Data, payloads[i])
+
+		var err error
+		tickets[i], err = s.Submit([]iosched.Op{
+			iosched.WriteFixedOp(f, slots[i], int64(i*align.BlockSize)),
+		})
+		require.NoError(t, err)
+	}
+
+	var res [1]iosched.Result
+	for i, ticket := range tickets {
+		_, err := s.Wait(ticket, res[:])
+		require.NoError(t, err)
+		require.NoError(t, res[0].Err, "chunk %d write failed", i)
+		slots[i].Release()
+	}
+
+	// Verify on-disk content with normal reads.
+	for i := range chunks {
+		buf := make([]byte, align.BlockSize)
+		ticket, err := s.Submit([]iosched.Op{iosched.ReadOp(f, buf, int64(i*align.BlockSize))})
+		require.NoError(t, err)
+		_, err = s.Wait(ticket, res[:])
+		require.NoError(t, err)
+		require.Equal(t, payloads[i], buf, "mismatch at chunk %d", i)
+	}
+}
+
+func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
+	s := newURingSched(t)
+
+	// Construct a slot from an unregistered pool — kernel has no pinned buffer.
+	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	path := filepath.Join(t.TempDir(), "noreg.dat")
+	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
+	f := openRW(t, path)
+
+	slot, err := pool.Acquire()
+	require.NoError(t, err)
+	defer slot.Release()
+
+	ticket, err := s.Submit([]iosched.Op{iosched.WriteFixedOp(f, slot, 0)})
+	require.NoError(t, err) // submit succeeds; error surfaces at completion
+
+	var res [1]iosched.Result
+	_, err = s.Wait(ticket, res[:])
+	require.NoError(t, err)         // Wait itself succeeds
+	require.Error(t, res[0].Err)    // but the op failed
+	t.Logf("kernel error for unregistered fixed op: %v", res[0].Err)
 }
 
 // ── DefaultIO uses URingScheduler on Linux ────────────────────────────────────

@@ -31,11 +31,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func mmap(addr uintptr, length uintptr, prot int, flags int, fd int, offset int64) (xaddr uintptr, err error) {
-	ptr, err := unix.MmapPtr(fd, offset, unsafe.Pointer(addr), length, prot, flags)
-	return uintptr(ptr), err
+// mmap wraps unix.MmapPtr with no address hint (addr=0). All io_uring
+// mappings use kernel-chosen addresses; the hint parameter from POSIX mmap
+// is never needed here.
+func mmap(length uintptr, prot int, flags int, fd int, offset int64) (unsafe.Pointer, error) {
+	return unix.MmapPtr(fd, offset, nil, length, prot, flags)
 }
 
-func munmap(addr uintptr, length uintptr) (err error) {
-	return unix.MunmapPtr(unsafe.Pointer(addr), length)
+func munmap(ptr unsafe.Pointer, length uintptr) error {
+	return unix.MunmapPtr(ptr, length)
 }

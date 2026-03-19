@@ -53,7 +53,7 @@ type testScenario struct {
 	debug    bool
 }
 
-type testContext map[string]interface{}
+type testContext map[string]any
 
 func testNewFramework(t *testing.T, params ringInitParams, scenario testScenario) {
 	ring := NewRing()
@@ -69,7 +69,7 @@ func testNewFramework(t *testing.T, params ringInitParams, scenario testScenario
 
 	defer ring.QueueExit()
 
-	context := make(map[string]interface{})
+	context := make(map[string]any)
 	if scenario.setup != nil {
 		scenario.setup(context)
 	}

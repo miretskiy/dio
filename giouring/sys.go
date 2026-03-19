@@ -31,14 +31,12 @@ import (
 	"unsafe"
 )
 
-func sysMmap(addr, length uintptr, prot, flags, fd int, offset int64) (unsafe.Pointer, error) {
-	ptr, err := mmap(addr, length, prot, flags, fd, offset)
-
-	return unsafe.Pointer(ptr), err
+func sysMmap(length uintptr, prot, flags, fd int, offset int64) (unsafe.Pointer, error) {
+	return mmap(length, prot, flags, fd, offset)
 }
 
-func sysMunmap(addr, length uintptr) error {
-	return munmap(addr, length)
+func sysMunmap(ptr unsafe.Pointer, length uintptr) error {
+	return munmap(ptr, length)
 }
 
 func sysMadvise(address, length, advice uintptr) error {

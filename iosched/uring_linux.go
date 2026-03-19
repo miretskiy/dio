@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/miretskiy/dio/giouring"
+	"github.com/miretskiy/dio/mempool"
 )
 
 // IOUringAvailable reports whether io_uring is supported on the running kernel.
@@ -114,20 +115,49 @@ type URingScheduler struct {
 	fatalErr atomic.Pointer[error]
 
 	wg sync.WaitGroup
+
+	// ring and depth are set in NewURingScheduler before the loop goroutine
+	// starts, so they are safe to read from any goroutine without locks.
+	ring  *giouring.Ring
+	depth uint32
+}
+
+// usePool implements the unexported pooler interface defined in scheduler.go.
+// Calls io_uring_register_buffers; safe from any goroutine because ring.ringFd
+// is immutable after QueueInit and io_uring_register does not race with
+// io_uring_enter in the kernel.
+func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
+	data := pool.RawData()
+	iovs := []syscall.Iovec{{Base: &data[0], Len: uint64(len(data))}}
+	if _, err := s.ring.RegisterBuffers(iovs); err != nil {
+		return fmt.Errorf("iosched: io_uring_register_buffers: %w", err)
+	}
+	return nil
 }
 
 // NewURingScheduler creates an io_uring-backed scheduler.
+// The ring is initialised here before the event-loop goroutine starts,
+// so callers can call RegisterDMASlab immediately after construction.
 func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 	if !IOUringAvailable {
 		return nil, errors.New("iosched: io_uring not available on this kernel")
 	}
 
-	depth := cfg.RingDepth
-	if depth < defaultRingDepth {
-		depth = defaultRingDepth
+	depth := max(cfg.RingDepth, defaultRingDepth)
+
+	var flags uint32
+	if cfg.SQPOLL {
+		flags |= giouring.SetupSQPoll
+	}
+
+	ring := giouring.NewRing()
+	if err := ring.QueueInit(depth, flags); err != nil {
+		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
 	}
 
 	s := &URingScheduler{
+		ring:      ring,
+		depth:     depth,
 		groups:    make([]uringGroup, depth),
 		groupSlab: newIndexSlab(int(depth)),
 		signal:    make(chan *submissionMsg, 1),
@@ -138,13 +168,8 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 	}
 	s.msgPool.New = func() any { return &submissionMsg{} }
 
-	readyCh := make(chan error, 1)
 	s.wg.Add(1)
-	go s.loop(depth, cfg.SQPOLL, readyCh)
-
-	if err := <-readyCh; err != nil {
-		return nil, err
-	}
+	go s.loop()
 	return s, nil
 }
 
@@ -272,33 +297,20 @@ type coordinator struct {
 	nSubmitted int // SQEs prepared since last SubmitAndWait
 }
 
-func (s *URingScheduler) loop(depth uint32, sqpoll bool, readyCh chan<- error) {
+func (s *URingScheduler) loop() {
 	defer s.wg.Done()
-
-	var flags uint32
-	if sqpoll {
-		flags |= giouring.SetupSQPoll
-	}
-
-	ring := giouring.NewRing()
-	if err := ring.QueueInit(depth, flags); err != nil {
-		readyCh <- fmt.Errorf("iosched: io_uring_setup: %w", err)
-		return
-	}
-	defer ring.QueueExit()
+	defer s.ring.QueueExit()
 
 	c := coordinator{
 		sched:     s,
-		ring:      ring,
-		inflight:  make([]inflightEntry, depth),
-		freeSlots: make([]int, depth),
-		batch:     make([]*submissionMsg, 0, depth),
+		ring:      s.ring,
+		inflight:  make([]inflightEntry, s.depth),
+		freeSlots: make([]int, s.depth),
+		batch:     make([]*submissionMsg, 0, s.depth),
 	}
-	for i := range depth {
+	for i := range s.depth {
 		c.freeSlots[i] = int(i)
 	}
-
-	readyCh <- nil
 	defer c.drainAll()
 
 	for {
@@ -433,12 +445,18 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op Op) {
 		sqe.PrepareRead(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset))
 	case OpWrite:
 		sqe.PrepareWrite(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset))
+	case OpReadFixed:
+		sqe.PrepareReadFixed(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset), 0)
+	case OpWriteFixed:
+		sqe.PrepareWriteFixed(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset), 0)
 	case OpFsync:
 		sqe.PrepareFsync(fd, 0)
 	case OpFdatasync:
 		sqe.PrepareFsync(fd, giouring.FsyncDatasync)
 	case OpFallocate:
 		sqe.PrepareFallocate(fd, int(op.opFlags), uint64(op.offset), uint64(op.length))
+	default:
+		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
 	}
 	// Propagate SQE linking flags.
 	if op.sqeFlags&sqeLink != 0 {

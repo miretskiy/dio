@@ -2,7 +2,11 @@
 
 package iosched
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/miretskiy/dio/mempool"
+)
 
 // IOUringAvailable reports whether io_uring is supported.
 // Always false on non-Linux platforms.
@@ -27,3 +31,7 @@ func (s *URingScheduler) Wait(_ Ticket, _ []Result) (int, error) {
 }
 
 func (s *URingScheduler) Close() error { return nil }
+
+func (s *URingScheduler) usePool(_ *mempool.SlabPool) error {
+	return errors.New("iosched: io_uring requires Linux")
+}

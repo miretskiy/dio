@@ -19,6 +19,8 @@ package iosched
 import (
 	"errors"
 	"io"
+
+	"github.com/miretskiy/dio/mempool"
 )
 
 // Scheduler is the async I/O submission interface.
@@ -49,6 +51,30 @@ type Scheduler interface {
 // ErrTicketConsumed is returned by Wait when called more than once with the
 // same Ticket.
 var ErrTicketConsumed = errors.New("iosched: ticket already consumed")
+
+// pooler is implemented by schedulers that support pre-registered DMA buffers.
+type pooler interface {
+	usePool(*mempool.SlabPool) error
+}
+
+// RegisterDMASlab registers pool as a fixed buffer with scheduler s via
+// io_uring_register_buffers. The kernel pins the buffer for the ring lifetime,
+// eliminating per-I/O DMA setup overhead for [ReadFixedOp] / [WriteFixedOp].
+//
+// Must be called after [NewURingScheduler] and before any fixed-buffer ops are
+// submitted. Calling it more than once replaces the previous registration.
+//
+// pool must outlive s — call pool.Close() only after s.Close() returns.
+//
+// If s does not support registered buffers, RegisterDMASlab is a silent no-op.
+// Registered buffers are an optional performance optimisation, not required
+// for correctness.
+func RegisterDMASlab(s Scheduler, pool *mempool.SlabPool) error {
+	if p, ok := s.(pooler); ok {
+		return p.usePool(pool)
+	}
+	return nil // scheduler doesn't support fixed buffers; silently skip
+}
 
 var errSchedulerClosed = errors.New("iosched: scheduler closed")
 

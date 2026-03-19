@@ -20,7 +20,6 @@ package sys
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"syscall"
@@ -158,8 +157,7 @@ func IsTransientIOError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
 		switch errno {
 		case syscall.EINTR,
 			syscall.EAGAIN,
@@ -177,15 +175,3 @@ func IsTransientIOError(err error) bool {
 	return false
 }
 
-// alignmentError is a detailed error for alignment constraint violations.
-type alignmentError struct {
-	field string
-	value int64
-	block int
-}
-
-func (e *alignmentError) Error() string {
-	return fmt.Sprintf("dio/sys: %s %d not aligned to %d", e.field, e.value, e.block)
-}
-
-func (e *alignmentError) Unwrap() error { return ErrAlignment }

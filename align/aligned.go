@@ -56,15 +56,34 @@ func AlignRange(offset int64, length int) (alignedOffset, alignedLength int64) {
 // callers needing exactly n bytes may reslice. Each page is pre-touched to
 // commit physical RAM, avoiding first-access page faults during I/O.
 //
+// On Linux, if the aligned size is an exact multiple of [HugepageSize] (2 MiB),
+// AllocAligned first attempts MAP_HUGETLB. If huge pages are unavailable
+// (ENOMEM — no pages reserved — or EOPNOTSUPP), it falls back to standard
+// 4 KiB pages transparently.
+//
 // WARNING: The buffer is NOT managed by the Go GC. The caller MUST call
 // [FreeAligned] when done to avoid a memory leak.
 func AllocAligned(size int) []byte {
 	alignedSize := int(PageAlign(int64(size)))
-	data, err := unix.Mmap(
-		-1, 0, alignedSize,
+	stdFlags := unix.MAP_ANON | unix.MAP_PRIVATE
+
+	if HugepageSupported && alignedSize%HugepageSize == 0 {
+		data, err := unix.Mmap(-1, 0, alignedSize,
+			unix.PROT_READ|unix.PROT_WRITE,
+			stdFlags|hugePageMmapExtraFlags)
+		if err == nil {
+			// Pre-warm with hugepage stride.
+			for i := 0; i < len(data); i += HugepageSize {
+				data[i] = 0
+			}
+			return data
+		}
+		// Hugepages unavailable; fall through to standard allocation below.
+	}
+
+	data, err := unix.Mmap(-1, 0, alignedSize,
 		unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_ANON|unix.MAP_PRIVATE,
-	)
+		stdFlags)
 	if err != nil {
 		panic(fmt.Sprintf("align: mmap(%d bytes): %v", size, err))
 	}

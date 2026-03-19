@@ -4,6 +4,7 @@ package sys
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"syscall"
@@ -12,6 +13,19 @@ import (
 
 	"github.com/miretskiy/dio/align"
 )
+
+// alignmentError is a detailed error for O_DIRECT alignment constraint violations.
+type alignmentError struct {
+	field string
+	value int64
+	block int
+}
+
+func (e *alignmentError) Error() string {
+	return fmt.Sprintf("dio/sys: %s %d not aligned to %d", e.field, e.value, e.block)
+}
+
+func (e *alignmentError) Unwrap() error { return ErrAlignment }
 
 // Platform capability constants.
 const (

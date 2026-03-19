@@ -53,9 +53,7 @@ type SubmissionQueue struct {
 
 	sqeHead uint32
 	sqeTail uint32
-
-	// nolint: unused
-	pad [2]uint32
+	_       [2]uint32 // kernel ABI padding
 }
 
 // liburing: io_uring_cq
@@ -70,9 +68,7 @@ type CompletionQueue struct {
 
 	ringSize uint
 	ringPtr  unsafe.Pointer
-
-	// nolint: unused
-	pad [2]uint32
+	_        [2]uint32 // kernel ABI padding
 }
 
 // liburing: io_uring
@@ -84,10 +80,8 @@ type Ring struct {
 	features    uint32
 	enterRingFd int
 	intFlags    uint8
-	// nolint: unused
-	pad [3]uint8
-	// nolint: unused
-	pad2 uint32
+	_           [3]uint8 // kernel ABI padding
+	_           uint32   // kernel ABI padding
 }
 
 // liburing: io_uring_cqe_shift
@@ -130,16 +124,6 @@ func (ring *Ring) CQESeen(event *CompletionQueueEvent) {
 	if event != nil {
 		ring.CQAdvance(1)
 	}
-}
-
-// liburing: io_uring_sqe_set_data - https://manpages.debian.org/unstable/liburing-dev/io_uring_sqe_set_data.3.en.html
-func (entry *SubmissionQueueEntry) SetData(data unsafe.Pointer) {
-	entry.UserData = uint64(uintptr(data))
-}
-
-// liburing: io_uring_cqe_get_data - https://manpages.debian.org/unstable/liburing-dev/io_uring_cqe_get_data.3.en.html
-func (c *CompletionQueueEvent) GetData() unsafe.Pointer {
-	return unsafe.Pointer(uintptr(c.UserData))
 }
 
 // liburing: io_uring_sqe_set_data64 - https://manpages.debian.org/unstable/liburing-dev/io_uring_sqe_set_data64.3.en.html

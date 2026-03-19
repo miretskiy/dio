@@ -451,7 +451,7 @@ func TestMultiAcceptMultiRecvTCP(t *testing.T) {
 		setup: func(t *testing.T, ctx testContext, ring *Ring) {
 			buffers := make([][]byte, 16)
 			ts := syscall.NsecToTimespec((time.Millisecond).Nanoseconds())
-			for i := 0; i < len(buffers); i++ {
+			for i := range buffers {
 				buffers[i] = make([]byte, 1024)
 
 				sqe := ring.GetSQE()
@@ -529,7 +529,7 @@ func TestRecvMsgMultiSendTCP(t *testing.T) {
 		setup: func(t *testing.T, ctx testContext, ring *Ring) {
 			buffers := make([][]byte, 16)
 			ts := syscall.NsecToTimespec((time.Millisecond).Nanoseconds())
-			for i := 0; i < len(buffers); i++ {
+			for i := range buffers {
 				buffers[i] = make([]byte, 1024)
 
 				sqe := ring.GetSQE()
@@ -593,12 +593,12 @@ const (
 	numberOfBuffers = 16
 )
 
-func getBuffer(bufferBase uintptr, idx int) uintptr {
-	return bufferBase + uintptr((idx * bufferSize))
+func getBuffer(bufferBase unsafe.Pointer, idx int) unsafe.Pointer {
+	return unsafe.Add(bufferBase, idx*bufferSize)
 }
 
-func recycleBuffer(bufRing *BufAndRing, bufferBase uintptr, idx int) {
-	bufRing.BufRingAdd(getBuffer(bufferBase, idx), bufferSize, uint16(idx), BufRingMask(numberOfBuffers), 0)
+func recycleBuffer(bufRing *BufAndRing, bufferBase unsafe.Pointer, idx int) {
+	bufRing.BufRingAdd(uintptr(getBuffer(bufferBase, idx)), bufferSize, uint16(idx), BufRingMask(numberOfBuffers), 0)
 	bufRing.BufRingAdvance(1)
 }
 
@@ -631,11 +631,11 @@ func TestMultiAcceptMultiRecvMultiDirectBufRingTCP(t *testing.T) {
 				RingEntries: uint32(numberOfBuffers),
 				Bgid:        0,
 			}
-			bufferBase := uintptr(unsafe.Pointer(bufRing)) + uintptr(RingBufStructSize)*uintptr(numberOfBuffers)
+			bufferBase := unsafe.Add(unsafe.Pointer(bufRing), uintptr(RingBufStructSize)*uintptr(numberOfBuffers))
 			_, err = ring.RegisterBufferRing(reg, 0)
 			NoError(t, err)
-			for i := 0; i < numberOfBuffers; i++ {
-				bufRing.BufRingAdd(getBuffer(bufferBase, i), bufferSize, uint16(i), BufRingMask(uint32(numberOfBuffers)), i)
+			for i := range numberOfBuffers {
+				bufRing.BufRingAdd(uintptr(getBuffer(bufferBase, i)), bufferSize, uint16(i), BufRingMask(uint32(numberOfBuffers)), i)
 			}
 
 			bufRing.BufRingAdvance(numberOfBuffers)
@@ -667,12 +667,12 @@ func TestMultiAcceptMultiRecvMultiDirectBufRingTCP(t *testing.T) {
 		recvDataProvider: func(ctx testContext, conn *tcpConn, cqe *CompletionQueueEvent) []byte {
 			NotZero(t, cqe.Flags&CQEFBuffer)
 			bufferIdx := int(cqe.Flags >> CQEBufferShift)
-			bufferBase, ok := ctx["bufferBase"].(uintptr)
+			bufferBase, ok := ctx["bufferBase"].(unsafe.Pointer)
 			True(t, ok)
 			bufRing, ok := ctx["bufRing"].(*BufAndRing)
 			True(t, ok)
 			bufPtr := getBuffer(bufferBase, bufferIdx)
-			ringBuffer := unsafe.Slice((*byte)(unsafe.Pointer(bufPtr)), bufferSize)
+			ringBuffer := unsafe.Slice((*byte)(bufPtr), bufferSize)
 
 			buffer := make([]byte, cqe.Res)
 			copy(buffer, ringBuffer[:cqe.Res])
