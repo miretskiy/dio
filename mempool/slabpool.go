@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"math/rand/v2"
 	"sync/atomic"
 	"unsafe"
 
@@ -133,8 +134,14 @@ func (p *SlabPool) initMask(slots int) {
 
 // Acquire returns a free [Slot]. Returns [ErrSlabExhausted] if all slots are
 // in use. Non-blocking; the caller is expected to retry or back off.
+//
+// Starts at a random shard to distribute load across shards under concurrent
+// use, then probes linearly (with wrap-around) until a free slot is found.
 func (p *SlabPool) Acquire() (Slot, error) {
-	for i := range p.activeShards {
+	n := int(p.activeShards)
+	start := rand.IntN(n)
+	for j := range n {
+		i := (start + j) % n
 		for {
 			mask := p.shards[i].mask.Load()
 			if mask == ^uint64(0) {
@@ -142,9 +149,9 @@ func (p *SlabPool) Acquire() (Slot, error) {
 			}
 			freePos := bits.TrailingZeros64(^mask) // index of first 0-bit
 			if p.shards[i].mask.CompareAndSwap(mask, mask|(uint64(1)<<freePos)) {
-				slot := int(i)*SlabBitsPerShard + freePos
-				start := slot * int(p.slotSize)
-				data := p.rawData[start : start+int(p.slotSize)]
+				slot := i*SlabBitsPerShard + freePos
+				offset := slot * int(p.slotSize)
+				data := p.rawData[offset : offset+int(p.slotSize)]
 				return Slot{
 					Data:   data,
 					rawPtr: uintptr(unsafe.Pointer(&data[0])),
