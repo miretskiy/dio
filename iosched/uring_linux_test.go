@@ -278,6 +278,51 @@ func TestURing_Concurrent(t *testing.T) {
 	}
 }
 
+// ── Ring capacity overflow ────────────────────────────────────────────────────
+
+// TestURing_BeyondRingCapacity submits more ops in a single Submit call than
+// the ring's SQ depth. The coordinator is expected to fill slots incrementally
+// across multiple SubmitAndWait cycles until all ops complete.
+func TestURing_BeyondRingCapacity(t *testing.T) {
+	const ringDepth = 32 // deliberately small
+	const numOps = ringDepth*3 + 7 // 103 ops — well beyond the ring
+
+	s := newURingSched(t, iosched.URingConfig{RingDepth: ringDepth})
+
+	// Write a file large enough to hold numOps × 4 KiB reads.
+	data := make([]byte, numOps*4096)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	path := filepath.Join(t.TempDir(), "overflow.dat")
+	require.NoError(t, os.WriteFile(path, data, 0644))
+	f := openRW(t, path)
+
+	ops := make([]iosched.Op, numOps)
+	bufs := make([][]byte, numOps)
+	for i := range numOps {
+		bufs[i] = make([]byte, 4096)
+		ops[i] = iosched.ReadOp(f, bufs[i], int64(i*4096))
+	}
+
+	// Single Submit with numOps ops — coordinator must batch them into the ring.
+	ticket, err := s.Submit(ops)
+	require.NoError(t, err)
+
+	results := make([]iosched.Result, numOps)
+	n, err := s.Wait(ticket, results)
+	require.NoError(t, err)
+	require.Equal(t, numOps, n)
+
+	for i, r := range results {
+		require.NoError(t, r.Err, "op %d failed", i)
+		require.Equal(t, 4096, r.N, "op %d short read", i)
+		require.Equal(t, data[i*4096:(i+1)*4096], bufs[i], "op %d data mismatch", i)
+	}
+
+	t.Logf("submitted %d ops into a ring of depth %d — all completed correctly", numOps, ringDepth)
+}
+
 // ── Close behaviour ───────────────────────────────────────────────────────────
 
 func TestURing_CloseThenSubmit(t *testing.T) {
