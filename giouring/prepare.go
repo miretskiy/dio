@@ -47,10 +47,13 @@ func (entry *SubmissionQueueEntry) prepareRW(opcode uint8, fd int, addr uintptr,
 	entry.Off = offset
 	entry.Addr = uint64(addr)
 	entry.Len = length
+	entry.OpcodeFlags = 0
 	entry.UserData = 0
 	entry.BufIG = 0
 	entry.Personality = 0
 	entry.SpliceFdIn = 0
+	entry.Addr3 = 0
+	entry._pad2 = [1]uint64{}
 }
 
 // liburing: io_uring_prep_accept - https://manpages.debian.org/unstable/liburing-dev/io_uring_prep_accept.3.en.html

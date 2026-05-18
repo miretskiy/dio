@@ -100,6 +100,7 @@ type resultStore struct {
 
 func (r *resultStore) init(nOps int) {
 	r.nOps = uint16(nOps)
+	clear(r.inline[:])
 	if nOps > len(r.inline) {
 		need := nOps - len(r.inline)
 		if cap(r.extra) >= need {
@@ -107,6 +108,9 @@ func (r *resultStore) init(nOps int) {
 		} else {
 			r.extra = make([]Result, need)
 		}
+		clear(r.extra)
+	} else {
+		r.extra = r.extra[:0]
 	}
 }
 
