@@ -5,13 +5,14 @@
 // The primary user-facing type is [BlockingIO], which provides synchronous
 // ReadAt/WriteAt/Fsync methods on every platform. When io_uring is available
 // (Linux), it wraps a [URingScheduler] and routes each call through the async
-// Submit/Wait path. When io_uring is unavailable, it invokes POSIX syscalls
-// directly — no indirection, no group management.
+// Submit path. When io_uring is unavailable, it invokes POSIX syscalls
+// directly — no indirection, no scheduler.
 //
-// The [Scheduler] interface exposes the async Submit/Wait API for group-commit
-// scenarios: submit N writes from N goroutines, then Wait on all tickets. The
-// [URingScheduler] batches all enqueued SQEs into a single io_uring_enter.
-// Only [URingScheduler] implements Scheduler; it is Linux-only.
+// The [Scheduler] interface exposes the async Submit API for group-commit
+// scenarios: prepare a [Submission] of N ops, call Submit, then wait on
+// `<-sub.Done()`. The [URingScheduler] batches all enqueued SQEs into a
+// single io_uring_enter. Only [URingScheduler] implements Scheduler; it is
+// Linux-only.
 //
 // Use [NewDefaultIO] to get the best available implementation for the host.
 package iosched
@@ -23,34 +24,34 @@ import (
 	"github.com/miretskiy/dio/mempool"
 )
 
+// ErrTooBusy is returned by [Scheduler.Submit] when accepting the submission
+// would exceed [URingConfig.MaxInflightOps]. Callers decide their own
+// backpressure policy: retry, backoff, drop the work, or surface the error.
+// The scheduler never blocks Submit waiting for budget.
+var ErrTooBusy = errors.New("iosched: too busy")
+
 // Scheduler is the async I/O submission interface.
 //
-// Callers build [Op] values, call Submit, and call Wait to collect results.
+// Callers build [Op] values, acquire a [Ticket] via [NewTicket], populate
+// Ticket.Ops, and call Submit. After Submit, the caller waits on
+// [Ticket.Wait] and then reads per-op results via [Op.Result]. Once
+// finished reading, the caller releases the Ticket back to the pool via
+// [Ticket.Release] (typically `defer t.Release()` immediately after
+// NewTicket).
+//
 // Ops with [Op.Linked] or [Op.HardLinked] form SQE chains executed in order
 // by the kernel. Independent ops may complete in any order.
 //
-// Each [Ticket] must be passed to Wait exactly once; a second call returns
-// [ErrTicketConsumed].
-//
-// Buffers referenced by Ops must remain valid until the corresponding Wait
-// returns.
-//
 // Implementations must be safe for concurrent use by multiple goroutines.
 type Scheduler interface {
-	// Submit enqueues ops and returns a completion Ticket. Does not block on
-	// I/O completion.
-	Submit(ops []Op) (Ticket, error)
-
-	// Wait blocks until all ops for the ticket complete, then writes results
-	// into the provided slice (len >= number of ops). Returns count written.
-	Wait(ticket Ticket, results []Result) (int, error)
+	// Submit enqueues t.Ops for asynchronous execution. Does not block on
+	// I/O completion. The scheduler retains *t internally for the duration
+	// of the request; the caller MUST call t.Wait before reading results
+	// or releasing the Ticket.
+	Submit(t *Ticket) error
 
 	io.Closer
 }
-
-// ErrTicketConsumed is returned by Wait when called more than once with the
-// same Ticket.
-var ErrTicketConsumed = errors.New("iosched: ticket already consumed")
 
 // pooler is implemented by schedulers that support pre-registered DMA buffers.
 type pooler interface {
@@ -76,55 +77,25 @@ func RegisterDMASlab(s Scheduler, pool *mempool.SlabPool) error {
 	return nil // scheduler doesn't support fixed buffers; silently skip
 }
 
-var errSchedulerClosed = errors.New("iosched: scheduler closed")
-
 // URingConfig configures the io_uring scheduler.
 type URingConfig struct {
 	// RingDepth is the number of SQ/CQ entries. Must be a power of two.
-	// Zero uses the default (256).
+	// Zero uses the default (256). Caps the number of ops in flight in the
+	// kernel at any moment.
 	RingDepth uint32
+
+	// MaxInflightOps caps the total number of ops currently in flight in
+	// the scheduler (queued + placed in the ring + awaiting reap). Submit
+	// returns [ErrTooBusy] when accepting a Submission would push the
+	// in-flight count above this cap. Zero (the default) means unlimited.
+	//
+	// Independent of RingDepth: a single Submission can carry many ops; the
+	// budget is per-op since each op holds resources for its lifetime in
+	// flight.
+	MaxInflightOps int64
 
 	// SQPOLL enables IORING_SETUP_SQPOLL. The kernel spawns a polling thread
 	// that submits SQEs without a syscall on the submission path, at the cost
 	// of one CPU core. The kernel thread sleeps after ~1 s of idle.
 	SQPOLL bool
-}
-
-// resultStore holds result slots for one Submit call.
-// Inline covers ≤4 ops (the common case) with no heap allocation.
-type resultStore struct {
-	nOps   uint16
-	inline [4]Result
-	extra  []Result // allocated lazily for >4 ops
-}
-
-func (r *resultStore) init(nOps int) {
-	r.nOps = uint16(nOps)
-	clear(r.inline[:])
-	if nOps > len(r.inline) {
-		need := nOps - len(r.inline)
-		if cap(r.extra) >= need {
-			r.extra = r.extra[:need]
-		} else {
-			r.extra = make([]Result, need)
-		}
-		clear(r.extra)
-	} else {
-		r.extra = r.extra[:0]
-	}
-}
-
-func (r *resultStore) at(i int) *Result {
-	if i < len(r.inline) {
-		return &r.inline[i]
-	}
-	return &r.extra[i-len(r.inline)]
-}
-
-func (r *resultStore) copyTo(dst []Result) int {
-	n := int(r.nOps)
-	for i := 0; i < n && i < len(dst); i++ {
-		dst[i] = *r.at(i)
-	}
-	return min(n, len(dst))
 }

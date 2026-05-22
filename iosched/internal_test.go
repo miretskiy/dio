@@ -5,12 +5,4 @@ package iosched
 // on non-Linux platforms flag them as unreachable without these anchors.
 var (
 	_ = Op.isLinked
-	_ = makeTicket
-	_ = Ticket.groupIdx
-	_ = Ticket.gen
-	_ = (*resultStore).init
-	_ = (*resultStore).copyTo
-	_ = newIndexSlab
-	_ = (*indexSlab).acquire
-	_ = (*indexSlab).release
 )

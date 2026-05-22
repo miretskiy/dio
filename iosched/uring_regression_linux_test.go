@@ -29,27 +29,16 @@ func TestURing_ReusedSQEWriteAfterFdatasync(t *testing.T) {
 		payload[i] = byte(i)
 	}
 
-	ticket, err := s.Submit([]iosched.Op{iosched.WriteOp(f, payload, 0)})
-	require.NoError(t, err)
-	var writeRes [1]iosched.Result
-	_, err = s.Wait(ticket, writeRes[:])
-	require.NoError(t, err)
-	require.NoError(t, writeRes[0].Err)
-	require.Equal(t, len(payload), writeRes[0].N)
+	results := submitWait(t, s, []iosched.Op{iosched.WriteOp(f, payload, 0)})
+	require.NoError(t, results[0].Err)
+	require.Equal(t, len(payload), results[0].N)
 
-	ticket, err = s.Submit([]iosched.Op{iosched.FdatasyncOp(f)})
-	require.NoError(t, err)
-	var syncRes [1]iosched.Result
-	_, err = s.Wait(ticket, syncRes[:])
-	require.NoError(t, err)
-	require.NoError(t, syncRes[0].Err)
+	results = submitWait(t, s, []iosched.Op{iosched.FdatasyncOp(f)})
+	require.NoError(t, results[0].Err)
 
-	ticket, err = s.Submit([]iosched.Op{iosched.WriteOp(f, payload, int64(len(payload)))})
-	require.NoError(t, err)
-	_, err = s.Wait(ticket, writeRes[:])
-	require.NoError(t, err)
-	require.NoError(t, writeRes[0].Err)
-	require.Equal(t, len(payload), writeRes[0].N)
+	results = submitWait(t, s, []iosched.Op{iosched.WriteOp(f, payload, int64(len(payload)))})
+	require.NoError(t, results[0].Err)
+	require.Equal(t, len(payload), results[0].N)
 }
 
 func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
@@ -84,37 +73,32 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 			<-start
 
 			payload := payloads[worker]
+			ticket := iosched.NewTicket()
+			defer ticket.Release()
 			for round := range rounds {
 				offset := int64((worker*rounds + round) * align.BlockSize)
-				ticket, err := s.Submit([]iosched.Op{
+				ticket.Ops = []iosched.Op{
 					iosched.WriteOp(f, payload, offset).Linked(),
 					iosched.FdatasyncOp(f),
-				})
-				if err != nil {
+				}
+				if err := s.Submit(ticket); err != nil {
 					errs <- fmt.Errorf("worker %d round %d submit: %w", worker, round, err)
 					return
 				}
+				ticket.Wait()
 
-				var res [2]iosched.Result
-				n, err := s.Wait(ticket, res[:])
-				if err != nil {
-					errs <- fmt.Errorf("worker %d round %d wait: %w", worker, round, err)
+				r0 := ticket.Ops[0].Result()
+				r1 := ticket.Ops[1].Result()
+				if r0.Err != nil {
+					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, r0.N, r0.Err)
 					return
 				}
-				if n != len(res) {
-					errs <- fmt.Errorf("worker %d round %d result count: got %d want %d", worker, round, n, len(res))
+				if r0.N != len(payload) {
+					errs <- fmt.Errorf("worker %d round %d write count: got %d want %d", worker, round, r0.N, len(payload))
 					return
 				}
-				if res[0].Err != nil {
-					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, res[0].N, res[0].Err)
-					return
-				}
-				if res[0].N != len(payload) {
-					errs <- fmt.Errorf("worker %d round %d write count: got %d want %d", worker, round, res[0].N, len(payload))
-					return
-				}
-				if res[1].Err != nil {
-					errs <- fmt.Errorf("worker %d round %d fdatasync: %w", worker, round, res[1].Err)
+				if r1.Err != nil {
+					errs <- fmt.Errorf("worker %d round %d fdatasync: %w", worker, round, r1.Err)
 					return
 				}
 			}

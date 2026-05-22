@@ -12,7 +12,7 @@ import (
 // It works on all platforms.
 //
 // When S is non-nil (io_uring available), each method routes through
-// Submit+Wait, fully using the async ring pipeline.
+// Submit + Wait via a pool-allocated [Ticket].
 //
 // When S is nil, methods invoke POSIX syscalls directly with no indirection.
 //
@@ -30,22 +30,27 @@ func NewBlockingIO(s Scheduler) *BlockingIO {
 	return &BlockingIO{S: s}
 }
 
+// submitOne runs a single op through the scheduler and returns its Result.
+// Acquires/releases a Ticket from the pool around the call.
+func (b *BlockingIO) submitOne(op Op) Result {
+	t := NewTicket()
+	defer t.Release()
+	t.Ops = []Op{op}
+	if err := b.S.Submit(t); err != nil {
+		return Result{Err: err}
+	}
+	t.Wait()
+	return t.Ops[0].Result()
+}
+
 // ReadAt performs a positioned read.
 func (b *BlockingIO) ReadAt(f *os.File, buf []byte, offset int64) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
 	if b.S != nil {
-		ops := [1]Op{ReadOp(f, buf, offset)}
-		t, err := b.S.Submit(ops[:])
-		if err != nil {
-			return 0, err
-		}
-		var res [1]Result
-		if _, err := b.S.Wait(t, res[:]); err != nil {
-			return 0, err
-		}
-		return res[0].N, res[0].Err
+		r := b.submitOne(ReadOp(f, buf, offset))
+		return r.N, r.Err
 	}
 	n, err := syscall.Pread(int(f.Fd()), buf, offset)
 	runtime.KeepAlive(f)
@@ -58,16 +63,8 @@ func (b *BlockingIO) WriteAt(f *os.File, buf []byte, offset int64) (int, error) 
 		return 0, nil
 	}
 	if b.S != nil {
-		ops := [1]Op{WriteOp(f, buf, offset)}
-		t, err := b.S.Submit(ops[:])
-		if err != nil {
-			return 0, err
-		}
-		var res [1]Result
-		if _, err := b.S.Wait(t, res[:]); err != nil {
-			return 0, err
-		}
-		return res[0].N, res[0].Err
+		r := b.submitOne(WriteOp(f, buf, offset))
+		return r.N, r.Err
 	}
 	n, err := syscall.Pwrite(int(f.Fd()), buf, offset)
 	runtime.KeepAlive(f)
@@ -77,16 +74,7 @@ func (b *BlockingIO) WriteAt(f *os.File, buf []byte, offset int64) (int, error) 
 // Fsync flushes data and metadata for f.
 func (b *BlockingIO) Fsync(f *os.File) error {
 	if b.S != nil {
-		ops := [1]Op{FsyncOp(f)}
-		t, err := b.S.Submit(ops[:])
-		if err != nil {
-			return err
-		}
-		var res [1]Result
-		if _, err := b.S.Wait(t, res[:]); err != nil {
-			return err
-		}
-		return res[0].Err
+		return b.submitOne(FsyncOp(f)).Err
 	}
 	return f.Sync()
 }
@@ -95,16 +83,7 @@ func (b *BlockingIO) Fsync(f *os.File) error {
 // data retrieval. On Darwin, this uses F_FULLFSYNC for correctness.
 func (b *BlockingIO) Fdatasync(f *os.File) error {
 	if b.S != nil {
-		ops := [1]Op{FdatasyncOp(f)}
-		t, err := b.S.Submit(ops[:])
-		if err != nil {
-			return err
-		}
-		var res [1]Result
-		if _, err := b.S.Wait(t, res[:]); err != nil {
-			return err
-		}
-		return res[0].Err
+		return b.submitOne(FdatasyncOp(f)).Err
 	}
 	return sys.Fdatasync(f)
 }

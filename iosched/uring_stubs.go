@@ -22,12 +22,8 @@ func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
 // errors.
 type URingScheduler struct{}
 
-func (s *URingScheduler) Submit(_ []Op) (Ticket, error) {
-	return 0, errors.New("iosched: io_uring requires Linux")
-}
-
-func (s *URingScheduler) Wait(_ Ticket, _ []Result) (int, error) {
-	return 0, errors.New("iosched: io_uring requires Linux")
+func (s *URingScheduler) Submit(_ *Ticket) error {
+	return errors.New("iosched: io_uring requires Linux")
 }
 
 func (s *URingScheduler) Close() error { return nil }

@@ -187,11 +187,15 @@ func BenchmarkFanout_URing(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	results := make([]iosched.Result, fanoutNumSinks)
 	writeOps := make([]iosched.Op, fanoutNumSinks)
 
 	b.SetBytes(fanoutChunk * (1 + fanoutNumSinks))
 	b.ResetTimer()
+
+	readTicket := iosched.NewTicket()
+	defer readTicket.Release()
+	writeTicket := iosched.NewTicket()
+	defer writeTicket.Release()
 
 	for i := range b.N {
 		offset := int64(i%fanoutNumChunks) * fanoutChunk
@@ -202,42 +206,36 @@ func BenchmarkFanout_URing(b *testing.B) {
 		}
 
 		// Fixed read.
-		rticket, err := sched.Submit([]iosched.Op{
-			iosched.ReadFixedOp(ff.src, slot, offset),
-		})
-		if err != nil {
+		readTicket.Ops = []iosched.Op{iosched.ReadFixedOp(ff.src, slot, offset)}
+		if err := sched.Submit(readTicket); err != nil {
 			slot.Release()
 			b.Fatalf("submit read: %v", err)
 		}
-		if _, err := sched.Wait(rticket, results[:1]); err != nil {
+		readTicket.Wait()
+		if rerr := readTicket.Ops[0].Result().Err; rerr != nil {
 			slot.Release()
-			b.Fatalf("wait read: %v", err)
-		}
-		if results[0].Err != nil {
-			slot.Release()
-			b.Fatalf("read at %d: %v", offset, results[0].Err)
+			b.Fatalf("read at %d: %v", offset, rerr)
 		}
 
 		// Fan-out: all sinks in one batch, dispatched in parallel by the ring.
 		for si := range fanoutNumSinks {
 			writeOps[si] = iosched.WriteFixedOp(ff.sinks[si], slot, offset)
 		}
-		wticket, err := sched.Submit(writeOps)
-		if err != nil {
+		writeTicket.Ops = writeOps
+		if err := sched.Submit(writeTicket); err != nil {
 			slot.Release()
 			b.Fatalf("submit writes: %v", err)
 		}
-		if _, err := sched.Wait(wticket, results); err != nil {
-			slot.Release()
-			b.Fatalf("wait writes: %v", err)
-		}
-		for si, r := range results {
-			if r.Err != nil {
+		writeTicket.Wait()
+		for si := range fanoutNumSinks {
+			if werr := writeTicket.Ops[si].Result().Err; werr != nil {
 				slot.Release()
-				b.Fatalf("write sink%d at %d: %v", si+1, offset, r.Err)
+				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}
 		}
 
 		slot.Release()
 	}
+	b.StopTimer()
+	reportSchedStats(b, sched)
 }
