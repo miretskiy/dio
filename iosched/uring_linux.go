@@ -94,14 +94,13 @@ type URingScheduler struct {
 	closeRing sync.Once
 
 	// stats tracks coordinator-internal counters useful for diagnosing
-	// batching behavior. Only the leader writes; readers can call Stats
-	// for a snapshot.
+	// batching behavior. Protected by mu.
 	stats struct {
 		// syscalls counts io_uring_enter calls that actually placed new
 		// SQEs (i.e. cycles where fillSlots produced at least one SQE).
 		// opsPlaced / syscalls = average batch size.
-		syscalls  atomic.Uint64
-		opsPlaced atomic.Uint64
+		syscalls  uint64
+		opsPlaced uint64
 	}
 
 	// Ring + ring-owned state. Accessed only by the active leader (the
@@ -125,9 +124,11 @@ type Stats struct {
 
 // Stats returns a snapshot of the leader counters.
 func (s *URingScheduler) Stats() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return Stats{
-		Syscalls:  s.stats.syscalls.Load(),
-		OpsPlaced: s.stats.opsPlaced.Load(),
+		Syscalls:  s.stats.syscalls,
+		OpsPlaced: s.stats.opsPlaced,
 	}
 }
 
@@ -253,9 +254,11 @@ func (s *URingScheduler) Submit(ops []Op) error {
 		s.flushing = nil
 		s.mu.Unlock()
 
-		err := s.runLeader(batch)
+		stats, err := s.runLeader(batch)
 
 		s.mu.Lock()
+		s.stats.syscalls += stats.syscalls
+		s.stats.opsPlaced += stats.opsPlaced
 		if err != nil {
 			s.closeLocked(err)
 		}
@@ -269,10 +272,19 @@ func (s *URingScheduler) Submit(ops []Op) error {
 			br.done = true
 		}
 		s.leaderActive = false
+		needBroadcast := len(batch) > 1 || len(s.pending) > 0 || s.closing.closed
 		clear(batch)
 		s.flushing = batch[:0]
-		s.cond.Broadcast()
-		// Loop: the top-of-loop r.done check returns this caller's result.
+		if needBroadcast {
+			s.cond.Broadcast()
+		}
+		if r.done {
+			err := r.err
+			s.mu.Unlock()
+			return err
+		}
+		// Should not happen: the leader's request was in the swapped batch.
+		// Loop instead of hanging if the invariant is violated.
 	}
 }
 
@@ -281,13 +293,14 @@ func (s *URingScheduler) Submit(ops []Op) error {
 // Invariant on entry: leaderActive is true; no one else touches the ring
 // state (inflight, freeSlots, nInflight). The batch contains at least one
 // request not yet done.
-func (s *URingScheduler) runLeader(batch []*request) error {
+func (s *URingScheduler) runLeader(batch []*request) (leaderStats, error) {
+	var stats leaderStats
 	for !allComplete(batch) {
 		before := s.nInflight
 		if err := s.fillSlots(batch); err != nil {
 			s.failInflight(err)
 			s.failBatch(batch, err)
-			return err
+			return stats, err
 		}
 
 		// If we have nothing to wait on, there's a bug — break out to avoid
@@ -295,23 +308,28 @@ func (s *URingScheduler) runLeader(batch []*request) error {
 		if s.nInflight == 0 {
 			err := errors.New("iosched: leader stalled with no in-flight ops")
 			s.failBatch(batch, err)
-			return err
+			return stats, err
 		}
 
 		if placed := s.nInflight - before; placed > 0 {
-			s.stats.syscalls.Add(1)
-			s.stats.opsPlaced.Add(uint64(placed))
+			stats.syscalls++
+			stats.opsPlaced += uint64(placed)
 		}
 
 		if err := s.kernelSubmit(); err != nil {
 			ringErr := fmt.Errorf("iosched: ring error: %w", err)
 			s.failInflight(ringErr)
 			s.failBatch(batch, ringErr)
-			return ringErr
+			return stats, ringErr
 		}
 		s.reap()
 	}
-	return nil
+	return stats, nil
+}
+
+type leaderStats struct {
+	syscalls  uint64
+	opsPlaced uint64
 }
 
 func allComplete(batch []*request) bool {
