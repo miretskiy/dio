@@ -19,12 +19,13 @@ import (
 
 	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/sys"
 )
 
 const benchStorageRoot = "/instance_storage"
 
-// benchFile creates a pre-allocated O_DIRECT file under /instance_storage of
-// the given size, filled with deterministic bytes. b.Cleanup removes it.
+// benchFile creates a pre-allocated file under /instance_storage of the given
+// size, filled with deterministic bytes. b.Cleanup removes it.
 func benchFile(b *testing.B, size int64) *os.File {
 	b.Helper()
 	if _, err := os.Stat(benchStorageRoot); os.IsNotExist(err) {
@@ -64,6 +65,22 @@ func benchFile(b *testing.B, size int64) *os.File {
 		os.RemoveAll(dir)
 	})
 	return f
+}
+
+// benchDirectReadFile creates and fills a benchmark file, then opens a second
+// read-only descriptor with O_DIRECT.
+func benchDirectReadFile(b *testing.B, size int64) *os.File {
+	b.Helper()
+
+	f := benchFile(b, size)
+	direct, err := sys.OpenDirect(f.Name(), sys.FlDirectIO)
+	if err != nil {
+		b.Fatalf("open direct %s: %v", f.Name(), err)
+	}
+	b.Cleanup(func() {
+		direct.Close()
+	})
+	return direct
 }
 
 // BenchmarkSubmission_ReadAt_Serial measures one Submit round
@@ -202,6 +219,71 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 						}
 						if res := ops[0].Result(); res.Err != nil {
 							b.Errorf("read: %v", res.Err)
+							return
+						}
+					}
+				})
+			}
+			wg.Wait()
+			b.StopTimer()
+			reportSchedStats(b, sched)
+		})
+	}
+}
+
+// BenchmarkSubmission_Throughput_ReadAt_Workers measures large O_DIRECT reads
+// with enough concurrent Submit callers to test storage throughput rather than
+// 4 KiB scheduler overhead.
+func BenchmarkSubmission_Throughput_ReadAt_Workers(b *testing.B) {
+	if !iosched.IOUringAvailable {
+		b.Skip("io_uring not available")
+	}
+	const fileSize = 8 << 30
+	const blockSize = 1 << 20
+
+	for _, workers := range []int{8, 32} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			f := benchDirectReadFile(b, fileSize)
+			sched, err := iosched.NewURingScheduler(iosched.URingConfig{
+				RingDepth: 512,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer sched.Close()
+
+			b.SetBytes(blockSize)
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			perG := b.N / workers
+			extra := b.N % workers
+			var wg sync.WaitGroup
+			for g := range workers {
+				count := perG
+				if g < extra {
+					count++
+				}
+				wg.Go(func() {
+					buf := align.AllocAligned(blockSize)
+					defer align.FreeAligned(buf)
+
+					ops := make([]iosched.Op, 1)
+					for i := range count {
+						block := int64(i*workers + g)
+						offset := (block * blockSize) % (fileSize - blockSize)
+						ops[0] = iosched.ReadOp(f, buf, offset)
+						if err := sched.Submit(ops); err != nil {
+							b.Errorf("submit: %v", err)
+							return
+						}
+						res := ops[0].Result()
+						if res.Err != nil {
+							b.Errorf("read: %v", res.Err)
+							return
+						}
+						if res.N != blockSize {
+							b.Errorf("short read: got %d want %d", res.N, blockSize)
 							return
 						}
 					}
