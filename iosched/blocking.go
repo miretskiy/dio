@@ -11,8 +11,8 @@ import (
 // BlockingIO wraps an optional [Scheduler] with synchronous methods.
 // It works on all platforms.
 //
-// When S is non-nil (io_uring available), each method routes through
-// Submit + Wait via a pool-allocated [Ticket].
+// When S is non-nil (io_uring available), each method calls S.Submit with a
+// single-op slice and reads the per-op result.
 //
 // When S is nil, methods invoke POSIX syscalls directly with no indirection.
 //
@@ -31,16 +31,12 @@ func NewBlockingIO(s Scheduler) *BlockingIO {
 }
 
 // submitOne runs a single op through the scheduler and returns its Result.
-// Acquires/releases a Ticket from the pool around the call.
 func (b *BlockingIO) submitOne(op Op) Result {
-	t := NewTicket()
-	defer t.Release()
-	t.Ops = []Op{op}
-	if err := b.S.Submit(t); err != nil {
+	ops := []Op{op}
+	if err := b.S.Submit(ops); err != nil {
 		return Result{Err: err}
 	}
-	t.Wait()
-	return t.Ops[0].Result()
+	return ops[0].Result()
 }
 
 // ReadAt performs a positioned read.

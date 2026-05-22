@@ -192,10 +192,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 	b.SetBytes(fanoutChunk * (1 + fanoutNumSinks))
 	b.ResetTimer()
 
-	readTicket := iosched.NewTicket()
-	defer readTicket.Release()
-	writeTicket := iosched.NewTicket()
-	defer writeTicket.Release()
+	readOps := make([]iosched.Op, 1)
 
 	for i := range b.N {
 		offset := int64(i%fanoutNumChunks) * fanoutChunk
@@ -206,13 +203,12 @@ func BenchmarkFanout_URing(b *testing.B) {
 		}
 
 		// Fixed read.
-		readTicket.Ops = []iosched.Op{iosched.ReadFixedOp(ff.src, slot, offset)}
-		if err := sched.Submit(readTicket); err != nil {
+		readOps[0] = iosched.ReadFixedOp(ff.src, slot, offset)
+		if err := sched.Submit(readOps); err != nil {
 			slot.Release()
 			b.Fatalf("submit read: %v", err)
 		}
-		readTicket.Wait()
-		if rerr := readTicket.Ops[0].Result().Err; rerr != nil {
+		if rerr := readOps[0].Result().Err; rerr != nil {
 			slot.Release()
 			b.Fatalf("read at %d: %v", offset, rerr)
 		}
@@ -221,14 +217,12 @@ func BenchmarkFanout_URing(b *testing.B) {
 		for si := range fanoutNumSinks {
 			writeOps[si] = iosched.WriteFixedOp(ff.sinks[si], slot, offset)
 		}
-		writeTicket.Ops = writeOps
-		if err := sched.Submit(writeTicket); err != nil {
+		if err := sched.Submit(writeOps); err != nil {
 			slot.Release()
 			b.Fatalf("submit writes: %v", err)
 		}
-		writeTicket.Wait()
 		for si := range fanoutNumSinks {
-			if werr := writeTicket.Ops[si].Result().Err; werr != nil {
+			if werr := writeOps[si].Result().Err; werr != nil {
 				slot.Release()
 				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}

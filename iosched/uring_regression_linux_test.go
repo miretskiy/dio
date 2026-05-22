@@ -73,22 +73,18 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 			<-start
 
 			payload := payloads[worker]
-			ticket := iosched.NewTicket()
-			defer ticket.Release()
+			ops := make([]iosched.Op, 2)
 			for round := range rounds {
 				offset := int64((worker*rounds + round) * align.BlockSize)
-				ticket.Ops = []iosched.Op{
-					iosched.WriteOp(f, payload, offset).Linked(),
-					iosched.FdatasyncOp(f),
-				}
-				if err := s.Submit(ticket); err != nil {
+				ops[0] = iosched.WriteOp(f, payload, offset).Linked()
+				ops[1] = iosched.FdatasyncOp(f)
+				if err := s.Submit(ops); err != nil {
 					errs <- fmt.Errorf("worker %d round %d submit: %w", worker, round, err)
 					return
 				}
-				ticket.Wait()
 
-				r0 := ticket.Ops[0].Result()
-				r1 := ticket.Ops[1].Result()
+				r0 := ops[0].Result()
+				r1 := ops[1].Result()
 				if r0.Err != nil {
 					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, r0.N, r0.Err)
 					return

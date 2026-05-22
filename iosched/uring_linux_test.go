@@ -3,15 +3,12 @@
 package iosched_test
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -59,19 +56,15 @@ func openRW(t *testing.T, path string) *os.File {
 	return f
 }
 
-// submitWait acquires a Ticket, submits ops, waits, and returns the per-op
+// submitWait submits ops, blocks for completion, and returns the per-op
 // results. Test helper for the common "submit one batch, wait for it"
-// pattern. Releases the Ticket back to the pool before returning.
+// pattern.
 func submitWait(t *testing.T, s *iosched.URingScheduler, ops []iosched.Op) []iosched.Result {
 	t.Helper()
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-	ticket.Ops = ops
-	require.NoError(t, s.Submit(ticket))
-	ticket.Wait()
-	results := make([]iosched.Result, len(ticket.Ops))
-	for i := range ticket.Ops {
-		results[i] = ticket.Ops[i].Result()
+	require.NoError(t, s.Submit(ops))
+	results := make([]iosched.Result, len(ops))
+	for i := range ops {
+		results[i] = ops[i].Result()
 	}
 	return results
 }
@@ -120,22 +113,37 @@ func TestURing_GroupCommit(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, make([]byte, chunks*4096), 0644))
 	f := openRW(t, path)
 
+	// Each chunk runs in its own goroutine; the drain-leader inside Submit
+	// batches concurrent calls into shared io_uring_enter invocations.
 	payloads := make([][]byte, chunks)
-	tickets := make([]*iosched.Ticket, chunks)
 	for i := range chunks {
 		payloads[i] = make([]byte, 4096)
 		_, _ = rand.Read(payloads[i])
-		tickets[i] = iosched.NewTicket()
-		tickets[i].Ops = []iosched.Op{iosched.WriteOp(f, payloads[i], int64(i*4096))}
-		require.NoError(t, s.Submit(tickets[i]))
 	}
 
-	for i := range tickets {
-		tickets[i].Wait()
-		res := tickets[i].Ops[0].Result()
-		require.NoError(t, res.Err, "chunk %d", i)
-		require.Equal(t, 4096, res.N, "chunk %d", i)
-		tickets[i].Release()
+	errs := make(chan error, chunks)
+	var wg sync.WaitGroup
+	for i := range chunks {
+		wg.Go(func() {
+			ops := []iosched.Op{iosched.WriteOp(f, payloads[i], int64(i*4096))}
+			if err := s.Submit(ops); err != nil {
+				errs <- fmt.Errorf("chunk %d submit: %w", i, err)
+				return
+			}
+			res := ops[0].Result()
+			if res.Err != nil {
+				errs <- fmt.Errorf("chunk %d: %w", i, res.Err)
+				return
+			}
+			if res.N != 4096 {
+				errs <- fmt.Errorf("chunk %d short: %d", i, res.N)
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 
 	// Verify all writes.
@@ -219,17 +227,15 @@ func TestURing_Concurrent(t *testing.T) {
 	for range goroutines {
 		wg.Go(func() {
 			buf := make([]byte, readSize)
-			t := iosched.NewTicket()
-			defer t.Release()
+			ops := make([]iosched.Op, 1)
 			for i := range readsPerGoroutine {
 				offset := int64((i * readSize) % (fileSize - readSize))
-				t.Ops = []iosched.Op{iosched.ReadOp(f, buf, offset)}
-				if err := s.Submit(t); err != nil {
+				ops[0] = iosched.ReadOp(f, buf, offset)
+				if err := s.Submit(ops); err != nil {
 					errs <- fmt.Errorf("submit at %d: %w", offset, err)
 					return
 				}
-				t.Wait()
-				res := t.Ops[0].Result()
+				res := ops[0].Result()
 				if res.Err != nil {
 					errs <- fmt.Errorf("read at %d: %w", offset, res.Err)
 					return
@@ -257,11 +263,11 @@ func TestURing_Concurrent(t *testing.T) {
 
 // ── Ring capacity overflow ────────────────────────────────────────────────────
 
-// TestURing_BeyondRingCapacity submits more ops in a single Submission than
+// TestURing_BeyondRingCapacity submits more ops in a single Submit call than
 // the ring's SQ depth. The coordinator is expected to fill slots incrementally
 // across multiple SubmitAndWait cycles until all ops complete.
 func TestURing_BeyondRingCapacity(t *testing.T) {
-	const ringDepth = 32 // deliberately small
+	const ringDepth = 32           // deliberately small
 	const numOps = ringDepth*3 + 7 // 103 ops — well beyond the ring
 
 	s := newURingSched(t, iosched.URingConfig{RingDepth: ringDepth})
@@ -282,7 +288,7 @@ func TestURing_BeyondRingCapacity(t *testing.T) {
 		ops[i] = iosched.ReadOp(f, bufs[i], int64(i*4096))
 	}
 
-	// Single Submission with numOps ops — coordinator must batch into the ring.
+	// Single Submit with numOps ops — the scheduler must batch into the ring.
 	results := submitWait(t, s, ops)
 	require.Len(t, results, numOps)
 
@@ -307,10 +313,7 @@ func TestURing_CloseThenSubmit(t *testing.T) {
 	f := openRW(t, path)
 
 	buf := make([]byte, 4096)
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-	ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, 0)}
-	err = s.Submit(ticket)
+	err = s.Submit([]iosched.Op{iosched.ReadOp(f, buf, 0)})
 	require.Error(t, err)
 }
 
@@ -329,12 +332,9 @@ func TestURing_SQPOLL(t *testing.T) {
 	defer f.Close()
 
 	buf := make([]byte, 4096)
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-	ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, 0)}
-	require.NoError(t, s.Submit(ticket))
-	ticket.Wait()
-	require.NoError(t, ticket.Ops[0].Result().Err)
+	ops := []iosched.Op{iosched.ReadOp(f, buf, 0)}
+	require.NoError(t, s.Submit(ops))
+	require.NoError(t, ops[0].Result().Err)
 	require.Equal(t, data, buf)
 }
 
@@ -402,26 +402,37 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 
 	payloads := make([][]byte, chunks)
 	slots := make([]mempool.Slot, chunks)
-	tickets := make([]*iosched.Ticket, chunks)
 
-	// Submit all writes concurrently.
 	for i := range chunks {
 		payloads[i] = make([]byte, align.BlockSize)
 		_, _ = rand.Read(payloads[i])
 
 		slots[i], _ = pool.Acquire()
 		copy(slots[i].Data, payloads[i])
-
-		tickets[i] = iosched.NewTicket()
-		tickets[i].Ops = []iosched.Op{iosched.WriteFixedOp(f, slots[i], int64(i*align.BlockSize))}
-		require.NoError(t, s.Submit(tickets[i]))
 	}
 
-	for i := range tickets {
-		tickets[i].Wait()
-		require.NoError(t, tickets[i].Ops[0].Result().Err, "chunk %d write failed", i)
+	// Submit concurrently — drain-leader batches them into shared submits.
+	errs := make(chan error, chunks)
+	var wg sync.WaitGroup
+	for i := range chunks {
+		wg.Go(func() {
+			ops := []iosched.Op{iosched.WriteFixedOp(f, slots[i], int64(i*align.BlockSize))}
+			if err := s.Submit(ops); err != nil {
+				errs <- fmt.Errorf("chunk %d submit: %w", i, err)
+				return
+			}
+			if err := ops[0].Result().Err; err != nil {
+				errs <- fmt.Errorf("chunk %d write: %w", i, err)
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	for i := range chunks {
 		slots[i].Release()
-		tickets[i].Release()
 	}
 
 	// Verify on-disk content with normal reads.
@@ -467,17 +478,14 @@ func TestURing_MaxInflightOps_ReturnsErrTooBusy(t *testing.T) {
 	path, _ := writeUringFile(t, 5*4096)
 	f := openRW(t, path)
 
-	// Submission of 5 ops exceeds MaxInflightOps=4 immediately.
+	// A Submit call of 5 ops exceeds MaxInflightOps=4 immediately.
 	ops := make([]iosched.Op, 5)
 	bufs := make([][]byte, 5)
 	for i := range ops {
 		bufs[i] = make([]byte, 4096)
 		ops[i] = iosched.ReadOp(f, bufs[i], int64(i*4096))
 	}
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-	ticket.Ops = ops
-	err := s.Submit(ticket)
+	err := s.Submit(ops)
 	require.ErrorIs(t, err, iosched.ErrTooBusy)
 }
 
@@ -498,20 +506,13 @@ func TestURing_MaxInflightOps_RecoversAfterCompletion(t *testing.T) {
 		bufs[i] = make([]byte, 4096)
 		ops[i] = iosched.ReadOp(f, bufs[i], 0)
 	}
-	t1 := iosched.NewTicket()
-	defer t1.Release()
-	t1.Ops = ops
-	require.NoError(t, s.Submit(t1))
-	t1.Wait()
+	require.NoError(t, s.Submit(ops))
 
 	// Budget should now be restored. Submit again.
 	buf := make([]byte, 4096)
-	t2 := iosched.NewTicket()
-	defer t2.Release()
-	t2.Ops = []iosched.Op{iosched.ReadOp(f, buf, 0)}
-	require.NoError(t, s.Submit(t2))
-	t2.Wait()
-	require.NoError(t, t2.Ops[0].Result().Err)
+	ops2 := []iosched.Op{iosched.ReadOp(f, buf, 0)}
+	require.NoError(t, s.Submit(ops2))
+	require.NoError(t, ops2[0].Result().Err)
 }
 
 // TestURing_MaxInflightOps_UnlimitedByDefault verifies that with the default
@@ -521,19 +522,28 @@ func TestURing_MaxInflightOps_UnlimitedByDefault(t *testing.T) {
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
+	// Submit N concurrent goroutines under default config (no cap).
 	const N = 500
-	tickets := make([]*iosched.Ticket, N)
 	bufs := make([][]byte, N)
-	for i := range tickets {
+	errs := make(chan error, N)
+	var wg sync.WaitGroup
+	for i := range N {
 		bufs[i] = make([]byte, 4096)
-		tickets[i] = iosched.NewTicket()
-		tickets[i].Ops = []iosched.Op{iosched.ReadOp(f, bufs[i], 0)}
-		require.NoError(t, s.Submit(tickets[i]))
+		wg.Go(func() {
+			ops := []iosched.Op{iosched.ReadOp(f, bufs[i], 0)}
+			if err := s.Submit(ops); err != nil {
+				errs <- err
+				return
+			}
+			if err := ops[0].Result().Err; err != nil {
+				errs <- err
+			}
+		})
 	}
-	for i := range tickets {
-		tickets[i].Wait()
-		require.NoError(t, tickets[i].Ops[0].Result().Err)
-		tickets[i].Release()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 
@@ -550,105 +560,36 @@ func TestNewDefaultIO_UsesURing(t *testing.T) {
 	require.True(t, ok)
 }
 
-// ── Submission lifecycle / API ────────────────────────────────────────────────
+// ── Concurrency / drain-leader behavior ─────────────────────────────────────
 
-// TestURing_Ticket_LongDelayBeforeWait verifies that a Ticket remains valid
-// (and the results readable) even when the caller waits long after Submit.
-// The library-pooled Ticket lets the scheduler complete the IO concurrently;
-// Wait then returns immediately on the already-done WaitGroup.
-func TestURing_Ticket_LongDelayBeforeWait(t *testing.T) {
+// TestURing_ManyConcurrentSubmits verifies that many concurrent goroutines
+// can all call Submit and the drain-leader pattern correctly batches and
+// completes them.
+func TestURing_ManyConcurrentSubmits(t *testing.T) {
 	s := newURingSched(t)
-	path, data := writeUringFile(t, 4096)
-	f := openRW(t, path)
-
-	buf := make([]byte, 4096)
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-	ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, 0)}
-	require.NoError(t, s.Submit(ticket))
-
-	// Sleep long enough that the op has surely completed.
-	time.Sleep(100 * time.Millisecond)
-
-	// Wait returns immediately since the WaitGroup counter is already 0.
-	ticket.Wait()
-	res := ticket.Ops[0].Result()
-	require.NoError(t, res.Err)
-	require.Equal(t, 4096, res.N)
-	require.Equal(t, data, buf)
-}
-
-// TestURing_Ticket_PooledRoundTrip exercises explicit Ticket pool reuse.
-// NewTicket already returns from a sync.Pool internally; this test confirms
-// that NewTicket → Submit → Wait → Release cycle is repeatable.
-func TestURing_Ticket_PooledRoundTrip(t *testing.T) {
-	s := newURingSched(t)
-	path, data := writeUringFile(t, 4096)
-	f := openRW(t, path)
-
-	for i := 0; i < 100; i++ {
-		ticket := iosched.NewTicket()
-		buf := make([]byte, 4096)
-		ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, 0)}
-		require.NoError(t, s.Submit(ticket))
-		ticket.Wait()
-		res := ticket.Ops[0].Result()
-		require.NoError(t, res.Err, "iter %d", i)
-		require.Equal(t, data, buf, "iter %d", i)
-		ticket.Release()
-	}
-}
-
-// TestURing_Ticket_ContextNotComposable documents that Ticket.Wait does NOT
-// compose with context cancellation via select. (sync.WaitGroup does not
-// expose a chan.) Callers needing cancellation must wrap Wait in their own
-// goroutine; this test verifies that Wait still blocks until completion.
-func TestURing_Ticket_ContextNotComposable(t *testing.T) {
-	s := newURingSched(t)
-	path, _ := writeUringFile(t, 4096)
-	f := openRW(t, path)
-
-	buf := make([]byte, 4096)
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-	ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, 0)}
-	require.NoError(t, s.Submit(ticket))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-	_ = ctx  // ctx is not selectable against ticket.Wait
-
-	// ticket.Wait() blocks until the coordinator signals; ctx cancellation
-	// is invisible to it. Wait should return cleanly.
-	ticket.Wait()
-	require.NoError(t, ticket.Ops[0].Result().Err)
-}
-
-// TestURing_Ticket_ManyConcurrentWithoutLimit verifies that with default
-// MaxInflightOps=0 (unlimited), many concurrent Submits succeed.
-func TestURing_Ticket_ManyConcurrentWithoutLimit(t *testing.T) {
-	s := newURingSched(t) // default config; MaxInflightOps=0
-
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
 	const N = 200
-	tickets := make([]*iosched.Ticket, N)
 	bufs := make([][]byte, N)
-
-	var completed atomic.Int32
+	errs := make(chan error, N)
+	var wg sync.WaitGroup
 	for i := range N {
 		bufs[i] = make([]byte, 4096)
-		tickets[i] = iosched.NewTicket()
-		tickets[i].Ops = []iosched.Op{iosched.ReadOp(f, bufs[i], 0)}
-		require.NoError(t, s.Submit(tickets[i]))
+		wg.Go(func() {
+			ops := []iosched.Op{iosched.ReadOp(f, bufs[i], 0)}
+			if err := s.Submit(ops); err != nil {
+				errs <- err
+				return
+			}
+			if err := ops[0].Result().Err; err != nil {
+				errs <- err
+			}
+		})
 	}
-	for i := range tickets {
-		tickets[i].Wait()
-		if tickets[i].Ops[0].Result().Err == nil {
-			completed.Add(1)
-		}
-		tickets[i].Release()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
-	require.Equal(t, int32(N), completed.Load())
 }

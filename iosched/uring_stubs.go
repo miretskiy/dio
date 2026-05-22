@@ -22,7 +22,7 @@ func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
 // errors.
 type URingScheduler struct{}
 
-func (s *URingScheduler) Submit(_ *Ticket) error {
+func (s *URingScheduler) Submit(_ []Op) error {
 	return errors.New("iosched: io_uring requires Linux")
 }
 

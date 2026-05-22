@@ -1,7 +1,7 @@
 //go:build linux
 
-// Micro-benchmarks for the io_uring Submission API. These exercise the
-// hot path of Submit + sub.Done() against /instance_storage (NVMe) so
+// Micro-benchmarks for the io_uring Submit API. These exercise the
+// blocking Submit hot path against /instance_storage (NVMe) so
 // throughput, allocation behavior, and CPU utilization can be measured
 // against the real storage device rather than tmpfs.
 //
@@ -66,7 +66,7 @@ func benchFile(b *testing.B, size int64) *os.File {
 	return f
 }
 
-// BenchmarkSubmission_ReadAt_Serial measures one Submit + sub.Done() round
+// BenchmarkSubmission_ReadAt_Serial measures one Submit round
 // trip on a single goroutine — the simplest path through the scheduler.
 // Shows base latency + per-op allocation cost.
 func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
@@ -88,20 +88,14 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	// Use a single Ticket reused across iterations. The Ticket itself is
-	// pool-managed, so even without explicit reuse the cost is amortized;
-	// reusing locally exercises the steady-state allocation profile.
-	ticket := iosched.NewTicket()
-	defer ticket.Release()
-
+	ops := make([]iosched.Op, 1)
 	for i := range b.N {
 		offset := int64((i * blockSize) % (fileSize - blockSize))
-		ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, offset)}
-		if err := sched.Submit(ticket); err != nil {
+		ops[0] = iosched.ReadOp(f, buf, offset)
+		if err := sched.Submit(ops); err != nil {
 			b.Fatalf("submit: %v", err)
 		}
-		ticket.Wait()
-		if res := ticket.Ops[0].Result(); res.Err != nil {
+		if res := ops[0].Result(); res.Err != nil {
 			b.Fatalf("read: %v", res.Err)
 		}
 	}
@@ -110,7 +104,7 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 }
 
 // reportSchedStats emits ops/syscall as a custom benchmark metric so
-// benchstat can summarize the average batch size achieved by the coordinator.
+// benchstat can summarize the average batch size achieved by the scheduler.
 func reportSchedStats(b *testing.B, sched *iosched.URingScheduler) {
 	st := sched.Stats()
 	if st.Syscalls == 0 {
@@ -120,8 +114,7 @@ func reportSchedStats(b *testing.B, sched *iosched.URingScheduler) {
 }
 
 // BenchmarkSubmission_ReadAt_Parallel measures throughput under N concurrent
-// readers. Exercises the signal-channel fast path + overflow slow path under
-// contention.
+// readers. Exercises leader election and batch swapping under contention.
 func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
@@ -142,18 +135,16 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		buf := make([]byte, blockSize)
-		ticket := iosched.NewTicket()
-		defer ticket.Release()
+		ops := make([]iosched.Op, 1)
 		var i int64
 		for pb.Next() {
 			offset := (i * blockSize) % (fileSize - blockSize)
 			i++
-			ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, offset)}
-			if err := sched.Submit(ticket); err != nil {
+			ops[0] = iosched.ReadOp(f, buf, offset)
+			if err := sched.Submit(ops); err != nil {
 				b.Fatalf("submit: %v", err)
 			}
-			ticket.Wait()
-			if res := ticket.Ops[0].Result(); res.Err != nil {
+			if res := ops[0].Result(); res.Err != nil {
 				b.Fatalf("read: %v", res.Err)
 			}
 		}
@@ -163,7 +154,7 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 }
 
 // BenchmarkSubmission_Concurrency sweeps the number of submitter goroutines
-// to see how the coordinator's opportunistic batching scales with arrival
+// to see how the scheduler's opportunistic batching scales with arrival
 // concurrency. Each goroutine submits 4 KiB reads in a tight loop. The
 // reported ops/syscall metric is the average number of SQEs placed per
 // io_uring_enter call — the directly observable "did batching happen?"
@@ -201,17 +192,15 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 				}
 				wg.Go(func() {
 					buf := make([]byte, blockSize)
-					ticket := iosched.NewTicket()
-					defer ticket.Release()
+					ops := make([]iosched.Op, 1)
 					for i := range count {
 						offset := int64((i * blockSize) % (fileSize - blockSize))
-						ticket.Ops = []iosched.Op{iosched.ReadOp(f, buf, offset)}
-						if err := sched.Submit(ticket); err != nil {
+						ops[0] = iosched.ReadOp(f, buf, offset)
+						if err := sched.Submit(ops); err != nil {
 							b.Errorf("submit: %v", err)
 							return
 						}
-						ticket.Wait()
-						if res := ticket.Ops[0].Result(); res.Err != nil {
+						if res := ops[0].Result(); res.Err != nil {
 							b.Errorf("read: %v", res.Err)
 							return
 						}
@@ -225,10 +214,10 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 	}
 }
 
-// BenchmarkSubmission_BatchedReads measures the cost of a single Submission
-// that carries many ops — exercises the per-Submission overhead amortized
+// BenchmarkSubmission_BatchedReads measures the cost of a single Submit call
+// that carries many ops — exercises the per-call overhead amortized
 // across N ops. Compared against _Serial this isolates the fixed cost of
-// Submit + Done vs the variable cost of placing/reaping ops.
+// Submit vs the variable cost of placing/reaping ops.
 func BenchmarkSubmission_BatchedReads(b *testing.B) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
@@ -254,21 +243,17 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			ticket := iosched.NewTicket()
-			defer ticket.Release()
 			ops := make([]iosched.Op, batch)
 			for i := range b.N {
 				for j := range ops {
 					offset := int64(((i*batch + j) * blockSize) % (fileSize - blockSize))
 					ops[j] = iosched.ReadOp(f, bufs[j], offset)
 				}
-				ticket.Ops = ops
-				if err := sched.Submit(ticket); err != nil {
+				if err := sched.Submit(ops); err != nil {
 					b.Fatalf("submit: %v", err)
 				}
-				ticket.Wait()
-				for j := range ticket.Ops {
-					if res := ticket.Ops[j].Result(); res.Err != nil {
+				for j := range ops {
+					if res := ops[j].Result(); res.Err != nil {
 						b.Fatalf("read %d: %v", j, res.Err)
 					}
 				}

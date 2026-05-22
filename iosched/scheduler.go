@@ -8,11 +8,10 @@
 // Submit path. When io_uring is unavailable, it invokes POSIX syscalls
 // directly — no indirection, no scheduler.
 //
-// The [Scheduler] interface exposes the async Submit API for group-commit
-// scenarios: prepare a [Submission] of N ops, call Submit, then wait on
-// `<-sub.Done()`. The [URingScheduler] batches all enqueued SQEs into a
-// single io_uring_enter. Only [URingScheduler] implements Scheduler; it is
-// Linux-only.
+// The [Scheduler] interface exposes a blocking Submit API for group-commit
+// scenarios: prepare N ops, call Submit, then read each op's [Result]. The
+// [URingScheduler] batches concurrent Submit calls into shared io_uring_enter
+// cycles. Only [URingScheduler] implements Scheduler; it is Linux-only.
 //
 // Use [NewDefaultIO] to get the best available implementation for the host.
 package iosched
@@ -30,25 +29,32 @@ import (
 // The scheduler never blocks Submit waiting for budget.
 var ErrTooBusy = errors.New("iosched: too busy")
 
-// Scheduler is the async I/O submission interface.
+// Scheduler is the synchronous I/O submission interface.
 //
-// Callers build [Op] values, acquire a [Ticket] via [NewTicket], populate
-// Ticket.Ops, and call Submit. After Submit, the caller waits on
-// [Ticket.Wait] and then reads per-op results via [Op.Result]. Once
-// finished reading, the caller releases the Ticket back to the pool via
-// [Ticket.Release] (typically `defer t.Release()` immediately after
-// NewTicket).
+// Callers build [Op] values and call Submit, which blocks until every op
+// has completed (or the scheduler shuts down). After Submit returns,
+// per-op outcomes are readable via [Op.Result].
+//
+// Parallelism comes from goroutines: many goroutines may call Submit
+// concurrently. The scheduler batches concurrent submissions into shared
+// io_uring_enter calls via a drain-leader pattern — one caller does the
+// kernel work for itself and any other callers whose ops happen to be
+// queued at the same time.
 //
 // Ops with [Op.Linked] or [Op.HardLinked] form SQE chains executed in order
 // by the kernel. Independent ops may complete in any order.
 //
 // Implementations must be safe for concurrent use by multiple goroutines.
 type Scheduler interface {
-	// Submit enqueues t.Ops for asynchronous execution. Does not block on
-	// I/O completion. The scheduler retains *t internally for the duration
-	// of the request; the caller MUST call t.Wait before reading results
-	// or releasing the Ticket.
-	Submit(t *Ticket) error
+	// Submit executes ops and blocks until every op has completed. The
+	// caller's ops slice must remain valid for the duration of the call;
+	// since Submit blocks until completion, this is the caller's natural
+	// stack frame lifetime.
+	//
+	// After Submit returns nil, each op's result is readable via
+	// op.Result(). If Submit returns a non-nil error (scheduler closed,
+	// backpressure, etc.), the per-op results are not guaranteed.
+	Submit(ops []Op) error
 
 	io.Closer
 }
@@ -86,10 +92,10 @@ type URingConfig struct {
 
 	// MaxInflightOps caps the total number of ops currently in flight in
 	// the scheduler (queued + placed in the ring + awaiting reap). Submit
-	// returns [ErrTooBusy] when accepting a Submission would push the
+	// returns [ErrTooBusy] when accepting a Submit call would push the
 	// in-flight count above this cap. Zero (the default) means unlimited.
 	//
-	// Independent of RingDepth: a single Submission can carry many ops; the
+	// Independent of RingDepth: a single Submit call can carry many ops; the
 	// budget is per-op since each op holds resources for its lifetime in
 	// flight.
 	MaxInflightOps int64

@@ -4,13 +4,24 @@ Decisions and non-decisions, captured so we don't relitigate them.
 
 ## Coordinator model
 
-A single coordinator goroutine owns the io_uring ring exclusively. Producers
-deliver `*submitState` values to it via a buffered(1) `signal` channel (fast
-path, lock-free) with a mutex-protected `overflow.queue` slow path. The
-coordinator drains both each cycle, places SQEs, calls `io_uring_enter`,
-and reaps CQEs. A single goroutine owning the ring is what io_uring expects;
-multi-coordinator designs (sharded rings) are possible but unnecessary at
-our scale.
+There is no permanent coordinator goroutine. Concurrent callers use a
+group-commit leader election: each `Submit` appends a small request to the
+pending queue; if no leader is active, that caller swaps the queue into a
+private batch, owns the io_uring ring until the batch completes, then publishes
+completion for every request under the mutex.
+
+The important property is still single ownership of the ring. At any instant,
+exactly one leader touches SQ/CQ state, `inflight`, or `freeSlots`. Other
+callers wait on the condition variable and either join the next batch or return
+after their request is published complete.
+
+The tradeoff is that the elected leader pays the coordination cost directly.
+Its observed completion latency can be worse than followers, and worse than the
+previous async-coordinator model, because it submits, reaps, and publishes
+completion for the whole batch before returning from its own `Submit`. The
+benchmarks measure average API cost well, but they do not separate leader and
+follower completion latency; if that tail behavior matters, the benchmark
+should record those roles independently.
 
 ## Backpressure: `MaxInflightOps`
 
@@ -20,26 +31,27 @@ returns `ErrTooBusy` immediately — `Submit` never blocks.
 We considered a counter-with-cond-var design that *blocks* `Submit` when
 the budget is exhausted. Rejected because:
 
-- It coupled correctness to `Wait` being called (callers who forgot to
-  Wait could permanently consume budget).
+- It would let callers park inside `Submit` indefinitely and provide no clear
+  cancellation story.
 - There was no clean way to cancel a blocked `Submit` (no context, no
   per-call timeout).
 - Caller-side policy (retry, backoff, give up) belongs at the caller, not
   inside the scheduler.
 
 Returning `ErrTooBusy` lets the caller decide. Default `MaxInflightOps=0`
-means unlimited — the scheduler does no backpressure of its own.
+means unlimited — the scheduler does no backpressure of its own and does not
+touch the global in-flight atomic counter on the hot path.
 
-## We do not implement: `BatchDelay` / opportunistic coalescing
+## We do not implement: `BatchDelay`
 
 We seriously considered, prototyped, and benchmarked an opt-in
-`BatchDelay time.Duration` knob: the coordinator would wait up to
+`BatchDelay time.Duration` knob: the scheduler would wait up to
 `BatchDelay` after collecting the first batch to give more submissions a
 chance to arrive before issuing the syscall. Trade submit-side latency
 for syscall efficiency.
 
 The benchmark (concurrent goroutines each doing serial
-`Submit → <-sub.Done()`) showed `BatchDelay` is *strongly net-negative*
+`Submit`) showed `BatchDelay` is *strongly net-negative*
 for our workload:
 
 | goroutines | no delay (ns/op) | 100µs delay (ns/op) | regression |
@@ -55,7 +67,7 @@ Throughput tells the same story:
 | 128 | 3353 | 464 |
 
 Yes, `ops/syscall` improved (88 → 127 at 128 goroutines, perfect batching
-at lower counts), but pipeline depth collapsed. The coordinator was waiting
+at lower counts), but pipeline depth collapsed. The scheduler was waiting
 on the timer while the kernel sat idle. We trade *throughput* for syscall
 density, not (as one might assume) *latency* for throughput.
 
@@ -65,11 +77,14 @@ between submissions, rather than waiting for each completion. We do not
 target that workload (kura's S3 backend uses one goroutine per request,
 each doing blocking IO).
 
-If a future workload genuinely needs this, design from scratch — not
-necessarily by reintroducing `BatchDelay`. A shared completion queue
-(producer-consumer model where the kernel/coordinator publishes completed
-submissions onto a single channel for any goroutine to pick up) would be
-the more honest answer for fan-out reaping.
+The group-commit path still batches opportunistically: all requests already in
+the pending queue when a leader swaps the batch share the same ring drain. It
+does not sleep to manufacture larger batches.
+
+We also tried a timer-free coalescing yield (`runtime.Gosched`) plus one
+bounded post-reap pending drain while the leader's own request was incomplete.
+That recovered syscall density, but it made the measured API latency worse
+across the compact benchmark matrix, so the code keeps the immediate swap.
 
 ## We do not enable `SQPOLL` by default
 
@@ -79,21 +94,13 @@ kernel poller falling asleep and requiring `IORING_ENTER_SQ_WAKEUP` to
 restart. It only catches up at 64+ goroutines, where it's marginally
 better but not enough to recommend default-on.
 
-## Per-Submission `done` channel
+## Per-Submit request allocation
 
-Each `Submission` allocates its own `chan struct{}` when constructed via
-`PrepareWaitableSubmission`. This is the largest per-Submit allocation
-(~96 B). We've considered:
-
-- **Lazy allocation** (context.Context-style): allocate `done` only when
-  caller actually waits. Saves the chan for fire-and-forget callers. Not
-  done; fire-and-forget isn't our target case.
-- **Shared completion queue**: one chan per scheduler, all completions
-  pushed onto it. Drops per-Submission chan entirely but changes the API
-  model substantially. Not done.
-
-For now, per-Submission chan is the right balance: clear caller semantics
-(`<-sub.Done()` composes with select and context), small but bounded cost.
+The scheduler intentionally allocates one small internal request per `Submit`.
+There is no `sync.Pool`: pooled request handles made ownership harder to reason
+about and hid a real lifetime bug when one caller returned a handle while a
+leader still had it in its active batch. The plain allocation is easier to audit,
+and the request becomes unreachable as soon as the completed batch is cleared.
 
 ## Things we explicitly punt on
 
@@ -101,5 +108,5 @@ For now, per-Submission chan is the right balance: clear caller semantics
   device; multi-device would be a different architecture.
 - **Adaptive batching** (measure recent batch size, tune delay). Too clever;
   static config is honest about the tradeoff.
-- **Lock-free overflow queue** (Treiber stack with sync.Pool nodes). The
-  overflow path is rare; the mutex cost there is invisible in practice.
+- **Lock-free pending queue** (Treiber stack with pooled nodes). The mutex is
+  simpler, and submit-side contention is not the bottleneck for this scheduler.
