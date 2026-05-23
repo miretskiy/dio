@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/miretskiy/dio/giouring"
@@ -43,6 +44,39 @@ type request struct {
 	nextOp  int   // next op index to place into the ring
 	done    bool  // protected by URingScheduler.mu
 	err     error // protected by URingScheduler.mu once done is published
+	trace   *requestTrace
+}
+
+type requestTrace struct {
+	sink               uringTraceSink
+	start              time.Time
+	completed          time.Time
+	role               uringTraceRole
+	queuedBehindLeader bool
+	queueLatency       time.Duration
+	batchSize          int
+	batchCycles        int
+}
+
+type uringTraceRole uint8
+
+const (
+	uringTraceLeader uringTraceRole = iota + 1
+	uringTraceFollower
+)
+
+type uringTraceEvent struct {
+	role               uringTraceRole
+	queuedBehindLeader bool
+	submitLatency      time.Duration
+	queueLatency       time.Duration
+	completeToReturn   time.Duration
+	batchSize          int
+	batchCycles        int
+}
+
+type uringTraceSink interface {
+	recordURingTrace(uringTraceEvent)
 }
 
 // inflightEntry maps a ring slot to the request and op that owns it.
@@ -102,6 +136,8 @@ type URingScheduler struct {
 		syscalls  uint64
 		opsPlaced uint64
 	}
+
+	trace uringTraceSink
 
 	// Ring + ring-owned state. Accessed only by the active leader (the
 	// leaderActive flag under mu serializes ownership). Producers that are
@@ -222,6 +258,13 @@ func (s *URingScheduler) Submit(ops []Op) error {
 	}
 
 	s.mu.Lock()
+	if s.trace != nil {
+		r.trace = &requestTrace{
+			sink:               s.trace,
+			start:              time.Now(),
+			queuedBehindLeader: s.leaderActive,
+		}
+	}
 	if s.closing.closed {
 		// Scheduler is already shut down; refund the budget and bail.
 		s.releaseInflight(n)
@@ -234,6 +277,7 @@ func (s *URingScheduler) Submit(ops []Op) error {
 	for {
 		if r.done {
 			err := r.err
+			s.recordTraceReturnLocked(r)
 			s.mu.Unlock()
 			return err
 		}
@@ -252,6 +296,7 @@ func (s *URingScheduler) Submit(ops []Op) error {
 		batch := s.pending
 		s.pending = s.flushing[:0]
 		s.flushing = nil
+		s.recordTraceBatchStartLocked(batch, r)
 		s.mu.Unlock()
 
 		stats, err := s.runLeader(batch)
@@ -259,6 +304,7 @@ func (s *URingScheduler) Submit(ops []Op) error {
 		s.mu.Lock()
 		s.stats.syscalls += stats.syscalls
 		s.stats.opsPlaced += stats.opsPlaced
+		s.recordTraceBatchCyclesLocked(batch, stats.cycles)
 		if err != nil {
 			s.closeLocked(err)
 		}
@@ -285,6 +331,7 @@ func (s *URingScheduler) Submit(ops []Op) error {
 		}
 		if r.done {
 			err := r.err
+			s.recordTraceReturnLocked(r)
 			s.mu.Unlock()
 			return err
 		}
@@ -301,6 +348,7 @@ func (s *URingScheduler) Submit(ops []Op) error {
 func (s *URingScheduler) runLeader(batch []*request) (leaderStats, error) {
 	var stats leaderStats
 	for !allComplete(batch) {
+		stats.cycles++
 		before := s.nInflight
 		if err := s.fillSlots(batch); err != nil {
 			s.failInflight(err)
@@ -335,6 +383,7 @@ func (s *URingScheduler) runLeader(batch []*request) (leaderStats, error) {
 type leaderStats struct {
 	syscalls  uint64
 	opsPlaced uint64
+	cycles    int
 }
 
 func allComplete(batch []*request) bool {
@@ -492,7 +541,76 @@ func (s *URingScheduler) releaseSlot(slot int) {
 // whole swapped batch has completed, under URingScheduler.mu.
 func (s *URingScheduler) complete(r *request, n int32) {
 	r.pending -= n
+	if r.pending == 0 {
+		s.recordTraceComplete(r)
+	}
 	s.releaseInflight(int64(n))
+}
+
+func (s *URingScheduler) recordTraceBatchStartLocked(batch []*request, leader *request) {
+	if s.trace == nil {
+		return
+	}
+	hasTrace := false
+	for _, r := range batch {
+		if r.trace != nil {
+			hasTrace = true
+			break
+		}
+	}
+	if !hasTrace {
+		return
+	}
+	now := time.Now()
+	for _, r := range batch {
+		if r.trace == nil {
+			continue
+		}
+		r.trace.role = uringTraceFollower
+		if r == leader {
+			r.trace.role = uringTraceLeader
+		}
+		r.trace.queueLatency = now.Sub(r.trace.start)
+		r.trace.batchSize = len(batch)
+	}
+}
+
+func (s *URingScheduler) recordTraceBatchCyclesLocked(batch []*request, cycles int) {
+	if s.trace == nil {
+		return
+	}
+	for _, r := range batch {
+		if r.trace != nil {
+			r.trace.batchCycles = cycles
+		}
+	}
+}
+
+func (s *URingScheduler) recordTraceComplete(r *request) {
+	if r.trace == nil || !r.trace.completed.IsZero() {
+		return
+	}
+	r.trace.completed = time.Now()
+}
+
+func (s *URingScheduler) recordTraceReturnLocked(r *request) {
+	if r.trace == nil {
+		return
+	}
+	now := time.Now()
+	completeToReturn := time.Duration(0)
+	if !r.trace.completed.IsZero() {
+		completeToReturn = now.Sub(r.trace.completed)
+	}
+	r.trace.sink.recordURingTrace(uringTraceEvent{
+		role:               r.trace.role,
+		queuedBehindLeader: r.trace.queuedBehindLeader,
+		submitLatency:      now.Sub(r.trace.start),
+		queueLatency:       r.trace.queueLatency,
+		completeToReturn:   completeToReturn,
+		batchSize:          r.trace.batchSize,
+		batchCycles:        r.trace.batchCycles,
+	})
 }
 
 // failInflight fails every valid inflight entry with err. Used when
@@ -534,6 +652,9 @@ func (s *URingScheduler) failBatch(batch []*request, err error) {
 		if unplaced > 0 {
 			r.nextOp = len(r.ops)
 			r.pending -= unplaced
+			if r.pending == 0 {
+				s.recordTraceComplete(r)
+			}
 			s.releaseInflight(int64(unplaced))
 		}
 		if r.err == nil {
@@ -572,6 +693,7 @@ func (s *URingScheduler) failPendingLocked(err error) {
 		if r.pending > 0 {
 			s.releaseInflight(int64(r.pending))
 			r.pending = 0
+			s.recordTraceComplete(r)
 		}
 		r.nextOp = len(r.ops)
 		r.err = err
