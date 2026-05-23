@@ -158,7 +158,7 @@ func BenchmarkURingSubmitRoleLatency(b *testing.B) {
 
 			recorder := &uringLatencyRecorder{}
 			sched.mu.Lock()
-			sched.trace = recorder
+			sched.trace = newURingTraceState(recorder)
 			sched.mu.Unlock()
 
 			b.SetBytes(blockSize)

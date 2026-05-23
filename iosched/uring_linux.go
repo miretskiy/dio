@@ -44,7 +44,6 @@ type request struct {
 	nextOp  int   // next op index to place into the ring
 	done    bool  // protected by URingScheduler.mu
 	err     error // protected by URingScheduler.mu once done is published
-	trace   *requestTrace
 }
 
 type requestTrace struct {
@@ -77,6 +76,20 @@ type uringTraceEvent struct {
 
 type uringTraceSink interface {
 	recordURingTrace(uringTraceEvent)
+}
+
+type uringTraceState struct {
+	sink uringTraceSink
+
+	mu       sync.Mutex
+	requests map[*request]*requestTrace
+}
+
+func newURingTraceState(sink uringTraceSink) *uringTraceState {
+	return &uringTraceState{
+		sink:     sink,
+		requests: make(map[*request]*requestTrace),
+	}
 }
 
 // inflightEntry maps a ring slot to the request and op that owns it.
@@ -137,7 +150,7 @@ type URingScheduler struct {
 		opsPlaced uint64
 	}
 
-	trace uringTraceSink
+	trace *uringTraceState
 
 	// Ring + ring-owned state. Accessed only by the active leader (the
 	// leaderActive flag under mu serializes ownership). Producers that are
@@ -259,11 +272,7 @@ func (s *URingScheduler) Submit(ops []Op) error {
 
 	s.mu.Lock()
 	if s.trace != nil {
-		r.trace = &requestTrace{
-			sink:               s.trace,
-			start:              time.Now(),
-			queuedBehindLeader: s.leaderActive,
-		}
+		s.trace.start(r, s.leaderActive)
 	}
 	if s.closing.closed {
 		// Scheduler is already shut down; refund the budget and bail.
@@ -551,27 +560,34 @@ func (s *URingScheduler) recordTraceBatchStartLocked(batch []*request, leader *r
 	if s.trace == nil {
 		return
 	}
-	hasTrace := false
-	for _, r := range batch {
-		if r.trace != nil {
-			hasTrace = true
-			break
-		}
+	s.trace.batchStart(batch, leader)
+}
+
+func (t *uringTraceState) start(r *request, queuedBehindLeader bool) {
+	t.mu.Lock()
+	t.requests[r] = &requestTrace{
+		sink:               t.sink,
+		start:              time.Now(),
+		queuedBehindLeader: queuedBehindLeader,
 	}
-	if !hasTrace {
-		return
-	}
+	t.mu.Unlock()
+}
+
+func (t *uringTraceState) batchStart(batch []*request, leader *request) {
 	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, r := range batch {
-		if r.trace == nil {
+		tr := t.requests[r]
+		if tr == nil {
 			continue
 		}
-		r.trace.role = uringTraceFollower
+		tr.role = uringTraceFollower
 		if r == leader {
-			r.trace.role = uringTraceLeader
+			tr.role = uringTraceLeader
 		}
-		r.trace.queueLatency = now.Sub(r.trace.start)
-		r.trace.batchSize = len(batch)
+		tr.queueLatency = now.Sub(tr.start)
+		tr.batchSize = len(batch)
 	}
 }
 
@@ -579,38 +595,71 @@ func (s *URingScheduler) recordTraceBatchCyclesLocked(batch []*request, cycles i
 	if s.trace == nil {
 		return
 	}
+	s.trace.batchCycles(batch, cycles)
+}
+
+func (t *uringTraceState) batchCycles(batch []*request, cycles int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, r := range batch {
-		if r.trace != nil {
-			r.trace.batchCycles = cycles
+		tr := t.requests[r]
+		if tr != nil {
+			tr.batchSize = len(batch)
+			tr.batchCycles = cycles
 		}
 	}
 }
 
 func (s *URingScheduler) recordTraceComplete(r *request) {
-	if r.trace == nil || !r.trace.completed.IsZero() {
+	if s.trace == nil {
 		return
 	}
-	r.trace.completed = time.Now()
+	s.trace.complete(r)
+}
+
+func (t *uringTraceState) complete(r *request) {
+	now := time.Now()
+	t.mu.Lock()
+	if tr := t.requests[r]; tr != nil && tr.completed.IsZero() {
+		tr.completed = now
+	}
+	t.mu.Unlock()
 }
 
 func (s *URingScheduler) recordTraceReturnLocked(r *request) {
-	if r.trace == nil {
+	if s.trace == nil {
 		return
 	}
+	s.trace.finish(r)
+}
+
+func (t *uringTraceState) finish(r *request) {
 	now := time.Now()
-	completeToReturn := time.Duration(0)
-	if !r.trace.completed.IsZero() {
-		completeToReturn = now.Sub(r.trace.completed)
+	t.mu.Lock()
+	tr := t.requests[r]
+	if tr == nil {
+		t.mu.Unlock()
+		return
 	}
-	r.trace.sink.recordURingTrace(uringTraceEvent{
-		role:               r.trace.role,
-		queuedBehindLeader: r.trace.queuedBehindLeader,
-		submitLatency:      now.Sub(r.trace.start),
-		queueLatency:       r.trace.queueLatency,
+	delete(t.requests, r)
+
+	completeToReturn := time.Duration(0)
+	if !tr.completed.IsZero() {
+		completeToReturn = now.Sub(tr.completed)
+	}
+	event := uringTraceEvent{
+		role:               tr.role,
+		queuedBehindLeader: tr.queuedBehindLeader,
+		submitLatency:      now.Sub(tr.start),
+		queueLatency:       tr.queueLatency,
 		completeToReturn:   completeToReturn,
-		batchSize:          r.trace.batchSize,
-		batchCycles:        r.trace.batchCycles,
-	})
+		batchSize:          tr.batchSize,
+		batchCycles:        tr.batchCycles,
+	}
+	sink := tr.sink
+	t.mu.Unlock()
+
+	sink.recordURingTrace(event)
 }
 
 // failInflight fails every valid inflight entry with err. Used when
