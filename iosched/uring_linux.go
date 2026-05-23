@@ -272,11 +272,16 @@ func (s *URingScheduler) Submit(ops []Op) error {
 			br.done = true
 		}
 		s.leaderActive = false
-		needBroadcast := len(batch) > 1 || len(s.pending) > 0 || s.closing.closed
+		wakeCompletedFollowers := len(batch) > 1
+		wakeNextLeader := len(s.pending) > 0
+		closing := s.closing.closed
 		clear(batch)
 		s.flushing = batch[:0]
-		if needBroadcast {
+		switch {
+		case closing || wakeCompletedFollowers:
 			s.cond.Broadcast()
+		case wakeNextLeader:
+			s.cond.Signal()
 		}
 		if r.done {
 			err := r.err
