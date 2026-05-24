@@ -29,16 +29,16 @@ func TestURing_ReusedSQEWriteAfterFdatasync(t *testing.T) {
 		payload[i] = byte(i)
 	}
 
-	results := submitWait(t, s, []iosched.Op{iosched.WriteOp(f, payload, 0)})
-	require.NoError(t, results[0].Err)
-	require.Equal(t, len(payload), results[0].N)
+	res := submitResult(t, s, iosched.WriteOp(f, payload, 0))
+	require.NoError(t, res.Err)
+	require.Equal(t, len(payload), res.N)
 
-	results = submitWait(t, s, []iosched.Op{iosched.FdatasyncOp(f)})
-	require.NoError(t, results[0].Err)
+	res = submitResult(t, s, iosched.FdatasyncOp(f))
+	require.NoError(t, res.Err)
 
-	results = submitWait(t, s, []iosched.Op{iosched.WriteOp(f, payload, int64(len(payload)))})
-	require.NoError(t, results[0].Err)
-	require.Equal(t, len(payload), results[0].N)
+	res = submitResult(t, s, iosched.WriteOp(f, payload, int64(len(payload))))
+	require.NoError(t, res.Err)
+	require.Equal(t, len(payload), res.N)
 }
 
 func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
@@ -73,30 +73,32 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 			<-start
 
 			payload := payloads[worker]
-			ops := make([]iosched.Op, 2)
 			for round := range rounds {
 				offset := int64((worker*rounds + round) * align.BlockSize)
-				ops[0] = iosched.WriteOp(f, payload, offset).Linked()
-				ops[1] = iosched.FdatasyncOp(f)
-				if err := s.Submit(ops); err != nil {
+				ticket, err := s.Submit(iosched.WriteOp(f, payload, offset).Link(iosched.FdatasyncOp(f)))
+				if err != nil {
 					errs <- fmt.Errorf("worker %d round %d submit: %w", worker, round, err)
 					return
 				}
+				ticket.Wait()
 
-				r0 := ops[0].Result()
-				r1 := ops[1].Result()
+				r0 := ticket.Op.Result
 				if r0.Err != nil {
+					ticket.Release()
 					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, r0.N, r0.Err)
 					return
 				}
 				if r0.N != len(payload) {
+					ticket.Release()
 					errs <- fmt.Errorf("worker %d round %d write count: got %d want %d", worker, round, r0.N, len(payload))
 					return
 				}
-				if r1.Err != nil {
-					errs <- fmt.Errorf("worker %d round %d fdatasync: %w", worker, round, r1.Err)
+				if err := ticket.Error(); err != nil {
+					ticket.Release()
+					errs <- fmt.Errorf("worker %d round %d linked chain: %w", worker, round, err)
 					return
 				}
+				ticket.Release()
 			}
 		}()
 	}

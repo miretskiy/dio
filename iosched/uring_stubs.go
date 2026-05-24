@@ -4,26 +4,26 @@ package iosched
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/miretskiy/dio/mempool"
 )
 
 // IOUringAvailable reports whether io_uring is supported.
-// Always false on non-Linux platforms.
 const IOUringAvailable = false
+
+// URingScheduler is declared so code referencing the type compiles on non-Linux.
+type URingScheduler struct {
+	ticketPool sync.Pool
+}
 
 // NewURingScheduler always returns an error on non-Linux platforms.
 func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
 	return nil, errors.New("iosched: io_uring requires Linux")
 }
 
-// URingScheduler is declared here so that code referencing the type compiles
-// on non-Linux. The struct is intentionally empty; NewURingScheduler always
-// errors.
-type URingScheduler struct{}
-
-func (s *URingScheduler) Submit(_ []Op) error {
-	return errors.New("iosched: io_uring requires Linux")
+func (s *URingScheduler) Submit(_ Op) (*Ticket, error) {
+	return nil, errors.New("iosched: io_uring requires Linux")
 }
 
 func (s *URingScheduler) Close() error { return nil }

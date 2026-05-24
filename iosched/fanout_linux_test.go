@@ -187,12 +187,10 @@ func BenchmarkFanout_URing(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	writeOps := make([]iosched.Op, fanoutNumSinks)
+	writeTickets := make([]*iosched.Ticket, fanoutNumSinks)
 
 	b.SetBytes(fanoutChunk * (1 + fanoutNumSinks))
 	b.ResetTimer()
-
-	readOps := make([]iosched.Op, 1)
 
 	for i := range b.N {
 		offset := int64(i%fanoutNumChunks) * fanoutChunk
@@ -203,29 +201,37 @@ func BenchmarkFanout_URing(b *testing.B) {
 		}
 
 		// Fixed read.
-		readOps[0] = iosched.ReadFixedOp(ff.src, slot, offset)
-		if err := sched.Submit(readOps); err != nil {
+		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot, offset))
+		if err != nil {
 			slot.Release()
 			b.Fatalf("submit read: %v", err)
 		}
-		if rerr := readOps[0].Result().Err; rerr != nil {
+		readTicket.Wait()
+		if rerr := readTicket.Op.Result.Err; rerr != nil {
+			readTicket.Release()
 			slot.Release()
 			b.Fatalf("read at %d: %v", offset, rerr)
 		}
+		readTicket.Release()
 
-		// Fan-out: all sinks in one batch, dispatched in parallel by the ring.
+		// Fan-out: submit all sinks before waiting, allowing the coordinator
+		// to place them in the same ring wave.
 		for si := range fanoutNumSinks {
-			writeOps[si] = iosched.WriteFixedOp(ff.sinks[si], slot, offset)
-		}
-		if err := sched.Submit(writeOps); err != nil {
-			slot.Release()
-			b.Fatalf("submit writes: %v", err)
+			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot, offset))
+			if err != nil {
+				slot.Release()
+				b.Fatalf("submit write sink%d: %v", si+1, err)
+			}
+			writeTickets[si] = writeTicket
 		}
 		for si := range fanoutNumSinks {
-			if werr := writeOps[si].Result().Err; werr != nil {
+			writeTickets[si].Wait()
+			if werr := writeTickets[si].Op.Result.Err; werr != nil {
+				writeTickets[si].Release()
 				slot.Release()
 				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}
+			writeTickets[si].Release()
 		}
 
 		slot.Release()

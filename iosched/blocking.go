@@ -8,19 +8,7 @@ import (
 	"github.com/miretskiy/dio/sys"
 )
 
-// BlockingIO wraps an optional [Scheduler] with synchronous methods.
-// It works on all platforms.
-//
-// When S is non-nil (io_uring available), each method calls S.Submit with a
-// single-op slice and reads the per-op result.
-//
-// When S is nil, methods invoke POSIX syscalls directly with no indirection.
-//
-// # File lifetime
-//
-// Methods take *os.File, not raw fd integers. This ensures the GC can trace
-// the reference and the fd cannot be closed or reused while I/O is in flight.
-// See [Op] for a detailed explanation.
+// BlockingIO wraps an optional Scheduler with synchronous methods.
 type BlockingIO struct {
 	S Scheduler // nil for direct POSIX fallback
 }
@@ -30,13 +18,14 @@ func NewBlockingIO(s Scheduler) *BlockingIO {
 	return &BlockingIO{S: s}
 }
 
-// submitOne runs a single op through the scheduler and returns its Result.
 func (b *BlockingIO) submitOne(op Op) Result {
-	ops := []Op{op}
-	if err := b.S.Submit(ops); err != nil {
+	t, err := b.S.Submit(op)
+	if err != nil {
 		return Result{Err: err}
 	}
-	return ops[0].Result()
+	t.Wait()
+	defer t.Release()
+	return t.Op.Result
 }
 
 // ReadAt performs a positioned read.

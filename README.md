@@ -237,38 +237,34 @@ platforms; the implementation is swapped at construction time.
 import "github.com/miretskiy/dio/iosched"
 
 // Pick the best available backend automatically:
-//   Linux + io_uring kernel support → URingScheduler
-//   Otherwise                       → PwriteScheduler
-sched, err := iosched.NewDefaultScheduler()
-if err != nil {
-    return err
-}
-defer sched.Close()
+//   Linux + io_uring kernel support -> URingScheduler
+//   Otherwise                       -> direct POSIX syscalls
+bio := iosched.NewDefaultIO()
+defer bio.Close()
 
 f, _ := os.Open(path)
 defer f.Close()
 
 buf := make([]byte, blockSize)
-n, err := sched.ReadAt(int(f.Fd()), buf, offset)
+n, err := bio.ReadAt(f, buf, offset)
 
-n, err = sched.WriteAt(int(f.Fd()), buf[:n], offset)
+n, err = bio.WriteAt(f, buf[:n], offset)
 ```
 
-### PwriteScheduler (synchronous)
+### BlockingIO (synchronous)
 
-Zero-overhead baseline: each call maps directly to one `pread(2)` or
-`pwrite(2)` syscall.
+Portable synchronous wrapper. With a nil scheduler, each call maps directly to
+one `pread(2)`, `pwrite(2)`, or sync syscall.
 
 ```go
-sched, err := iosched.NewPwriteScheduler()
+bio := iosched.NewBlockingIO(nil)
 ```
 
 ### URingScheduler (async, Linux only)
 
-Sliding-window io_uring scheduler. A single coordinator goroutine owns
-the ring and continuously fills free SQ slots from a pending queue,
-calling `SubmitAndWait(1)` to drain completions. The ring stays full,
-maximising NVMe queue depth.
+Asynchronous io_uring scheduler. A single coordinator goroutine owns the ring.
+Submitters publish `Op` values through an intrusive lock-free MPSC stack and a
+buffered doorbell; the coordinator fills free SQ slots and reaps CQEs.
 
 ```go
 if !iosched.IOUringAvailable {
@@ -279,7 +275,27 @@ sched, err := iosched.NewURingScheduler(iosched.URingConfig{
     RingDepth: 256,  // SQ/CQ entries, must be power of two
     SQPOLL:    false, // true burns one CPU core for kernel-side polling
 })
+if err != nil {
+    return err
+}
+defer sched.Close()
+
+ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
+if err != nil {
+    return err
+}
+defer ticket.Release()
+ticket.Wait()
+if err := ticket.Error(); err != nil {
+    return err
+}
+n := ticket.Op.Result.N
 ```
+
+`Submit` does not implement application-level backpressure. It is a
+non-blocking handoff into the scheduler; callers that need an in-flight cap
+should wrap the scheduler with their own semaphore, token bucket, queue, or
+retry policy.
 
 ### Concurrent reads — batching in action
 
@@ -290,24 +306,21 @@ for _, req := range requests {
     go func(r Request) {
         defer wg.Done()
         buf := make([]byte, r.Size)
-        n, err := sched.ReadAt(int(f.Fd()), buf, r.Offset)
+        n, err := bio.ReadAt(f, buf, r.Offset)
         r.Done(buf[:n], err)
     }(req)
 }
 wg.Wait()
-// URingScheduler coalesces concurrent goroutine submissions into batches,
-// submitting them together with a single io_uring_enter syscall.
+// URingScheduler coalesces ready submissions into fewer io_uring_enter syscalls.
 ```
 
 ### Stats
 
 ```go
 stats := sched.Stats()
-fmt.Printf("batches=%d requests=%d avg_batch=%.1f\n",
-    stats.Batches, stats.Requests, stats.AvgBatch)
-if stats.ReadLatency != nil {
-    fmt.Printf("p99 read latency: %dµs\n",
-        stats.ReadLatency.ValueAtQuantile(99)/1000)
+if stats.Syscalls != 0 {
+    fmt.Printf("ops/syscall=%.1f\n",
+        float64(stats.OpsPlaced)/float64(stats.Syscalls))
 }
 ```
 

@@ -1,13 +1,5 @@
 //go:build linux
 
-// Micro-benchmarks for the io_uring Submit API. These exercise the
-// blocking Submit hot path against /instance_storage (NVMe) so
-// throughput, allocation behavior, and CPU utilization can be measured
-// against the real storage device rather than tmpfs.
-//
-// Run:
-//
-//	go test ./iosched/... -bench=BenchmarkSubmission -benchmem -benchtime=2s
 package iosched_test
 
 import (
@@ -19,21 +11,18 @@ import (
 
 	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
-	"github.com/miretskiy/dio/sys"
 )
 
 const benchStorageRoot = "/instance_storage"
 
-// benchFile creates a pre-allocated file under /instance_storage of the given
-// size, filled with deterministic bytes. b.Cleanup removes it.
 func benchFile(b *testing.B, size int64) *os.File {
 	b.Helper()
 	if _, err := os.Stat(benchStorageRoot); os.IsNotExist(err) {
 		b.Skipf("%s not found", benchStorageRoot)
 	}
-	dir := filepath.Join(benchStorageRoot, fmt.Sprintf("dio-bench-%d", os.Getpid()))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		b.Fatalf("mkdir %s: %v", dir, err)
+	dir, err := os.MkdirTemp(benchStorageRoot, "dio-bench-")
+	if err != nil {
+		b.Fatalf("mkdir temp under %s: %v", benchStorageRoot, err)
 	}
 	path := filepath.Join(dir, "data.bin")
 	f, err := os.Create(path)
@@ -43,14 +32,12 @@ func benchFile(b *testing.B, size int64) *os.File {
 	if err := f.Truncate(size); err != nil {
 		b.Fatalf("truncate %s: %v", path, err)
 	}
-	// Fill the file so reads hit storage.
 	buf := align.AllocAligned(1 << 20)
 	defer align.FreeAligned(buf)
 	for i := range buf {
 		buf[i] = byte(i)
 	}
-	off := int64(0)
-	for off < size {
+	for off := int64(0); off < size; {
 		n, werr := f.WriteAt(buf, off)
 		if werr != nil {
 			b.Fatalf("write at %d: %v", off, werr)
@@ -67,25 +54,14 @@ func benchFile(b *testing.B, size int64) *os.File {
 	return f
 }
 
-// benchDirectReadFile creates and fills a benchmark file, then opens a second
-// read-only descriptor with O_DIRECT.
-func benchDirectReadFile(b *testing.B, size int64) *os.File {
-	b.Helper()
-
-	f := benchFile(b, size)
-	direct, err := sys.OpenDirect(f.Name(), sys.FlDirectIO)
-	if err != nil {
-		b.Fatalf("open direct %s: %v", f.Name(), err)
+func reportSchedStats(b *testing.B, sched *iosched.URingScheduler) {
+	st := sched.Stats()
+	if st.Syscalls == 0 {
+		return
 	}
-	b.Cleanup(func() {
-		direct.Close()
-	})
-	return direct
+	b.ReportMetric(float64(st.OpsPlaced)/float64(st.Syscalls), "ops/syscall")
 }
 
-// BenchmarkSubmission_ReadAt_Serial measures one Submit round
-// trip on a single goroutine — the simplest path through the scheduler.
-// Shows base latency + per-op allocation cost.
 func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
@@ -105,33 +81,23 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	ops := make([]iosched.Op, 1)
 	for i := range b.N {
 		offset := int64((i * blockSize) % (fileSize - blockSize))
-		ops[0] = iosched.ReadOp(f, buf, offset)
-		if err := sched.Submit(ops); err != nil {
+		ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
+		if err != nil {
 			b.Fatalf("submit: %v", err)
 		}
-		if res := ops[0].Result(); res.Err != nil {
+		ticket.Wait()
+		if res := ticket.Op.Result; res.Err != nil {
+			ticket.Release()
 			b.Fatalf("read: %v", res.Err)
 		}
+		ticket.Release()
 	}
 	b.StopTimer()
 	reportSchedStats(b, sched)
 }
 
-// reportSchedStats emits ops/syscall as a custom benchmark metric so
-// benchstat can summarize the average batch size achieved by the scheduler.
-func reportSchedStats(b *testing.B, sched *iosched.URingScheduler) {
-	st := sched.Stats()
-	if st.Syscalls == 0 {
-		return
-	}
-	b.ReportMetric(float64(st.OpsPlaced)/float64(st.Syscalls), "ops/syscall")
-}
-
-// BenchmarkSubmission_ReadAt_Parallel measures throughput under N concurrent
-// readers. Exercises leader election and batch swapping under contention.
 func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
@@ -152,30 +118,26 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		buf := make([]byte, blockSize)
-		ops := make([]iosched.Op, 1)
 		var i int64
 		for pb.Next() {
 			offset := (i * blockSize) % (fileSize - blockSize)
 			i++
-			ops[0] = iosched.ReadOp(f, buf, offset)
-			if err := sched.Submit(ops); err != nil {
+			ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
+			if err != nil {
 				b.Fatalf("submit: %v", err)
 			}
-			if res := ops[0].Result(); res.Err != nil {
+			ticket.Wait()
+			if res := ticket.Op.Result; res.Err != nil {
+				ticket.Release()
 				b.Fatalf("read: %v", res.Err)
 			}
+			ticket.Release()
 		}
 	})
 	b.StopTimer()
 	reportSchedStats(b, sched)
 }
 
-// BenchmarkSubmission_Concurrency sweeps the number of submitter goroutines
-// to see how the scheduler's opportunistic batching scales with arrival
-// concurrency. Each goroutine submits 4 KiB reads in a tight loop. The
-// reported ops/syscall metric is the average number of SQEs placed per
-// io_uring_enter call — the directly observable "did batching happen?"
-// answer.
 func BenchmarkSubmission_Concurrency(b *testing.B) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
@@ -186,9 +148,7 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 	for _, n := range []int{1, 2, 4, 8, 16, 32, 64, 128} {
 		b.Run(fmt.Sprintf("goroutines=%d", n), func(b *testing.B) {
 			f := benchFile(b, fileSize)
-			sched, err := iosched.NewURingScheduler(iosched.URingConfig{
-				RingDepth: 512,
-			})
+			sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 512})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -198,7 +158,6 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			// Split b.N evenly across n goroutines.
 			perG := b.N / n
 			extra := b.N % n
 			var wg sync.WaitGroup
@@ -209,18 +168,20 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 				}
 				wg.Go(func() {
 					buf := make([]byte, blockSize)
-					ops := make([]iosched.Op, 1)
 					for i := range count {
 						offset := int64((i * blockSize) % (fileSize - blockSize))
-						ops[0] = iosched.ReadOp(f, buf, offset)
-						if err := sched.Submit(ops); err != nil {
+						ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
+						if err != nil {
 							b.Errorf("submit: %v", err)
 							return
 						}
-						if res := ops[0].Result(); res.Err != nil {
+						ticket.Wait()
+						if res := ticket.Op.Result; res.Err != nil {
+							ticket.Release()
 							b.Errorf("read: %v", res.Err)
 							return
 						}
+						ticket.Release()
 					}
 				})
 			}
@@ -231,75 +192,6 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 	}
 }
 
-// BenchmarkSubmission_Throughput_ReadAt_Workers measures large O_DIRECT reads
-// with enough concurrent Submit callers to test storage throughput rather than
-// 4 KiB scheduler overhead.
-func BenchmarkSubmission_Throughput_ReadAt_Workers(b *testing.B) {
-	if !iosched.IOUringAvailable {
-		b.Skip("io_uring not available")
-	}
-	const fileSize = 8 << 30
-	const blockSize = 1 << 20
-
-	for _, workers := range []int{8, 32} {
-		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
-			f := benchDirectReadFile(b, fileSize)
-			sched, err := iosched.NewURingScheduler(iosched.URingConfig{
-				RingDepth: 512,
-			})
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer sched.Close()
-
-			b.SetBytes(blockSize)
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			perG := b.N / workers
-			extra := b.N % workers
-			var wg sync.WaitGroup
-			for g := range workers {
-				count := perG
-				if g < extra {
-					count++
-				}
-				wg.Go(func() {
-					buf := align.AllocAligned(blockSize)
-					defer align.FreeAligned(buf)
-
-					ops := make([]iosched.Op, 1)
-					for i := range count {
-						block := int64(i*workers + g)
-						offset := (block * blockSize) % (fileSize - blockSize)
-						ops[0] = iosched.ReadOp(f, buf, offset)
-						if err := sched.Submit(ops); err != nil {
-							b.Errorf("submit: %v", err)
-							return
-						}
-						res := ops[0].Result()
-						if res.Err != nil {
-							b.Errorf("read: %v", res.Err)
-							return
-						}
-						if res.N != blockSize {
-							b.Errorf("short read: got %d want %d", res.N, blockSize)
-							return
-						}
-					}
-				})
-			}
-			wg.Wait()
-			b.StopTimer()
-			reportSchedStats(b, sched)
-		})
-	}
-}
-
-// BenchmarkSubmission_BatchedReads measures the cost of a single Submit call
-// that carries many ops — exercises the per-call overhead amortized
-// across N ops. Compared against _Serial this isolates the fixed cost of
-// Submit vs the variable cost of placing/reaping ops.
 func BenchmarkSubmission_BatchedReads(b *testing.B) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
@@ -317,6 +209,7 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 			defer sched.Close()
 
 			bufs := make([][]byte, batch)
+			tickets := make([]*iosched.Ticket, batch)
 			for i := range bufs {
 				bufs[i] = make([]byte, blockSize)
 			}
@@ -325,19 +218,22 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			ops := make([]iosched.Op, batch)
 			for i := range b.N {
-				for j := range ops {
+				for j := range tickets {
 					offset := int64(((i*batch + j) * blockSize) % (fileSize - blockSize))
-					ops[j] = iosched.ReadOp(f, bufs[j], offset)
+					ticket, err := sched.Submit(iosched.ReadOp(f, bufs[j], offset))
+					if err != nil {
+						b.Fatalf("submit %d: %v", j, err)
+					}
+					tickets[j] = ticket
 				}
-				if err := sched.Submit(ops); err != nil {
-					b.Fatalf("submit: %v", err)
-				}
-				for j := range ops {
-					if res := ops[j].Result(); res.Err != nil {
+				for j, ticket := range tickets {
+					ticket.Wait()
+					if res := ticket.Op.Result; res.Err != nil {
+						ticket.Release()
 						b.Fatalf("read %d: %v", j, res.Err)
 					}
+					ticket.Release()
 				}
 			}
 			b.StopTimer()

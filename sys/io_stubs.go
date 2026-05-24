@@ -63,4 +63,3 @@ func copyFileRangeEmulated(src, dst *os.File, srcOff, dstOff *int64, length int)
 	}
 	return total, nil
 }
-

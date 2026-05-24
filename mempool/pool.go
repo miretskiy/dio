@@ -19,10 +19,10 @@
 package mempool
 
 import (
-	"log/slog"
-	"time"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 

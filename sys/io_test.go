@@ -17,29 +17,29 @@ import (
 func TestAlignForHolePunch(t *testing.T) {
 	bs := int64(align.BlockSize)
 	tests := []struct {
-		name                       string
-		offset, length             int64
-		wantOffset, wantLength     int64
-		wantCanPunch               bool
+		name                   string
+		offset, length         int64
+		wantOffset, wantLength int64
+		wantCanPunch           bool
 	}{
 		{
-			name:         "perfect alignment",
-			offset:       bs, length: bs,
+			name:   "perfect alignment",
+			offset: bs, length: bs,
 			wantOffset: bs, wantLength: bs, wantCanPunch: true,
 		},
 		{
-			name:         "sub-block — cannot punch",
-			offset:       0, length: bs - 1,
+			name:   "sub-block — cannot punch",
+			offset: 0, length: bs - 1,
 			wantCanPunch: false,
 		},
 		{
-			name:         "offset=1, length=4096 — rounds up past end",
-			offset:       1, length: bs,
+			name:   "offset=1, length=4096 — rounds up past end",
+			offset: 1, length: bs,
 			wantCanPunch: false,
 		},
 		{
-			name:         "offset just past page (bs+1)",
-			offset:       bs + 1, length: bs,
+			name:   "offset just past page (bs+1)",
+			offset: bs + 1, length: bs,
 			wantCanPunch: false,
 		},
 		{
