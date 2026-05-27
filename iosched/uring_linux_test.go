@@ -15,6 +15,7 @@ import (
 	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
 	"github.com/miretskiy/dio/mempool"
+	"github.com/miretskiy/dio/sys"
 )
 
 func newURingSched(t *testing.T, cfg ...iosched.URingConfig) *iosched.URingScheduler {
@@ -30,11 +31,6 @@ func newURingSched(t *testing.T, cfg ...iosched.URingConfig) *iosched.URingSched
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
-}
-
-func newURingIO(t *testing.T) *iosched.BlockingIO {
-	t.Helper()
-	return iosched.NewBlockingIO(newURingSched(t))
 }
 
 func writeUringFile(t *testing.T, size int) (string, []byte) {
@@ -161,36 +157,6 @@ func TestURing_LinkedOps_WriteFdatasync(t *testing.T) {
 	require.Equal(t, 4096, ticket.Op.Result.N)
 }
 
-func TestURing_BlockingIO_ReadAt(t *testing.T) {
-	bio := newURingIO(t)
-	path, data := writeUringFile(t, 4096)
-	f := openRW(t, path)
-
-	buf := make([]byte, 4096)
-	n, err := bio.ReadAt(f, buf, 0)
-	require.NoError(t, err)
-	require.Equal(t, 4096, n)
-	require.Equal(t, data, buf)
-}
-
-func TestURing_BlockingIO_WriteAt(t *testing.T) {
-	bio := newURingIO(t)
-	path := filepath.Join(t.TempDir(), "write.dat")
-	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0644))
-	f := openRW(t, path)
-
-	payload := make([]byte, 4096)
-	_, _ = rand.Read(payload)
-	n, err := bio.WriteAt(f, payload, 0)
-	require.NoError(t, err)
-	require.Equal(t, 4096, n)
-
-	got := make([]byte, 4096)
-	_, err = bio.ReadAt(f, got, 0)
-	require.NoError(t, err)
-	require.Equal(t, payload, got)
-}
-
 func TestURing_Concurrent(t *testing.T) {
 	const (
 		fileSize          = 1 << 20
@@ -295,6 +261,103 @@ func TestURing_SQPOLL(t *testing.T) {
 	require.Equal(t, data, buf)
 }
 
+func TestURing_ReusedSQEWriteAfterFdatasync(t *testing.T) {
+	s := newURingSched(t)
+
+	path := filepath.Join(t.TempDir(), "direct.dat")
+	f, err := sys.CreateDirect(path, sys.FlDirectIO)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, f.Close()) })
+
+	payload := align.AllocAligned(align.BlockSize)
+	t.Cleanup(func() { align.FreeAligned(payload) })
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	res := submitResult(t, s, iosched.WriteOp(f, payload, 0))
+	require.NoError(t, res.Err)
+	require.Equal(t, len(payload), res.N)
+
+	res = submitResult(t, s, iosched.FdatasyncOp(f))
+	require.NoError(t, res.Err)
+
+	res = submitResult(t, s, iosched.WriteOp(f, payload, int64(len(payload))))
+	require.NoError(t, res.Err)
+	require.Equal(t, len(payload), res.N)
+}
+
+func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
+	const (
+		workers = 16
+		rounds  = 64
+	)
+	s := newURingSched(t, iosched.URingConfig{RingDepth: 32})
+
+	path := filepath.Join(t.TempDir(), "parallel-direct.dat")
+	f, err := sys.CreateDirect(path, sys.FlDirectIO)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, f.Close()) })
+
+	payloads := make([][]byte, workers)
+	for worker := range workers {
+		payload := align.AllocAligned(align.BlockSize)
+		for i := range payload {
+			payload[i] = byte(worker + i)
+		}
+		payloads[worker] = payload
+		t.Cleanup(func() { align.FreeAligned(payload) })
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+
+			payload := payloads[worker]
+			for round := range rounds {
+				offset := int64((worker*rounds + round) * align.BlockSize)
+				ticket, err := s.Submit(iosched.WriteOp(f, payload, offset).Link(iosched.FdatasyncOp(f)))
+				if err != nil {
+					errs <- fmt.Errorf("worker %d round %d submit: %w", worker, round, err)
+					return
+				}
+				ticket.Wait()
+
+				r0 := ticket.Op.Result
+				if r0.Err != nil {
+					ticket.Release()
+					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, r0.N, r0.Err)
+					return
+				}
+				if r0.N != len(payload) {
+					ticket.Release()
+					errs <- fmt.Errorf("worker %d round %d write count: got %d want %d", worker, round, r0.N, len(payload))
+					return
+				}
+				if err := ticket.Error(); err != nil {
+					ticket.Release()
+					errs <- fmt.Errorf("worker %d round %d linked chain: %w", worker, round, err)
+					return
+				}
+				ticket.Release()
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+}
+
 func newRegisteredPool(t *testing.T, s *iosched.URingScheduler) *mempool.SlabPool {
 	t.Helper()
 	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
@@ -303,13 +366,6 @@ func newRegisteredPool(t *testing.T, s *iosched.URingScheduler) *mempool.SlabPoo
 	require.NoError(t, iosched.RegisterDMASlab(s, pool))
 	t.Cleanup(func() { pool.Close() })
 	return pool
-}
-
-func TestURing_RegisterDMASlab(t *testing.T) {
-	s := newURingSched(t)
-	pool := newRegisteredPool(t, s)
-	require.Equal(t, align.BlockSize, pool.SlotSize())
-	require.Greater(t, pool.NumSlots(), 0)
 }
 
 func TestURing_FixedOp_WriteRead(t *testing.T) {
@@ -327,7 +383,7 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 	require.NoError(t, err)
 	copy(wslot.Data, payload)
 
-	res := submitResult(t, s, iosched.WriteFixedOp(f, wslot, 0))
+	res := submitResult(t, s, iosched.WriteFixedOp(f, wslot.Data, 0))
 	require.NoError(t, res.Err)
 	require.Equal(t, align.BlockSize, res.N)
 	wslot.Release()
@@ -335,7 +391,7 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 	rslot, err := pool.Acquire()
 	require.NoError(t, err)
 
-	res = submitResult(t, s, iosched.ReadFixedOp(f, rslot, 0))
+	res = submitResult(t, s, iosched.ReadFixedOp(f, rslot.Data, 0))
 	require.NoError(t, res.Err)
 	require.Equal(t, align.BlockSize, res.N)
 	require.Equal(t, payload, rslot.Data)
@@ -362,7 +418,7 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 		slots[i], _ = pool.Acquire()
 		copy(slots[i].Data, payloads[i])
 
-		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i], int64(i*align.BlockSize)))
+		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Data, int64(i*align.BlockSize)))
 		require.NoError(t, err)
 		tickets[i] = ticket
 	}
@@ -397,19 +453,18 @@ func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	require.NoError(t, err)
 	defer slot.Release()
 
-	res := submitResult(t, s, iosched.WriteFixedOp(f, slot, 0))
+	res := submitResult(t, s, iosched.WriteFixedOp(f, slot.Data, 0))
 	require.Error(t, res.Err)
 	t.Logf("kernel error for unregistered fixed op: %v", res.Err)
 }
 
-func TestNewDefaultIO_UsesURing(t *testing.T) {
+func TestNewDefaultScheduler_UsesURing(t *testing.T) {
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
-	bio := iosched.NewDefaultIO()
-	defer bio.Close()
-	require.NotNil(t, bio.S)
-	_, ok := bio.S.(*iosched.URingScheduler)
+	s := iosched.NewDefaultScheduler()
+	defer s.Close()
+	_, ok := s.(*iosched.URingScheduler)
 	require.True(t, ok)
 }
 

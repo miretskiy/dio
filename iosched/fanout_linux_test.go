@@ -201,7 +201,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 		}
 
 		// Fixed read.
-		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot, offset))
+		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Data, offset))
 		if err != nil {
 			slot.Release()
 			b.Fatalf("submit read: %v", err)
@@ -217,7 +217,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 		// Fan-out: submit all sinks before waiting, allowing the coordinator
 		// to place them in the same ring wave.
 		for si := range fanoutNumSinks {
-			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot, offset))
+			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Data, offset))
 			if err != nil {
 				slot.Release()
 				b.Fatalf("submit write sink%d: %v", si+1, err)

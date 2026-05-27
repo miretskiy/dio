@@ -2,17 +2,19 @@
 //
 // # Architecture
 //
-// The primary user-facing type is BlockingIO, which provides synchronous
-// ReadAt/WriteAt/Fsync methods on every platform. When io_uring is available
-// on Linux, it wraps a URingScheduler and routes each call through the async
-// Submit path. When io_uring is unavailable, it invokes POSIX syscalls directly.
+// The primary abstraction is Scheduler. On Linux, URingScheduler submits ops
+// through io_uring. POSIXScheduler implements the same Submit/Ticket lifecycle
+// with blocking POSIX file operations.
 package iosched
 
 import (
+	"errors"
 	"io"
 
 	"github.com/miretskiy/dio/mempool"
 )
+
+var errSchedulerClosed = errors.New("iosched: scheduler closed")
 
 // Scheduler is the async I/O submission interface.
 type Scheduler interface {

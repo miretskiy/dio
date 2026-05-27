@@ -4,7 +4,6 @@ package iosched
 
 import (
 	"errors"
-	"sync"
 
 	"github.com/miretskiy/dio/mempool"
 )
@@ -13,9 +12,7 @@ import (
 const IOUringAvailable = false
 
 // URingScheduler is declared so code referencing the type compiles on non-Linux.
-type URingScheduler struct {
-	ticketPool sync.Pool
-}
+type URingScheduler struct{}
 
 // NewURingScheduler always returns an error on non-Linux platforms.
 func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {

@@ -29,8 +29,6 @@ func probeIOUring() bool {
 
 const defaultRingDepth uint32 = 256
 
-var errSchedulerClosed = errors.New("iosched: scheduler closed")
-
 type inflightEntry struct {
 	t     *Ticket
 	op    *Op
@@ -47,7 +45,6 @@ type URingScheduler struct {
 	depth       uint32
 	stagingHead atomic.Pointer[Ticket]
 	wakeup      chan struct{}
-	ticketPool  sync.Pool
 
 	shutdown struct {
 		once sync.Once
@@ -130,12 +127,7 @@ func (s *URingScheduler) Submit(op Op) (*Ticket, error) {
 		return nil, err
 	}
 
-	t := s.acquireTicket()
-	t.Op = op
-	clearResults(&t.Op)
-	t.pending.Store(n)
-	t.sched = s
-	t.wg.Add(1)
+	t := getTicket(op, n)
 
 	s.push(t)
 	select {
@@ -143,31 +135,6 @@ func (s *URingScheduler) Submit(op Op) (*Ticket, error) {
 	default:
 	}
 	return t, nil
-}
-
-func countAndValidateOps(op *Op) (int32, error) {
-	var n int32
-	for p := op; p != nil; p = p.linked {
-		if p.f == nil {
-			return 0, fmt.Errorf("iosched: op %d has nil file", n)
-		}
-		n++
-	}
-	return n, nil
-}
-
-func clearResults(op *Op) {
-	for p := op; p != nil; p = p.linked {
-		p.Result = Result{}
-	}
-}
-
-func (s *URingScheduler) acquireTicket() *Ticket {
-	if t, _ := s.ticketPool.Get().(*Ticket); t != nil {
-		t.next = nil
-		return t
-	}
-	return &Ticket{}
 }
 
 func (s *URingScheduler) push(t *Ticket) {
@@ -456,7 +423,7 @@ func (c *coordinator) reap() {
 		} else {
 			e.op.Result.N = int(cqe.Res)
 		}
-		c.complete(e.t, 1)
+		completeTicket(e.t)
 	})
 	if count > 0 {
 		c.ring.CQAdvance(count)
@@ -469,13 +436,10 @@ func (c *coordinator) releaseSlot(slot int) {
 	c.nInflight--
 }
 
-func (c *coordinator) complete(t *Ticket, n int32) {
-	if t.pending.Add(-n) == 0 {
-		t.wg.Done()
-	}
-}
-
 func (c *coordinator) failAllInflight(err error) {
+	// One inflight entry represents one placed SQE, including each SQE in a
+	// linked chain. Completing each entry once preserves a ticket's remaining
+	// count even if earlier linked SQEs already reaped successfully.
 	for i, e := range c.inflight {
 		if !e.valid {
 			continue
@@ -484,7 +448,7 @@ func (c *coordinator) failAllInflight(err error) {
 			e.op.Result.Err = err
 		}
 		c.releaseSlot(i)
-		c.complete(e.t, 1)
+		completeTicket(e.t)
 	}
 }
 
@@ -499,6 +463,8 @@ func (c *coordinator) failStaged(err error) {
 }
 
 func (c *coordinator) failTicket(t *Ticket, err error) {
+	// failTicket is for tickets not represented by inflight entries. Inflight
+	// SQEs complete through reap or failAllInflight one SQE at a time.
 	for op := &t.Op; op != nil; op = op.linked {
 		if op.Result.Err == nil {
 			op.Result.Err = err

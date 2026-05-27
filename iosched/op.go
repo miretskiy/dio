@@ -1,11 +1,12 @@
 package iosched
 
 import (
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
 
-	"github.com/miretskiy/dio/mempool"
+	"github.com/miretskiy/dio/internal/buildutil"
 )
 
 // Opcode identifies the type of I/O operation.
@@ -77,19 +78,23 @@ func FdatasyncOp(f *os.File) Op {
 }
 
 // ReadFixedOp constructs a positioned read using a pre-registered fixed buffer.
-func ReadFixedOp(f *os.File, slot mempool.Slot, offset int64) Op {
-	return Op{opcode: OpReadFixed, f: f, buf: slot.Data, offset: offset}
+func ReadFixedOp(f *os.File, buf []byte, offset int64) Op {
+	return Op{opcode: OpReadFixed, f: f, buf: buf, offset: offset}
 }
 
 // WriteFixedOp constructs a positioned write using a pre-registered fixed buffer.
-func WriteFixedOp(f *os.File, slot mempool.Slot, offset int64) Op {
-	return Op{opcode: OpWriteFixed, f: f, buf: slot.Data, offset: offset}
+func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
+	return Op{opcode: OpWriteFixed, f: f, buf: buf, offset: offset}
 }
 
 // Link returns a copy of o linked to next with IOSQE_IO_LINK semantics.
 func (o Op) Link(next Op) Op {
-	o.sqeFlags |= sqeLink
-	o.linked = &next
+	tail := &o
+	for tail.linked != nil {
+		tail = tail.linked
+	}
+	tail.sqeFlags |= sqeLink
+	tail.linked = &next
 	return o
 }
 
@@ -97,7 +102,7 @@ func (o Op) isLinked() bool {
 	return o.sqeFlags&sqeLink != 0 && o.linked != nil
 }
 
-// Ticket is the per-Submit synchronization handle returned by URingScheduler.
+// Ticket is the per-Submit synchronization handle returned by Scheduler.
 type Ticket struct {
 	// Intrusive lock-free MPSC link.
 	next *Ticket
@@ -105,9 +110,32 @@ type Ticket struct {
 	// The embedded operation.
 	Op Op
 
-	wg      sync.WaitGroup
-	pending atomic.Int32
-	sched   *URingScheduler
+	wg       sync.WaitGroup
+	pending  atomic.Int32
+	released atomic.Bool
+}
+
+var ticketPool = sync.Pool{
+	New: func() any { return new(Ticket) },
+}
+
+func getTicket(op Op, pending int32) *Ticket {
+	t := ticketPool.Get().(*Ticket)
+	t.next = nil
+	t.Op = op
+	t.pending.Store(pending)
+	t.released.Store(false)
+	t.wg.Add(1)
+	return t
+}
+
+func putTicket(t *Ticket) {
+	clearResults(&t.Op)
+	t.Op = Op{}
+	t.next = nil
+	t.pending.Store(0)
+	t.released.Store(true)
+	ticketPool.Put(t)
 }
 
 // Wait blocks until all ops in the Ticket's linked chain have completed.
@@ -118,24 +146,21 @@ func (t *Ticket) Wait() {
 	t.wg.Wait()
 }
 
-// Release returns t to its scheduler's pool.
+// Release returns t to the shared ticket pool.
 //
 // It is nil-safe and idempotent so callers can use defer without having to
 // special-case failed Submit calls or accidental double release.
 func (t *Ticket) Release() {
-	if t == nil || t.sched == nil {
+	if t == nil || t.released.Swap(true) {
 		return
 	}
+	// If this ticket is not clean, we can't return it to the pool
+	// lest wg has incorrect state.
 	if t.pending.Load() > 0 {
-		t.sched = nil
 		return
 	}
 
-	pool := &t.sched.ticketPool
-	t.sched = nil
-	t.Op = Op{}
-	t.next = nil
-	pool.Put(t)
+	putTicket(t)
 }
 
 // Error returns the first operation error in io_uring linked-chain order.
@@ -149,4 +174,31 @@ func (t *Ticket) Error() error {
 		}
 	}
 	return nil
+}
+
+func countAndValidateOps(op *Op) (int32, error) {
+	var n int32
+	for p := op; p != nil; p = p.linked {
+		if p.f == nil {
+			return 0, fmt.Errorf("iosched: op %d has nil file", n)
+		}
+		n++
+	}
+	return n, nil
+}
+
+func clearResults(op *Op) {
+	for p := op; p != nil; p = p.linked {
+		p.Result = Result{}
+	}
+}
+
+func completeTicket(t *Ticket) {
+	remaining := t.pending.Add(-1)
+	if err := buildutil.Assert(remaining >= 0); err != nil {
+		panic(err)
+	}
+	if remaining == 0 {
+		t.wg.Done()
+	}
 }

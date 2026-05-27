@@ -5,8 +5,8 @@ Decisions and non-decisions, captured so we don't relitigate them.
 ## Coordinator model
 
 A single coordinator goroutine owns the io_uring ring exclusively. Producers
-call `Submit(Op)`, which copies the root `Op` into a pooled `Ticket`, pushes
-that ticket onto an intrusive lock-free MPSC Treiber stack, and rings a
+call `Submit(Op)`, which copies the root `Op` into a shared pooled `Ticket`,
+pushes that ticket onto an intrusive lock-free MPSC Treiber stack, and rings a
 buffered(1) doorbell with a non-blocking send.
 
 The submit path has no mutex and allocates no wrapper nodes. The only
@@ -44,9 +44,9 @@ return ticket.Error()
 ```
 
 `Release` is nil-safe and idempotent. It also guards the pool against abandoned
-tickets: if `pending > 0`, it only clears `t.sched` and deliberately does not
-return the ticket to the pool or clear `Op.f`, because the kernel may still be
-using the file descriptor and buffers reachable from the op chain.
+tickets: if `pending > 0`, it marks the ticket released and deliberately does
+not return the ticket to the pool or clear `Op.f`, because the kernel may still
+be using the file descriptor and buffers reachable from the op chain.
 
 `Ticket.Error` returns the first non-nil error in linked-chain order. It does
 not use `errors.Join`; this matches io_uring's fail-fast behavior where later

@@ -3,43 +3,36 @@ package iosched
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestTicketReleaseNilSafeIdempotentAndPendingSafe(t *testing.T) {
 	var nilTicket *Ticket
 	nilTicket.Release()
 
-	completed := &Ticket{
-		sched: &URingScheduler{},
-		Op: Op{
-			buf:    []byte("root"),
-			linked: &Op{buf: []byte("linked")},
-		},
-	}
+	completed := getTicket(Op{
+		buf:    []byte("root"),
+		linked: &Op{buf: []byte("linked")},
+	}, 1)
+	completeTicket(completed)
 	completed.Release()
 	completed.Release()
-	if completed.sched != nil {
-		t.Fatal("completed ticket kept scheduler after Release")
-	}
 	if completed.Op.linked != nil || completed.Op.buf != nil {
 		t.Fatal("completed ticket retained operation references")
 	}
 
-	pending := &Ticket{
-		sched: &URingScheduler{},
-		Op: Op{
-			buf:    []byte("root"),
-			linked: &Op{buf: []byte("linked")},
-		},
+	inflight := getTicket(Op{
+		buf:    []byte("root"),
+		linked: &Op{buf: []byte("linked")},
+	}, 1)
+	inflight.Release()
+	if inflight.Op.linked == nil || inflight.Op.buf == nil {
+		t.Fatal("in-flight ticket cleared operation references")
 	}
-	pending.pending.Store(1)
-	pending.Release()
-	pending.Release()
-	if pending.sched != nil {
-		t.Fatal("pending ticket kept scheduler after Release")
-	}
-	if pending.Op.linked == nil || pending.Op.buf == nil {
-		t.Fatal("pending ticket cleared operation references while still in flight")
+	completeTicket(inflight)
+	inflight.Release()
+	if inflight.Op.linked == nil || inflight.Op.buf == nil {
+		t.Fatal("early-released ticket was pooled after completion")
 	}
 }
 
@@ -64,5 +57,78 @@ func TestTicketErrorReturnsFirstLinkedError(t *testing.T) {
 
 	if got := ((*Ticket)(nil)).Error(); got != nil {
 		t.Fatalf("nil ticket error: got %v want nil", got)
+	}
+}
+
+func TestOpLinkAppendsToExistingChain(t *testing.T) {
+	first := errors.New("first")
+	second := errors.New("second")
+
+	op := Op{}.Link(Op{}).Link(Op{})
+	op.linked.Result.Err = first
+	op.linked.linked.Result.Err = second
+
+	ticket := &Ticket{Op: op}
+	if got := ticket.Error(); got != first {
+		t.Fatalf("first linked error: got %v want %v", got, first)
+	}
+	op.linked.Result.Err = nil
+	if got := ticket.Error(); got != second {
+		t.Fatalf("second linked error: got %v want %v", got, second)
+	}
+}
+
+func TestTicketPendingCompletionCountsDown(t *testing.T) {
+	ticket := getTicket(Op{}, 2)
+	done := make(chan struct{})
+	go func() {
+		ticket.Wait()
+		close(done)
+	}()
+
+	completeTicket(ticket)
+	if got := ticket.pending.Load(); got != 1 {
+		t.Fatalf("pending after first completion: got %d want 1", got)
+	}
+	select {
+	case <-done:
+		t.Fatal("Wait returned before all pending ops completed")
+	default:
+	}
+
+	completeTicket(ticket)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not return after pending reached zero")
+	}
+	if got := ticket.pending.Load(); got != 0 {
+		t.Fatalf("pending after second completion: got %d want 0", got)
+	}
+	ticket.Release()
+}
+
+func TestTicketPendingUnderflowPanics(t *testing.T) {
+	ticket := getTicket(Op{}, 1)
+	completeTicket(ticket)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("completeTicket did not panic on pending underflow")
+		}
+	}()
+	completeTicket(ticket)
+}
+
+func BenchmarkTicketGetCompleteRelease(b *testing.B) {
+	ticket := getTicket(Op{}, 1)
+	completeTicket(ticket)
+	ticket.Release()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ticket := getTicket(Op{}, 1)
+		completeTicket(ticket)
+		ticket.Release()
 	}
 }

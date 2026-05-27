@@ -238,26 +238,34 @@ import "github.com/miretskiy/dio/iosched"
 
 // Pick the best available backend automatically:
 //   Linux + io_uring kernel support -> URingScheduler
-//   Otherwise                       -> direct POSIX syscalls
-bio := iosched.NewDefaultIO()
-defer bio.Close()
+//   Otherwise                       -> POSIXScheduler
+sched := iosched.NewDefaultScheduler()
+defer sched.Close()
 
 f, _ := os.Open(path)
 defer f.Close()
 
 buf := make([]byte, blockSize)
-n, err := bio.ReadAt(f, buf, offset)
-
-n, err = bio.WriteAt(f, buf[:n], offset)
+ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
+if err != nil {
+    return err
+}
+defer ticket.Release()
+ticket.Wait()
+if err := ticket.Error(); err != nil {
+    return err
+}
 ```
 
-### BlockingIO (synchronous)
+### POSIXScheduler (sync Scheduler)
 
-Portable synchronous wrapper. With a nil scheduler, each call maps directly to
-one `pread(2)`, `pwrite(2)`, or sync syscall.
+Synchronous `Scheduler` implementation for callers that want the same
+`Submit`/`Ticket` API without io_uring. Each `Submit` performs the POSIX
+operation before returning, so `Ticket.Wait` is immediate.
 
 ```go
-bio := iosched.NewBlockingIO(nil)
+sched := iosched.NewPOSIXScheduler()
+defer sched.Close()
 ```
 
 ### URingScheduler (async, Linux only)
