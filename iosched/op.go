@@ -1,172 +1,186 @@
 package iosched
 
 import (
-	"os"
-
-	"github.com/miretskiy/dio/mempool"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"syscall"
 )
 
-// Opcode identifies the type of I/O operation.
-type Opcode uint8
+// ErrClosed is returned by [Scheduler.Submit] after the scheduler has been
+// closed.
+var ErrClosed = errors.New("iosched: scheduler closed")
+
+// opCode identifies the kind of I/O an [Op] performs.
+type opCode uint8
 
 const (
-	OpRead       Opcode = iota // pread — positioned read
-	OpWrite                    // pwrite — positioned write
-	OpFsync                    // fsync — flush data and metadata
-	OpFdatasync                // fdatasync — flush data (skip metadata unless needed)
-	OpFallocate                // fallocate — preallocate or punch holes
-	OpReadFixed                // pread via IORING_OP_READ_FIXED (pre-registered buffer)
-	OpWriteFixed               // pwrite via IORING_OP_WRITE_FIXED (pre-registered buffer)
+	opNop opCode = iota
+	opRead
+	opWrite
+	opReadFixed
+	opWriteFixed
+	opFsync
+	opFdatasync
 )
 
-// Op describes a single I/O operation submitted to a [Scheduler].
+// SQE flag bits for link chains. The values mirror the kernel's
+// IOSQE_IO_LINK / IOSQE_IO_HARDLINK; uring_linux.go statically asserts they
+// match giouring's constants. Defined here (rather than referencing giouring)
+// so Op compiles on non-Linux platforms.
+const (
+	sqeLink     uint8 = 1 << 2
+	sqeHardlink uint8 = 1 << 3
+	sqeLinkMask       = sqeLink | sqeHardlink
+)
+
+// Op describes one positioned I/O operation. Build Ops with [ReadOp],
+// [WriteOp], [ReadFixedOp], [WriteFixedOp], [FsyncOp] or [FdatasyncOp],
+// pass them to [Scheduler.Submit], then read the outcome via [Op.Result].
 //
-// Op is a plain value type — construct with a constructor such as [WriteOp],
-// [ReadFixedOp], etc., then optionally chain [Op.Linked] or [Op.HardLinked]
-// before passing into [Scheduler.Submit].
-//
-//	ops := []Op{
-//	    WriteOp(f, buf, 0).Linked(), // must complete before the next op
-//	    FdatasyncOp(f),
-//	}
-//	if err := s.Submit(ops); err != nil { ... }
-//	for i := range ops {
-//	    res := ops[i].Result()
-//	    ...
-//	}
-//
-// # File lifetime
-//
-// Op borrows the *os.File without taking ownership. The File (and any buffer
-// or slot referenced by the Op) must remain valid until [Scheduler.Submit]
-// returns. Since Submit blocks until all ops complete, the caller's stack
-// frame keeps these references alive naturally.
-//
-// Always pass *os.File, never a raw fd: the fd can be closed and recycled by
-// the runtime before the kernel completes the I/O if the File is GC'd first.
-//
-// # Fixed-buffer ops
-//
-// [ReadFixedOp] and [WriteFixedOp] use slots from a [mempool.SlabPool]
-// pre-registered with the ring via [RegisterDMASlab]. The kernel keeps the
-// slab pinned for the ring lifetime, avoiding per-I/O DMA setup overhead.
-//
-//	slot, err := pool.Acquire()
-//	if err != nil { ... }
-//	defer slot.Release()
-//	if err := s.Submit([]Op{WriteFixedOp(f, slot, offset)}); err != nil { ... }
-//
-// # Linking (ordered chains)
-//
-// Ops submitted together can be ordered using SQE links. A linked op is held
-// by the kernel until its predecessor completes:
-//
-//   - [Op.Linked]: soft link — if this op fails, the next is cancelled (ECANCELED).
-//   - [Op.HardLinked]: hard link — the next op runs regardless of this op's result.
-//
-// Only intermediate ops in a chain carry a link flag; the last op must not be
-// linked. Example — atomic write-then-sync:
-//
-//	WriteOp(f, data, off).Linked(), // run first; cancel sync on failure
-//	FdatasyncOp(f),                 // run second (no link on final op)
+// An Op is a plain value; a fresh Op (or a reused one) carries no state from
+// previous submissions other than its result field, which Submit resets.
 type Op struct {
-	opcode   Opcode
-	f        *os.File     // always set; retained by caller's slice across Submit
-	buf      []byte       // read/write buffer; nil for fsync/fallocate
-	slot     mempool.Slot // non-zero for fixed-buffer ops; anchors slot lifetime
-	offset   int64        // file offset for read/write/fallocate
-	length   int64        // range length for fallocate
-	opFlags  uint32       // op-specific flags (fallocate mode)
-	sqeFlags uint8        // SQE linking flags (sqeLink, sqeHardLink)
-	result   Result       // populated by scheduler before Submit returns
+	buf      []byte
+	off      int64
+	g        *submitGroup // owning submission; set by the scheduler
+	fd       int32
+	res      int32 // completion result: byte count, or negated errno
+	code     opCode
+	sqeFlags uint8 // SQE flag bits (link/hardlink)
 }
 
-// SQE linking flag bits stored in Op.sqeFlags.
-const (
-	sqeLink     uint8 = 1 << 0 // soft link to next op (IOSQE_IO_LINK)
-	sqeHardLink uint8 = 1 << 1 // hard link to next op (IOSQE_IO_HARDLINK)
-)
-
-// ReadOp constructs a positioned-read operation.
-// f and buf must remain valid until Submit returns.
-func ReadOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpRead, f: f, buf: buf, offset: offset}
+// ReadOp returns an Op that reads len(buf) bytes from fd at offset off
+// (pread semantics: the file cursor is not used or moved).
+func ReadOp(fd int, buf []byte, off int64) Op {
+	return Op{code: opRead, fd: int32(fd), buf: buf, off: off}
 }
 
-// WriteOp constructs a positioned-write operation.
-// f and buf must remain valid until Submit returns.
-func WriteOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpWrite, f: f, buf: buf, offset: offset}
+// WriteOp returns an Op that writes len(buf) bytes to fd at offset off
+// (pwrite semantics).
+func WriteOp(fd int, buf []byte, off int64) Op {
+	return Op{code: opWrite, fd: int32(fd), buf: buf, off: off}
 }
 
-// FsyncOp constructs a full fsync operation (flushes data and metadata).
-// f must remain valid until Submit returns.
-func FsyncOp(f *os.File) Op {
-	return Op{opcode: OpFsync, f: f}
+// ReadFixedOp is like [ReadOp] but uses a pre-registered DMA buffer: buf must
+// lie within the [mempool.SlabPool] registered via [RegisterDMASlab],
+// eliminating per-I/O page-pinning overhead. On schedulers without registered
+// buffer support (POSIX) it behaves exactly like ReadOp.
+func ReadFixedOp(fd int, buf []byte, off int64) Op {
+	return Op{code: opReadFixed, fd: int32(fd), buf: buf, off: off}
 }
 
-// FdatasyncOp constructs an fdatasync operation (flushes data; skips
-// metadata unless required for data retrieval).
-// f must remain valid until Submit returns.
-func FdatasyncOp(f *os.File) Op {
-	return Op{opcode: OpFdatasync, f: f}
+// WriteFixedOp is like [WriteOp] but uses a pre-registered DMA buffer.
+// See [ReadFixedOp] for the buffer requirements.
+func WriteFixedOp(fd int, buf []byte, off int64) Op {
+	return Op{code: opWriteFixed, fd: int32(fd), buf: buf, off: off}
 }
 
-// FallocateOp constructs a fallocate operation.
-// mode is the FALLOC_FL_* flags (0 = preallocate and zero-fill).
-// f must remain valid until Submit returns.
-func FallocateOp(f *os.File, mode uint32, offset, length int64) Op {
-	return Op{opcode: OpFallocate, f: f, offset: offset, length: length, opFlags: mode}
+// FsyncOp returns an Op that flushes fd's data and metadata to stable storage.
+func FsyncOp(fd int) Op {
+	return Op{code: opFsync, fd: int32(fd)}
 }
 
-// ReadFixedOp constructs a positioned-read using a pre-registered fixed buffer.
-// slot must be obtained from the scheduler's [mempool.SlabPool].
-// If the op is submitted, slot and f must remain valid until Submit returns.
-// If the op is never submitted, call slot.Release() to return the slot to the
-// pool.
-func ReadFixedOp(f *os.File, slot mempool.Slot, offset int64) Op {
-	return Op{opcode: OpReadFixed, f: f, buf: slot.Data, slot: slot, offset: offset}
+// FdatasyncOp returns an Op that flushes fd's data (and only the metadata
+// required to retrieve it) to stable storage. On platforms without
+// fdatasync it degrades to fsync.
+func FdatasyncOp(fd int) Op {
+	return Op{code: opFdatasync, fd: int32(fd)}
 }
 
-// WriteFixedOp constructs a positioned-write using a pre-registered fixed buffer.
-// slot must be obtained from the scheduler's [mempool.SlabPool].
-// If the op is submitted, slot and f must remain valid until Submit returns.
-// If the op is never submitted, call slot.Release() to return the slot to the
-// pool.
-func WriteFixedOp(f *os.File, slot mempool.Slot, offset int64) Op {
-	return Op{opcode: OpWriteFixed, f: f, buf: slot.Data, slot: slot, offset: offset}
+// Linked marks op as the predecessor of the next op in the same Submit call:
+// the kernel executes the next op only after this op completes fully. A
+// failed or short transfer breaks the chain, completing the remaining linked
+// ops with ECANCELED. The last op of a chain must not be Linked.
+func (op Op) Linked() Op {
+	op.sqeFlags = (op.sqeFlags &^ sqeLinkMask) | sqeLink
+	return op
 }
 
-// Linked returns a copy of op with a soft link to the next op in the
-// submission slice. If this op fails, the next linked op is cancelled.
-// The final op in a chain must NOT be linked.
-func (o Op) Linked() Op {
-	o.sqeFlags = (o.sqeFlags &^ sqeHardLink) | sqeLink
-	return o
+// HardLinked is like [Linked], but the chain keeps executing even if this op
+// fails or transfers fewer bytes than requested.
+func (op Op) HardLinked() Op {
+	op.sqeFlags = (op.sqeFlags &^ sqeLinkMask) | sqeHardlink
+	return op
 }
 
-// HardLinked returns a copy of op with a hard link to the next op.
-// Unlike [Op.Linked], the next op executes regardless of this op's result.
-func (o Op) HardLinked() Op {
-	o.sqeFlags = (o.sqeFlags &^ sqeLink) | sqeHardLink
-	return o
-}
-
-// isLinked reports whether this op links to the next one (soft or hard).
-func (o Op) isLinked() bool {
-	return o.sqeFlags&(sqeLink|sqeHardLink) != 0
-}
-
-// Result returns the outcome of this op. Valid only after the call to
-// [Scheduler.Submit] returns; reading earlier is a race.
-func (o *Op) Result() Result { return o.result }
-
-// Result holds the outcome of a single completed Op.
-//
-// For read/write ops, N is the number of bytes transferred.
-// For fsync/fdatasync/fallocate, N is 0 on success.
-// Err is non-nil on failure (typically a [syscall.Errno]).
+// Result holds the outcome of a completed [Op].
 type Result struct {
-	N   int
+	// N is the number of bytes transferred (0 for fsync ops). A read of
+	// N == 0 with a non-empty buffer indicates end-of-file.
+	N int
+	// Err is nil on success, the syscall error otherwise. Ops canceled by a
+	// broken link chain report syscall.ECANCELED.
 	Err error
+}
+
+// Result returns op's completion outcome. Valid only after the
+// [Scheduler.Submit] call that carried op has returned nil.
+func (op *Op) Result() Result {
+	if op.res < 0 {
+		return Result{Err: syscall.Errno(-op.res)}
+	}
+	return Result{N: int(op.res)}
+}
+
+// completeErr records err as op's completion result.
+func (op *Op) completeErr(err syscall.Errno) {
+	op.res = -int32(err)
+}
+
+// chainEnd returns the index just past the link chain starting at ops[start].
+// An op without a link flag terminates its chain.
+func chainEnd(ops []Op, start int) int {
+	end := start
+	for end < len(ops)-1 && ops[end].sqeFlags&sqeLinkMask != 0 {
+		end++
+	}
+	return end + 1
+}
+
+// validateChains rejects op lists that no scheduler can execute: a trailing
+// op that still links forward (it would chain into an unrelated submission),
+// and chains longer than maxChain (0 = unlimited), which could never be
+// placed contiguously in the submission ring.
+func validateChains(ops []Op, maxChain int) error {
+	if ops[len(ops)-1].sqeFlags&sqeLinkMask != 0 {
+		return errors.New("iosched: last op of a Submit call must not be Linked/HardLinked")
+	}
+	for start := 0; start < len(ops); {
+		end := chainEnd(ops, start)
+		if maxChain > 0 && end-start > maxChain {
+			return fmt.Errorf("iosched: link chain of %d ops exceeds scheduler capacity %d", end-start, maxChain)
+		}
+		start = end
+	}
+	return nil
+}
+
+// submitGroup tracks one Submit call's outstanding ops and parks its caller.
+// remaining is decremented once per completed op; the caller waits on sema,
+// which is also used by the io_uring scheduler to hand off ring leadership.
+type submitGroup struct {
+	remaining atomic.Int32
+	sema      chan struct{} // cap 1; tokens coalesce via signal()
+	// intrusive wait-list links, guarded by the scheduler mutex
+	next, prev *submitGroup
+	inList     bool
+}
+
+// signal wakes the group's waiter. Non-blocking: a token is dropped if one is
+// already pending, so done- and leadership-signals coalesce. Waiters treat
+// every wakeup as a hint and re-check state.
+func (g *submitGroup) signal() {
+	select {
+	case g.sema <- struct{}{}:
+	default:
+	}
+}
+
+// drain removes a pending token, if any, so a pooled group starts clean.
+func (g *submitGroup) drain() {
+	select {
+	case <-g.sema:
+	default:
+	}
 }

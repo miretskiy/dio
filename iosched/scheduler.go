@@ -10,8 +10,10 @@
 //
 // The [Scheduler] interface exposes a blocking Submit API for group-commit
 // scenarios: prepare N ops, call Submit, then read each op's [Result]. The
-// [URingScheduler] batches concurrent Submit calls into shared io_uring_enter
-// cycles. Only [URingScheduler] implements Scheduler; it is Linux-only.
+// [URingScheduler] (Linux-only) batches concurrent Submit calls into shared
+// io_uring_enter cycles. [PosixScheduler] implements the same interface with
+// synchronous positioned syscalls for tests and for operating systems
+// without io_uring.
 //
 // Use [NewDefaultIO] to get the best available implementation for the host.
 package iosched

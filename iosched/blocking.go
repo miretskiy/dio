@@ -1,93 +1,174 @@
+//go:build !windows
+
 package iosched
 
 import (
+	"io"
 	"os"
 	"runtime"
-	"syscall"
 
-	"github.com/miretskiy/dio/sys"
+	"golang.org/x/sys/unix"
 )
 
-// BlockingIO wraps an optional [Scheduler] with synchronous methods.
-// It works on all platforms.
+// BlockingIO provides synchronous positioned I/O on every platform. See the
+// package documentation for how it picks its backend; construct one with
+// [NewDefaultIO], [NewBlockingIO], or [NewPosixIO].
 //
-// When S is non-nil (io_uring available), each method calls S.Submit with a
-// single-op slice and reads the per-op result.
-//
-// When S is nil, methods invoke POSIX syscalls directly with no indirection.
-//
-// # File lifetime
-//
-// Methods take *os.File, not raw fd integers. This ensures the GC can trace
-// the reference and the fd cannot be closed or reused while I/O is in flight.
-// See [Op] for a detailed explanation.
+// ReadAt and WriteAt implement full io.ReaderAt/io.WriterAt semantics:
+// they loop on short transfers and ReadAt returns io.EOF when the file ends
+// before the buffer is full.
 type BlockingIO struct {
-	S Scheduler // nil for direct POSIX fallback
+	sched Scheduler
 }
 
-// NewBlockingIO wraps s. Pass nil to use direct POSIX syscalls.
+// NewBlockingIO returns a BlockingIO that routes every call through s.
 func NewBlockingIO(s Scheduler) *BlockingIO {
-	return &BlockingIO{S: s}
+	return &BlockingIO{sched: s}
 }
 
-// submitOne runs a single op through the scheduler and returns its Result.
-func (b *BlockingIO) submitOne(op Op) Result {
-	ops := []Op{op}
-	if err := b.S.Submit(ops); err != nil {
-		return Result{Err: err}
-	}
-	return ops[0].Result()
+// NewPosixIO returns a BlockingIO that invokes POSIX syscalls directly —
+// no indirection, no scheduler.
+func NewPosixIO() *BlockingIO {
+	return &BlockingIO{}
 }
 
-// ReadAt performs a positioned read.
-func (b *BlockingIO) ReadAt(f *os.File, buf []byte, offset int64) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
-	}
-	if b.S != nil {
-		r := b.submitOne(ReadOp(f, buf, offset))
-		return r.N, r.Err
-	}
-	n, err := syscall.Pread(int(f.Fd()), buf, offset)
-	runtime.KeepAlive(f)
-	return n, err
-}
+// Scheduler returns the underlying scheduler, or nil for the direct POSIX
+// path. Useful for [RegisterDMASlab] or for submitting op batches directly.
+func (b *BlockingIO) Scheduler() Scheduler { return b.sched }
 
-// WriteAt performs a positioned write.
-func (b *BlockingIO) WriteAt(f *os.File, buf []byte, offset int64) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
-	}
-	if b.S != nil {
-		r := b.submitOne(WriteOp(f, buf, offset))
-		return r.N, r.Err
-	}
-	n, err := syscall.Pwrite(int(f.Fd()), buf, offset)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// Fsync flushes data and metadata for f.
-func (b *BlockingIO) Fsync(f *os.File) error {
-	if b.S != nil {
-		return b.submitOne(FsyncOp(f)).Err
-	}
-	return f.Sync()
-}
-
-// Fdatasync flushes data for f, skipping metadata unless required for
-// data retrieval. On Darwin, this uses F_FULLFSYNC for correctness.
-func (b *BlockingIO) Fdatasync(f *os.File) error {
-	if b.S != nil {
-		return b.submitOne(FdatasyncOp(f)).Err
-	}
-	return sys.Fdatasync(f)
-}
-
-// Close closes the underlying Scheduler if present.
+// Close releases the underlying scheduler, if any.
 func (b *BlockingIO) Close() error {
-	if b.S != nil {
-		return b.S.Close()
+	if b.sched != nil {
+		return b.sched.Close()
 	}
 	return nil
+}
+
+// ReadAt reads len(p) bytes from f at offset off, looping on short reads.
+// It returns io.EOF if the file ends first (per io.ReaderAt).
+func (b *BlockingIO) ReadAt(f *os.File, p []byte, off int64) (int, error) {
+	fd := int(f.Fd())
+	var (
+		total int
+		err   error
+	)
+	if b.sched == nil {
+		total, err = preadFull(fd, p, off)
+	} else {
+		total, err = b.submitFull(opRead, fd, p, off)
+	}
+	runtime.KeepAlive(f)
+	return total, err
+}
+
+// WriteAt writes len(p) bytes to f at offset off, looping on short writes.
+func (b *BlockingIO) WriteAt(f *os.File, p []byte, off int64) (int, error) {
+	fd := int(f.Fd())
+	var (
+		total int
+		err   error
+	)
+	if b.sched == nil {
+		total, err = pwriteFull(fd, p, off)
+	} else {
+		total, err = b.submitFull(opWrite, fd, p, off)
+	}
+	runtime.KeepAlive(f)
+	return total, err
+}
+
+// Fsync flushes f's data and metadata to stable storage.
+func (b *BlockingIO) Fsync(f *os.File) error {
+	return b.sync(f, opFsync)
+}
+
+// Fdatasync flushes f's data (and only the metadata needed to retrieve it).
+// On platforms without fdatasync it degrades to fsync.
+func (b *BlockingIO) Fdatasync(f *os.File) error {
+	return b.sync(f, opFdatasync)
+}
+
+func (b *BlockingIO) sync(f *os.File, code opCode) error {
+	fd := int(f.Fd())
+	var err error
+	if b.sched == nil {
+		for {
+			if code == opFsync {
+				err = unix.Fsync(fd)
+			} else {
+				err = fdatasync(fd)
+			}
+			if err != unix.EINTR {
+				break
+			}
+		}
+	} else {
+		ops := []Op{{code: code, fd: int32(fd)}}
+		err = b.sched.Submit(ops)
+		if err == nil {
+			err = ops[0].Result().Err
+		}
+	}
+	runtime.KeepAlive(f)
+	return err
+}
+
+// submitFull routes one transfer through the scheduler, resubmitting the
+// remainder after short transfers.
+func (b *BlockingIO) submitFull(code opCode, fd int, p []byte, off int64) (int, error) {
+	total := 0
+	for total < len(p) {
+		ops := []Op{{code: code, fd: int32(fd), buf: p[total:], off: off + int64(total)}}
+		if err := b.sched.Submit(ops); err != nil {
+			return total, err
+		}
+		r := ops[0].Result()
+		if r.Err != nil {
+			return total, r.Err
+		}
+		if r.N == 0 {
+			if code == opRead {
+				return total, io.EOF
+			}
+			return total, io.ErrShortWrite
+		}
+		total += r.N
+	}
+	return total, nil
+}
+
+func preadFull(fd int, p []byte, off int64) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := unix.Pread(fd, p[total:], off+int64(total))
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.EOF
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func pwriteFull(fd int, p []byte, off int64) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := unix.Pwrite(fd, p[total:], off+int64(total))
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+		total += n
+	}
+	return total, nil
 }

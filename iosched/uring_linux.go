@@ -3,580 +3,554 @@
 package iosched
 
 import (
-	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/miretskiy/dio/giouring"
-	"github.com/miretskiy/dio/internal/buildutil"
 	"github.com/miretskiy/dio/mempool"
+	"golang.org/x/sys/unix"
 )
 
-// IOUringAvailable reports whether io_uring is supported on the running kernel.
-// Probed once at package init time by attempting to create and immediately
-// tear down a minimal ring.
-var IOUringAvailable = probeIOUring()
+const defaultRingDepth = 256
 
-func probeIOUring() bool {
-	ring := giouring.NewRing()
-	if err := ring.QueueInit(1, 0); err != nil {
-		return false
-	}
-	ring.QueueExit()
-	return true
-}
+// Compile-time assertion that op.go's mirrored SQE flag bits match the
+// kernel values giouring exposes (a mismatch makes the index non-zero).
+var (
+	_ = [1]struct{}{}[giouring.SqeIOLink-sqeLink]
+	_ = [1]struct{}{}[giouring.SqeIOHardlink-sqeHardlink]
+)
 
-const defaultRingDepth uint32 = 256
-
-var errSchedulerClosed = errors.New("iosched: scheduler closed")
-
-// ── Per-Submit request ────────────────────────────────────────────────────────
-
-// request is the internal handle for one Submit call. It is allocated per
-// Submit and stays referenced by the active batch until that batch completes.
-type request struct {
-	ops     []Op  // caller's slice; lives across Submit invocation
-	pending int32 // unfinished op count
-	nextOp  int   // next op index to place into the ring
-	done    bool  // protected by URingScheduler.mu
-	err     error // protected by URingScheduler.mu once done is published
-}
-
-// inflightEntry maps a ring slot to the request and op that owns it.
-type inflightEntry struct {
-	r     *request
-	opIdx int
-	valid bool
-}
-
-// ── URingScheduler ────────────────────────────────────────────────────────────
-
-// URingScheduler is a synchronous io_uring [Scheduler]. Submit blocks until
-// completion. Concurrent Submit calls cooperate via a drain-leader pattern:
-// one caller becomes the leader and drives io_uring_enter / CQE reaping for
-// itself and any other callers currently in the pending queue; the others
-// park on the cond and return when their own request is marked done. There
-// is no dedicated coordinator goroutine.
+// URingScheduler is the io_uring-backed [Scheduler].
 //
-// Group commit: the leader swaps the pending queue into a private batch,
-// processes that batch to completion, then publishes every completion under
-// the mutex. Callers that arrive while the leader is active wait for the next
-// batch.
+// # Design
+//
+// The scheduler owns no goroutines and no timers; the only resources beyond
+// the ring itself are a fixed op-slot table and a few reusable scratch
+// buffers. All kernel work is done by the submitting goroutines:
+//
+//   - Every Submit places its ops into the SQ (under a short mutex hold) and
+//     publishes them with one io_uring_enter. Independent Submit calls that
+//     race on the same flush window are picked up by whichever enter runs
+//     first, so concurrent submissions share enter cycles.
+//   - Exactly one submitter at a time is the leader: it parks in
+//     io_uring_enter(GETEVENTS, waitNr=1) so every completion is reaped the
+//     moment the kernel posts it, then completes ops, wakes finished waiters,
+//     and refills the SQ from the overflow queue. When the leader's own ops
+//     finish while others remain in flight, it hands leadership to a waiting
+//     submitter.
+//
+// waitNr=1 keeps completion latency minimal: the leader wakes per CQE batch
+// available, not after an arbitrary count.
+//
+// In-kernel concurrency is bounded by the CQ size (2 × RingDepth) via the
+// slot table, so the completion queue can never overflow. Ops that do not
+// fit wait in an internal FIFO and enter the ring as completions free slots.
 type URingScheduler struct {
-	// inflightOps counts ops currently in flight when MaxInflightOps is
-	// configured. The default unlimited path leaves this counter untouched.
-	inflightOps atomic.Int64
-	// maxInflight is the cached cap from URingConfig.MaxInflightOps.
-	// 0 means unlimited.
+	ring *giouring.Ring
+
+	// budget is the remaining in-flight op allowance; used only when
+	// maxInflight > 0.
+	budget      atomic.Int64
 	maxInflight int64
+	maxChain    int
+	sqPoll      bool
 
-	// mu + cond + pending/flushing/leaderActive form the drain-leader state
-	// machine. mu protects pending, flushing, leaderActive, closing.closed,
-	// and closing.err. cond is signaled when a leader broadcasts at the end
-	// of its run or when Close fires.
-	mu           sync.Mutex
-	cond         *sync.Cond
-	pending      []*request
-	flushing     []*request
-	leaderActive bool
+	mu        sync.Mutex
+	closed    bool
+	hasLeader bool
+	freeSlots []uint32
+	overflow  opDeque    // accepted ops not yet placed in the SQ (FIFO)
+	waiters   waiterList // groups parked in Submit, in arrival order
 
-	// closing is the shutdown state. Once.Do serializes the first close.
-	// closed is set under mu; readers check it under mu in the Submit loop.
-	closing struct {
-		sync.Once
-		closed bool
-		err    error
-	}
+	// slots maps SQE user_data (a slot index) to the in-flight op. Entries
+	// are written under mu by submitters and read lock-free by the leader;
+	// atomic.Pointer provides the cross-goroutine ordering.
+	slots []atomic.Pointer[Op]
 
-	closeRing sync.Once
+	// Leader-only scratch (at most one leader exists at any time).
+	cqes       []*giouring.CompletionQueueEvent
+	reaped     []uint32
+	doneGroups []*submitGroup
 
-	// stats tracks coordinator-internal counters useful for diagnosing
-	// batching behavior. Only the leader writes; readers can call Stats
-	// for a snapshot.
-	stats struct {
-		// syscalls counts io_uring_enter calls that actually placed new
-		// SQEs (i.e. cycles where fillSlots produced at least one SQE).
-		// opsPlaced / syscalls = average batch size.
-		syscalls  atomic.Uint64
-		opsPlaced atomic.Uint64
-	}
-
-	// Ring + ring-owned state. Accessed only by the active leader (the
-	// leaderActive flag under mu serializes ownership). Producers that are
-	// not the leader never touch any of these fields.
-	ring      *giouring.Ring
-	depth     uint32
-	inflight  []inflightEntry
-	freeSlots []int
-	nInflight int
+	pool *mempool.SlabPool // registered DMA slab, if any
 }
 
-// Stats is a point-in-time snapshot of leader-thread counters.
-type Stats struct {
-	// Syscalls is the number of io_uring_enter calls that submitted new SQEs.
-	Syscalls uint64
-	// OpsPlaced is the total number of SQEs placed into the ring.
-	// OpsPlaced / Syscalls gives the average batch size.
-	OpsPlaced uint64
-}
+var _ Scheduler = (*URingScheduler)(nil)
 
-// Stats returns a snapshot of the leader counters.
-func (s *URingScheduler) Stats() Stats {
-	return Stats{
-		Syscalls:  s.stats.syscalls.Load(),
-		OpsPlaced: s.stats.opsPlaced.Load(),
-	}
-}
-
-func (s *URingScheduler) tryReserveInflight(n int64) bool {
-	if s.maxInflight == 0 {
-		return true
-	}
-	if s.inflightOps.Add(n) > s.maxInflight {
-		s.inflightOps.Add(-n)
-		return false
-	}
-	return true
-}
-
-func (s *URingScheduler) releaseInflight(n int64) {
-	if s.maxInflight > 0 {
-		s.inflightOps.Add(-n)
-	}
-}
-
-// usePool implements the unexported pooler interface defined in scheduler.go.
-func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closing.closed {
-		return s.closing.err
-	}
-	if s.leaderActive || len(s.pending) > 0 || s.nInflight > 0 {
-		return errors.New("iosched: cannot register DMA slab while scheduler is active")
-	}
-
-	data := pool.RawData()
-	iovs := []syscall.Iovec{{Base: &data[0], Len: uint64(len(data))}}
-	if _, err := s.ring.RegisterBuffers(iovs); err != nil {
-		return fmt.Errorf("iosched: io_uring_register_buffers: %w", err)
-	}
-	return nil
-}
-
-// NewURingScheduler creates an io_uring-backed scheduler. No background
-// goroutine is started; the ring is driven by whichever caller currently
-// holds the leader role.
+// NewURingScheduler creates an io_uring scheduler. The returned scheduler
+// must be closed with Close, which blocks until all in-flight ops drain.
 func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
-	if !IOUringAvailable {
-		return nil, errors.New("iosched: io_uring not available on this kernel")
+	depth := cfg.RingDepth
+	if depth == 0 {
+		depth = defaultRingDepth
+	}
+	if depth&(depth-1) != 0 {
+		return nil, fmt.Errorf("iosched: RingDepth %d is not a power of two", depth)
 	}
 
-	depth := max(cfg.RingDepth, defaultRingDepth)
-
-	var flags uint32
+	flags := giouring.SetupClamp
 	if cfg.SQPOLL {
 		flags |= giouring.SetupSQPoll
 	}
-
 	ring := giouring.NewRing()
 	if err := ring.QueueInit(depth, flags); err != nil {
-		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
+		return nil, fmt.Errorf("iosched: io_uring setup: %w", err)
 	}
 
+	// The kernel sizes the CQ at 2× the SQ entries; capping in-kernel ops at
+	// the CQ size guarantees completions are never dropped to the (slow)
+	// overflow path.
+	numSlots := int(depth) * 2
 	s := &URingScheduler{
 		ring:        ring,
-		depth:       depth,
 		maxInflight: cfg.MaxInflightOps,
-		pending:     make([]*request, 0, 128),
-		flushing:    make([]*request, 0, 128),
-		inflight:    make([]inflightEntry, depth),
-		freeSlots:   make([]int, depth),
+		maxChain:    int(depth),
+		sqPoll:      cfg.SQPOLL,
+		freeSlots:   make([]uint32, numSlots),
+		slots:       make([]atomic.Pointer[Op], numSlots),
+		cqes:        make([]*giouring.CompletionQueueEvent, numSlots),
+		reaped:      make([]uint32, 0, numSlots),
+		doneGroups:  make([]*submitGroup, 0, numSlots),
 	}
-	s.cond = sync.NewCond(&s.mu)
-	for i := range s.depth {
-		s.freeSlots[i] = int(i)
+	for i := range s.freeSlots {
+		s.freeSlots[i] = uint32(i)
 	}
 	return s, nil
 }
 
-// Submit executes ops and blocks until every op has completed.
-// See [Scheduler] for the full contract.
+// Submit implements [Scheduler].
 func (s *URingScheduler) Submit(ops []Op) error {
 	if len(ops) == 0 {
-		return errors.New("iosched: empty op slice")
+		return nil
+	}
+	if err := validateChains(ops, s.maxChain); err != nil {
+		return err
+	}
+	nOps := int64(len(ops))
+	if s.maxInflight > 0 {
+		if s.budget.Add(nOps) > s.maxInflight {
+			s.budget.Add(-nOps)
+			return ErrTooBusy
+		}
 	}
 
-	n := int64(len(ops))
-	if !s.tryReserveInflight(n) {
-		return ErrTooBusy
-	}
-
-	r := &request{
-		ops:     ops,
-		pending: int32(len(ops)),
+	g := acquireGroup()
+	g.remaining.Store(int32(len(ops)))
+	for i := range ops {
+		ops[i].g = g
+		ops[i].res = 0
 	}
 
 	s.mu.Lock()
-	if s.closing.closed {
-		// Scheduler is already shut down; refund the budget and bail.
-		s.releaseInflight(n)
-		err := s.closing.err
+	if s.closed {
 		s.mu.Unlock()
-		return err
+		if s.maxInflight > 0 {
+			s.budget.Add(-nOps)
+		}
+		releaseGroup(g)
+		return ErrClosed
 	}
-	s.pending = append(s.pending, r)
-
-	for {
-		if r.done {
-			err := r.err
-			s.mu.Unlock()
-			return err
-		}
-		if s.leaderActive {
-			s.cond.Wait()
-			continue
-		}
-		if s.closing.closed {
-			s.failPendingLocked(s.closing.err)
-			continue
-		}
-
-		// Become the leader. Swap the pending queue into a private batch,
-		// process it to completion, then publish all completions under mu.
-		s.leaderActive = true
-		batch := s.pending
-		s.pending = s.flushing[:0]
-		s.flushing = nil
-		s.mu.Unlock()
-
-		err := s.runLeader(batch)
-
-		s.mu.Lock()
-		if err != nil {
-			s.closeLocked(err)
-		}
-		for _, br := range batch {
-			if br.done {
-				continue
-			}
-			if br.err == nil {
-				br.err = err
-			}
-			br.done = true
-		}
-		s.leaderActive = false
-		clear(batch)
-		s.flushing = batch[:0]
-		s.cond.Broadcast()
-		// Loop: the top-of-loop r.done check returns this caller's result.
+	s.enqueueLocked(ops)
+	toSubmit := s.flushLocked()
+	leader := !s.hasLeader
+	pushed := false
+	if leader {
+		s.hasLeader = true
+	} else if g.remaining.Load() > 0 {
+		s.waiters.push(g)
+		pushed = true
 	}
-}
-
-// runLeader drives the io_uring loop on behalf of one swapped batch.
-//
-// Invariant on entry: leaderActive is true; no one else touches the ring
-// state (inflight, freeSlots, nInflight). The batch contains at least one
-// request not yet done.
-func (s *URingScheduler) runLeader(batch []*request) error {
-	for !allComplete(batch) {
-		before := s.nInflight
-		if err := s.fillSlots(batch); err != nil {
-			s.failInflight(err)
-			s.failBatch(batch, err)
-			return err
-		}
-
-		// If we have nothing to wait on, there's a bug — break out to avoid
-		// a hard hang. Should never happen if allComplete returned false.
-		if s.nInflight == 0 {
-			err := errors.New("iosched: leader stalled with no in-flight ops")
-			s.failBatch(batch, err)
-			return err
-		}
-
-		if placed := s.nInflight - before; placed > 0 {
-			s.stats.syscalls.Add(1)
-			s.stats.opsPlaced.Add(uint64(placed))
-		}
-
-		if err := s.kernelSubmit(); err != nil {
-			ringErr := fmt.Errorf("iosched: ring error: %w", err)
-			s.failInflight(ringErr)
-			s.failBatch(batch, ringErr)
-			return ringErr
-		}
-		s.reap()
-	}
-	return nil
-}
-
-func allComplete(batch []*request) bool {
-	for _, r := range batch {
-		if r.pending > 0 {
-			return false
-		}
-	}
-	return true
-}
-
-// fillSlots places as many ops as possible from batch into free SQ slots.
-// Skips requests already done. Linked chains are placed atomically: if a
-// chain won't fit, we stop trying to place ops from that request this cycle.
-func (s *URingScheduler) fillSlots(batch []*request) error {
-	for _, r := range batch {
-		if r.pending == 0 {
-			continue
-		}
-		if err := s.fillSlotsFromRequest(r); err != nil {
-			return err
-		}
-		if len(s.freeSlots) == 0 {
-			return nil
-		}
-	}
-	return nil
-}
-
-func (s *URingScheduler) fillSlotsFromRequest(r *request) error {
-	for r.nextOp < len(r.ops) {
-		// Find the end of the current linked chain.
-		chainEnd := r.nextOp
-		for chainEnd < len(r.ops)-1 && r.ops[chainEnd].isLinked() {
-			chainEnd++
-		}
-		chainLen := chainEnd - r.nextOp + 1
-		if chainLen > int(s.depth) {
-			return fmt.Errorf("iosched: linked op chain length %d exceeds ring depth %d", chainLen, s.depth)
-		}
-		if len(s.freeSlots) < chainLen {
-			return nil // not enough room for this chain
-		}
-
-		for i := r.nextOp; i <= chainEnd; i++ {
-			op := r.ops[i]
-			slot := s.freeSlots[len(s.freeSlots)-1]
-			s.freeSlots = s.freeSlots[:len(s.freeSlots)-1]
-
-			sqe := s.ring.GetSQE()
-			if err := buildutil.Assert(sqe != nil); err != nil {
-				err = fmt.Errorf(
-					"iosched: GetSQE returned nil; slot=%d nInflight=%d freeSlots=%d depth=%d: %w",
-					slot, s.nInflight, len(s.freeSlots)+1, s.depth, err,
-				)
-				s.freeSlots = append(s.freeSlots, slot)
-				r.ops[i].result.Err = err
-				r.nextOp = i + 1
-				s.complete(r, 1)
-				return err
-			}
-
-			prepareSQE(sqe, op)
-			sqe.SetData64(uint64(slot))
-
-			s.inflight[slot] = inflightEntry{
-				r:     r,
-				opIdx: i,
-				valid: true,
-			}
-			s.nInflight++
-		}
-		r.nextOp = chainEnd + 1
-	}
-	return nil
-}
-
-// prepareSQE configures sqe for op.
-// op.f is alive for the duration of this call (held by the caller's slice).
-func prepareSQE(sqe *giouring.SubmissionQueueEntry, op Op) {
-	fd := int(op.f.Fd())
-	switch op.opcode {
-	case OpRead:
-		sqe.PrepareRead(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset))
-	case OpWrite:
-		sqe.PrepareWrite(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset))
-	case OpReadFixed:
-		sqe.PrepareReadFixed(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset), 0)
-	case OpWriteFixed:
-		sqe.PrepareWriteFixed(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset), 0)
-	case OpFsync:
-		sqe.PrepareFsync(fd, 0)
-	case OpFdatasync:
-		sqe.PrepareFsync(fd, giouring.FsyncDatasync)
-	case OpFallocate:
-		sqe.PrepareFallocate(fd, int(op.opFlags), uint64(op.offset), uint64(op.length))
-	default:
-		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
-	}
-	if op.sqeFlags&sqeLink != 0 {
-		sqe.SetFlags(uint32(giouring.SqeIOLink))
-	} else if op.sqeFlags&sqeHardLink != 0 {
-		sqe.SetFlags(uint32(giouring.SqeIOHardlink))
-	}
-}
-
-// kernelSubmit calls io_uring_enter, submitting prepared SQEs and waiting for
-// at least one completion. Retries on EINTR.
-func (s *URingScheduler) kernelSubmit() error {
-	waitNr := uint32(1)
-	if s.nInflight == 0 {
-		waitNr = 0
-	}
-	for {
-		_, err := s.ring.SubmitAndWait(waitNr)
-		if err == nil {
-			return nil
-		}
-		if errors.Is(err, syscall.EINTR) {
-			continue
-		}
-		return err
-	}
-}
-
-// reap drains every completed CQE and acks its owning request.
-func (s *URingScheduler) reap() {
-	var count uint32
-	s.ring.ForEachCQE(func(cqe *giouring.CompletionQueueEvent) {
-		count++
-		slot := int(cqe.GetData64())
-		e := s.inflight[slot]
-		s.releaseSlot(slot)
-
-		op := &e.r.ops[e.opIdx]
-		if cqe.Res < 0 {
-			op.result.Err = syscall.Errno(-cqe.Res)
-		} else {
-			op.result.N = int(cqe.Res)
-		}
-		s.complete(e.r, 1)
-	})
-	if count > 0 {
-		s.ring.CQAdvance(count)
-	}
-}
-
-func (s *URingScheduler) releaseSlot(slot int) {
-	s.inflight[slot].valid = false
-	s.freeSlots = append(s.freeSlots, slot)
-	s.nInflight--
-}
-
-// complete acks n ops on r. The active leader publishes r.done only after the
-// whole swapped batch has completed, under URingScheduler.mu.
-func (s *URingScheduler) complete(r *request, n int32) {
-	r.pending -= n
-	s.releaseInflight(int64(n))
-}
-
-// failInflight fails every valid inflight entry with err. Used when
-// kernelSubmit returns a fatal error.
-func (s *URingScheduler) failInflight(err error) {
-	for i, e := range s.inflight {
-		if !e.valid {
-			continue
-		}
-		op := &e.r.ops[e.opIdx]
-		if op.result.Err == nil {
-			op.result.Err = err
-		}
-		s.releaseSlot(i)
-		s.complete(e.r, 1)
-	}
-}
-
-// failBatch fails any request in batch that isn't yet done, marking unplaced
-// ops with err. Used during shutdown or when the leader detects a fatal
-// condition.
-func (s *URingScheduler) failBatch(batch []*request, err error) {
-	for _, r := range batch {
-		if r.pending == 0 {
-			if r.err == nil {
-				r.err = err
-			}
-			continue
-		}
-		// Fail any unplaced ops (those at indices >= r.nextOp; ops already
-		// placed are tracked via inflight and handled by failInflight or
-		// by ordinary reap).
-		for i := int(r.nextOp); i < len(r.ops); i++ {
-			if r.ops[i].result.Err == nil {
-				r.ops[i].result.Err = err
-			}
-		}
-		unplaced := int32(len(r.ops) - int(r.nextOp))
-		if unplaced > 0 {
-			r.nextOp = len(r.ops)
-			r.pending -= unplaced
-			s.releaseInflight(int64(unplaced))
-		}
-		if r.err == nil {
-			r.err = err
-		}
-	}
-}
-
-// closeLocked records err as the shutdown reason if shutdown hasn't fired yet.
-// s.mu must be held.
-func (s *URingScheduler) closeLocked(err error) {
-	s.closing.Do(func() {
-		if err == nil {
-			err = errSchedulerClosed
-		}
-		s.closing.closed = true
-		s.closing.err = err
-	})
-}
-
-// failPendingLocked fails all requests that have not been picked up by a
-// leader. s.mu must be held.
-func (s *URingScheduler) failPendingLocked(err error) {
-	if err == nil {
-		err = errSchedulerClosed
-	}
-	for _, r := range s.pending {
-		if r.done {
-			continue
-		}
-		for i := r.nextOp; i < len(r.ops); i++ {
-			if r.ops[i].result.Err == nil {
-				r.ops[i].result.Err = err
-			}
-		}
-		if r.pending > 0 {
-			s.releaseInflight(int64(r.pending))
-			r.pending = 0
-		}
-		r.nextOp = len(r.ops)
-		r.err = err
-		r.done = true
-	}
-	clear(s.pending)
-	s.pending = s.pending[:0]
-	s.cond.Broadcast()
-}
-
-// Close shuts the scheduler down. Pending Submits return errSchedulerClosed.
-// If a leader is in flight, Close waits for it to finish its current cycle
-// before tearing down the ring.
-func (s *URingScheduler) Close() error {
-	s.mu.Lock()
-	s.closeLocked(errSchedulerClosed)
-	// Wake any waiters so they observe closed.
-	s.cond.Broadcast()
-
-	// Wait for any active leader to finish.
-	for s.leaderActive {
-		s.cond.Wait()
-	}
-
-	// Fail any pending requests that never got a leader.
-	s.failPendingLocked(s.closing.err)
 	s.mu.Unlock()
 
-	s.closeRing.Do(func() { s.ring.QueueExit() })
+	if leader {
+		s.lead(g, toSubmit)
+	} else {
+		if toSubmit > 0 && g.remaining.Load() > 0 {
+			s.enterSubmit(toSubmit)
+		}
+		s.await(g, pushed)
+	}
+	releaseGroup(g)
 	return nil
+}
+
+// lead is the drain-leader loop: park in the kernel until completions arrive,
+// reap them, complete ops and wake their submitters, refill the SQ from the
+// overflow queue, and repeat until g's own ops are done. On exit, leadership
+// is handed to a waiting submitter if work remains. Called without mu held;
+// only one goroutine leads at a time.
+func (s *URingScheduler) lead(g *submitGroup, toSubmit uint32) {
+	for {
+		s.enterWait(toSubmit)
+		toSubmit = 0
+
+		n := int(s.ring.PeekBatchCQE(s.cqes))
+		if n == 0 {
+			continue
+		}
+		for _, cqe := range s.cqes[:n] {
+			idx := uint32(cqe.GetData64())
+			op := s.slots[idx].Load()
+			op.res = cqe.Res
+			s.reaped = append(s.reaped, idx)
+			if grp := op.g; grp.remaining.Add(-1) == 0 && grp != g {
+				s.doneGroups = append(s.doneGroups, grp)
+			}
+		}
+		s.ring.CQAdvance(uint32(n))
+		if s.maxInflight > 0 {
+			s.budget.Add(-int64(n))
+		}
+
+		s.mu.Lock()
+		s.freeSlots = append(s.freeSlots, s.reaped...)
+		s.reaped = s.reaped[:0]
+		// Unlink completed groups before signaling them (below, after
+		// unlock): a signaled waiter may recycle its group immediately, so
+		// it must already be off the list.
+		for _, grp := range s.doneGroups {
+			s.waiters.unlink(grp)
+		}
+		s.refillLocked()
+		toSubmit = s.flushLocked()
+		done := g.remaining.Load() == 0
+		s.mu.Unlock()
+
+		// We still hold leadership here, so the scratch buffers are
+		// exclusively ours; they must be clean before leadership is
+		// released below, when the next leader takes them over.
+		for _, grp := range s.doneGroups {
+			grp.signal()
+		}
+		s.doneGroups = s.doneGroups[:0]
+
+		if !done {
+			continue
+		}
+
+		s.mu.Lock()
+		s.hasLeader = false
+		var successor *submitGroup
+		if len(s.freeSlots) < len(s.slots) || s.overflow.len() > 0 {
+			// Work remains; wake a waiter to take over leadership. The
+			// list holds only incomplete groups, and nothing can complete
+			// them until a new leader reaps.
+			successor = s.waiters.first()
+		}
+		s.mu.Unlock()
+
+		if toSubmit > 0 {
+			s.enterSubmit(toSubmit)
+		}
+		if successor != nil {
+			successor.signal()
+		}
+		return
+	}
+}
+
+// await parks until g's ops complete, taking over ring leadership if it is
+// handed to us. pushed reports whether g was added to the wait list.
+func (s *URingScheduler) await(g *submitGroup, pushed bool) {
+	for {
+		if g.remaining.Load() == 0 {
+			break
+		}
+		<-g.sema // done- or leadership-signal; recheck either way
+		if g.remaining.Load() == 0 {
+			break
+		}
+		s.mu.Lock()
+		// Recheck under mu: a leader may have completed our ops and exited
+		// between the check above and the Lock. Taking leadership with no
+		// remaining ops would park forever on a possibly idle ring. If the
+		// lock-holder that completed us has released leadership, its
+		// decrements are visible here (mutex ordering), so the check is
+		// authoritative.
+		if g.remaining.Load() == 0 {
+			s.mu.Unlock()
+			break
+		}
+		if !s.hasLeader {
+			s.hasLeader = true
+			s.waiters.unlink(g)
+			s.mu.Unlock()
+			s.lead(g, 0)
+			return
+		}
+		s.mu.Unlock()
+	}
+	if pushed {
+		// The leader may have decremented our last op but not yet unlinked
+		// us; g must be off the list before it is recycled.
+		s.mu.Lock()
+		s.waiters.unlink(g)
+		s.mu.Unlock()
+	}
+}
+
+// enqueueLocked places ops into the SQ, falling back to the overflow FIFO
+// when slots or SQ space run out. Link chains are kept intact: a chain is
+// placed contiguously or not at all (the kernel terminates a link chain at
+// the end of a submission batch). Once anything has overflowed, subsequent
+// ops queue behind it to preserve FIFO fairness.
+func (s *URingScheduler) enqueueLocked(ops []Op) {
+	for start := 0; start < len(ops); {
+		end := chainEnd(ops, start)
+		n := end - start
+		if s.overflow.len() > 0 || len(s.freeSlots) < n || s.ring.SQSpaceLeft() < uint32(n) {
+			for i := start; i < end; i++ {
+				s.overflow.push(&ops[i])
+			}
+		} else {
+			for i := start; i < end; i++ {
+				s.placeLocked(&ops[i])
+			}
+		}
+		start = end
+	}
+}
+
+// refillLocked moves overflowed ops into the SQ while capacity allows,
+// whole chains at a time.
+func (s *URingScheduler) refillLocked() {
+	for s.overflow.len() > 0 {
+		n := s.overflow.chainLen()
+		if len(s.freeSlots) < n || s.ring.SQSpaceLeft() < uint32(n) {
+			return
+		}
+		for range n {
+			s.placeLocked(s.overflow.pop())
+		}
+	}
+}
+
+// placeLocked writes one SQE for op. Caller guarantees a free slot and SQ
+// space.
+func (s *URingScheduler) placeLocked(op *Op) {
+	last := len(s.freeSlots) - 1
+	idx := s.freeSlots[last]
+	s.freeSlots = s.freeSlots[:last]
+	s.slots[idx].Store(op)
+
+	sqe := s.ring.GetSQE()
+	var addr uintptr
+	if len(op.buf) > 0 {
+		addr = uintptr(unsafe.Pointer(&op.buf[0]))
+	}
+	switch op.code {
+	case opRead:
+		sqe.PrepareRead(int(op.fd), addr, uint32(len(op.buf)), uint64(op.off))
+	case opWrite:
+		sqe.PrepareWrite(int(op.fd), addr, uint32(len(op.buf)), uint64(op.off))
+	case opReadFixed:
+		// The whole DMA slab is registered as buffer index 0.
+		sqe.PrepareReadFixed(int(op.fd), addr, uint32(len(op.buf)), uint64(op.off), 0)
+	case opWriteFixed:
+		sqe.PrepareWriteFixed(int(op.fd), addr, uint32(len(op.buf)), uint64(op.off), 0)
+	case opFsync:
+		sqe.PrepareFsync(int(op.fd), 0)
+	case opFdatasync:
+		sqe.PrepareFsync(int(op.fd), giouring.FsyncDatasync)
+	default:
+		sqe.PrepareNop()
+	}
+	sqe.Flags = op.sqeFlags
+	sqe.UserData = uint64(idx)
+}
+
+// flushLocked publishes prepared SQEs and returns the count to pass to
+// io_uring_enter (outside mu). Under SQPOLL the kernel-side poller consumes
+// SQEs itself; the occasional wakeup syscall is issued inline and 0 is
+// returned.
+func (s *URingScheduler) flushLocked() uint32 {
+	if s.sqPoll {
+		_, _ = s.ring.Submit() // flush + wake the SQ poller thread if idle
+		return 0
+	}
+	return s.ring.FlushSQ()
+}
+
+// enterWait submits toSubmit pending SQEs (over-counting is harmless — the
+// kernel consumes at most what is flushed) and blocks until at least one
+// CQE is available.
+func (s *URingScheduler) enterWait(toSubmit uint32) {
+	for {
+		if toSubmit == 0 && s.ring.CQReady() > 0 {
+			return
+		}
+		_, err := s.ring.Enter(toSubmit, 1, giouring.EnterGetEvents, nil)
+		switch err {
+		case nil:
+			return
+		case unix.EINTR:
+			continue
+		case unix.EAGAIN, unix.EBUSY:
+			runtime.Gosched()
+		default:
+			panic(fmt.Sprintf("iosched: io_uring_enter: %v", err))
+		}
+	}
+}
+
+// enterSubmit publishes toSubmit pending SQEs without waiting.
+func (s *URingScheduler) enterSubmit(toSubmit uint32) {
+	for {
+		_, err := s.ring.Enter(toSubmit, 0, 0, nil)
+		switch err {
+		case nil:
+			return
+		case unix.EINTR:
+			continue
+		case unix.EAGAIN, unix.EBUSY:
+			runtime.Gosched()
+		default:
+			panic(fmt.Sprintf("iosched: io_uring_enter: %v", err))
+		}
+	}
+}
+
+// usePool implements pooler: it registers pool's slab as fixed buffer 0 via
+// io_uring_register_buffers. See [RegisterDMASlab].
+func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	if s.pool != nil {
+		if _, err := s.ring.UnregisterBuffers(); err != nil {
+			return fmt.Errorf("iosched: unregister buffers: %w", err)
+		}
+		s.pool = nil
+	}
+	raw := pool.RawData()
+	iov := []syscall.Iovec{{Base: &raw[0], Len: uint64(len(raw))}}
+	if _, err := s.ring.RegisterBuffers(iov); err != nil {
+		return fmt.Errorf("iosched: register buffers: %w", err)
+	}
+	s.pool = pool
+	return nil
+}
+
+// Close implements [io.Closer]. It rejects new submissions, waits for all
+// in-flight ops to drain (their Submit callers reap them), then tears down
+// the ring.
+func (s *URingScheduler) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.mu.Unlock()
+
+	for {
+		s.mu.Lock()
+		idle := !s.hasLeader && s.overflow.len() == 0 && len(s.freeSlots) == len(s.slots)
+		s.mu.Unlock()
+		if idle {
+			break
+		}
+		time.Sleep(50 * time.Microsecond)
+	}
+
+	if s.pool != nil {
+		_, _ = s.ring.UnregisterBuffers()
+		s.pool = nil
+	}
+	s.ring.QueueExit()
+	return nil
+}
+
+// groupPool recycles submitGroups so steady-state Submit calls allocate
+// nothing.
+var groupPool = sync.Pool{
+	New: func() any { return &submitGroup{sema: make(chan struct{}, 1)} },
+}
+
+func acquireGroup() *submitGroup {
+	return groupPool.Get().(*submitGroup)
+}
+
+func releaseGroup(g *submitGroup) {
+	g.drain() // discard a stale token (e.g. an unconsumed handoff signal)
+	groupPool.Put(g)
+}
+
+// waiterList is an intrusive doubly-linked FIFO of parked submission groups.
+// All operations require the scheduler mutex.
+type waiterList struct {
+	head, tail *submitGroup
+}
+
+func (l *waiterList) push(g *submitGroup) {
+	g.inList = true
+	g.prev = l.tail
+	g.next = nil
+	if l.tail != nil {
+		l.tail.next = g
+	} else {
+		l.head = g
+	}
+	l.tail = g
+}
+
+// unlink removes g if present; safe to call on an already-unlinked group.
+func (l *waiterList) unlink(g *submitGroup) {
+	if !g.inList {
+		return
+	}
+	if g.prev != nil {
+		g.prev.next = g.next
+	} else {
+		l.head = g.next
+	}
+	if g.next != nil {
+		g.next.prev = g.prev
+	} else {
+		l.tail = g.prev
+	}
+	g.next, g.prev = nil, nil
+	g.inList = false
+}
+
+func (l *waiterList) first() *submitGroup { return l.head }
+
+// opDeque is a slice-backed FIFO of ops awaiting ring capacity. Capacity is
+// reused across cycles; it grows only to the peak backlog.
+type opDeque struct {
+	ops  []*Op
+	head int
+}
+
+func (q *opDeque) len() int { return len(q.ops) - q.head }
+
+func (q *opDeque) push(op *Op) { q.ops = append(q.ops, op) }
+
+func (q *opDeque) pop() *Op {
+	op := q.ops[q.head]
+	q.ops[q.head] = nil
+	q.head++
+	if q.head == len(q.ops) {
+		q.ops = q.ops[:0]
+		q.head = 0
+	}
+	return op
+}
+
+// chainLen returns the length of the link chain at the head of the queue.
+// Chains are always enqueued whole, and validateChains guarantees the final
+// op of every submission carries no link flag, so the scan terminates.
+func (q *opDeque) chainLen() int {
+	n := 1
+	for i := q.head; q.ops[i].sqeFlags&sqeLinkMask != 0; i++ {
+		n++
+	}
+	return n
 }
