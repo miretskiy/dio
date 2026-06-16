@@ -166,7 +166,9 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 				if g < extra {
 					count++
 				}
-				wg.Go(func() {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
 					buf := make([]byte, blockSize)
 					for i := range count {
 						offset := int64((i * blockSize) % (fileSize - blockSize))
@@ -183,7 +185,7 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 						}
 						ticket.Release()
 					}
-				})
+				}()
 			}
 			wg.Wait()
 			b.StopTimer()

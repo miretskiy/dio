@@ -143,10 +143,12 @@ func BenchmarkFanout_Naive(b *testing.B) {
 
 		var wg sync.WaitGroup
 		for si := range fanoutNumSinks {
-			wg.Go(func() {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 				_, errs[si] = unix.Pwrite(int(ff.sinks[si].Fd()), buf[:n], offset)
 				runtime.KeepAlive(ff.sinks[si])
-			})
+			}()
 		}
 		wg.Wait()
 

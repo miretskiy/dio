@@ -173,7 +173,9 @@ func TestURing_Concurrent(t *testing.T) {
 
 	for worker := range goroutines {
 		_ = worker
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			buf := make([]byte, readSize)
 			for i := range readsPerGoroutine {
 				offset := int64((i * readSize) % (fileSize - readSize))
@@ -200,7 +202,7 @@ func TestURing_Concurrent(t *testing.T) {
 					}
 				}
 			}
-		})
+		}()
 	}
 
 	wg.Wait()

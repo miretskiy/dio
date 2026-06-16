@@ -203,7 +203,9 @@ func TestSlabPool_Concurrent(t *testing.T) {
 	errs := make(chan error, goroutines)
 
 	for range goroutines {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			for range iters {
 				s, err := p.Acquire()
 				if err != nil {
@@ -219,7 +221,7 @@ func TestSlabPool_Concurrent(t *testing.T) {
 				s.Data[0] = 0xFF
 				s.Release()
 			}
-		})
+		}()
 	}
 
 	wg.Wait()
@@ -244,14 +246,16 @@ func TestSlabPool_ConcurrentNoDoubleAlloc(t *testing.T) {
 	idx := 0
 
 	for range n {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			s, err := p.Acquire()
 			require.NoError(t, err)
 			mu.Lock()
 			slots[idx] = s
 			idx++
 			mu.Unlock()
-		})
+		}()
 	}
 	wg.Wait()
 

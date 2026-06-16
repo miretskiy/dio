@@ -157,7 +157,8 @@ func IsTransientIOError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errno, ok := errors.AsType[syscall.Errno](err); ok {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
 		switch errno {
 		case syscall.EINTR,
 			syscall.EAGAIN,
