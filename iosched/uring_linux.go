@@ -403,6 +403,11 @@ func (c *coordinator) submit() error {
 		if err == nil {
 			return nil
 		}
+		// io_uring_enter is io_uring's one interruptible point: a signal (e.g.
+		// Go's SIGURG async preemption) can interrupt the wait-for-completion.
+		// Re-enter to resume. The submitted read/write ops run asynchronously in
+		// kernel context and never complete with -EINTR, so this is the only
+		// EINTR handling io_uring needs. See the package doc.
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}

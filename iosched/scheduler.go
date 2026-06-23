@@ -5,6 +5,17 @@
 // The primary abstraction is Scheduler. On Linux, URingScheduler submits ops
 // through io_uring. POSIXScheduler implements the same Submit/Ticket lifecycle
 // with blocking POSIX file operations.
+//
+// # Signals (EINTR)
+//
+// Schedulers absorb EINTR internally: a completed op's Result.Err is never
+// syscall.EINTR, so callers handle only terminal errors and short transfers.
+//
+// Go's runtime preempts goroutines with SIGURG (since 1.14), which interrupts
+// in-flight blocking syscalls, so EINTR is routine for any code entering the
+// kernel. The standard library retries it for callers (internal/poll); this
+// package does the same. How each backend retries is documented at its
+// implementation.
 package iosched
 
 import (
@@ -20,9 +31,12 @@ var errSchedulerClosed = errors.New("iosched: scheduler closed")
 type Scheduler interface {
 	// Submit enqueues op for asynchronous execution and returns a Ticket.
 	// The caller must call Ticket.Wait before reading results or releasing
-	// the Ticket. Linked operations are attached with Op.Link. Submit does
-	// not implement backpressure; callers that need admission control should
-	// wrap the scheduler with their own semaphore, queue, or retry policy.
+	// the Ticket. Linked operations are attached with Op.Link.
+	//
+	// Submit does not implement backpressure; callers that need admission
+	// control wrap the scheduler with their own semaphore or queue. It does,
+	// however, handle EINTR internally (see the package doc), so callers never
+	// retry interrupted syscalls themselves — Result.Err is never EINTR.
 	Submit(op Op) (*Ticket, error)
 
 	// Close shuts down the scheduler. Callers must stop submitting before
