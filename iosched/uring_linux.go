@@ -355,7 +355,7 @@ func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
 		var parked bool
 
 		for op := &t.Op; op != nil; op = op.linked {
-			if !op.virtual {
+			if !op.isVirtual() {
 				continue
 			}
 			if c.sched.vfiles == 0 {
@@ -384,7 +384,7 @@ func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
 		}
 
 		for op := &t.Op; op != nil; op = op.linked {
-			if op.virtual && (op.opcode == OpVOpenat || op.opcode == OpVClose) {
+			if op.isVBarrier() {
 				c.parkedOps[op.vfd] = &barrierOp
 			}
 		}
@@ -471,7 +471,7 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 	fd := opFD(op)
 	buf := bufferPtr(op.buf)
-	switch op.opcode {
+	switch op.base() {
 	case OpRead:
 		sqe.PrepareRead(fd, buf, uint32(len(op.buf)), uint64(op.offset))
 	case OpWrite:
@@ -484,15 +484,17 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 		sqe.PrepareFsync(fd, 0)
 	case OpFdatasync:
 		sqe.PrepareFsync(fd, giouring.FsyncDatasync)
-	case OpVOpenat:
+	case OpFallocate:
+		sqe.PrepareFallocate(fd, 0, uint64(op.offset), uint64(op.length))
+	case OpOpenat:
 		sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, op.vfd)
-	case OpVClose:
+	case OpClose:
 		sqe.PrepareCloseDirect(op.vfd)
 	default:
 		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
 	}
 	var sqeFlags uint32
-	if op.virtual && op.opcode != OpVOpenat && op.opcode != OpVClose {
+	if op.isVirtual() && !op.isVBarrier() {
 		sqeFlags |= uint32(giouring.SqeFixedFile)
 	}
 	if op.sqeFlags&sqeLink != 0 && op.linked != nil {
@@ -504,7 +506,7 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 }
 
 func opFD(op *Op) int {
-	if op.virtual {
+	if op.isVirtual() {
 		return int(op.vfd)
 	}
 	return int(op.f.Fd())
@@ -569,14 +571,14 @@ func (c *coordinator) reap() *Ticket {
 }
 
 func (c *coordinator) completeVOp(op *Op) *Ticket {
-	if !op.virtual || (op.opcode != OpVOpenat && op.opcode != OpVClose) || c.sched.vfiles == 0 {
+	if !op.isVBarrier() || c.sched.vfiles == 0 {
 		return nil
 	}
 
 	index := op.vfd
 	parked := c.takeParked(index)
 
-	if op.opcode == OpVClose {
+	if op.base() == OpClose {
 		c.failTicketList(parked, syscall.EBADF)
 		return nil
 	}

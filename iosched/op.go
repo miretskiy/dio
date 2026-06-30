@@ -9,7 +9,12 @@ import (
 	"github.com/miretskiy/dio/internal/buildutil"
 )
 
-// Opcode identifies the type of I/O operation.
+// Opcode identifies the type of I/O operation. The low 7 bits name the
+// operation; the opVirtual high bit marks the virtual-file addressing mode —
+// the file is an io_uring registered-table index (vfd) rather than an *os.File.
+// A V*Op constructor sets the bit; base() masks it off, so the switches stay
+// single-armed and isVirtual is one test. Openat and Close exist only in the
+// virtual form (this package opens/closes files only into the table).
 const (
 	OpRead       uint8 = iota // pread - positioned read
 	OpWrite                   // pwrite - positioned write
@@ -17,9 +22,13 @@ const (
 	OpFdatasync               // fdatasync - flush data
 	OpReadFixed               // pread via IORING_OP_READ_FIXED
 	OpWriteFixed              // pwrite via IORING_OP_WRITE_FIXED
-	OpVOpenat                 // openat into an io_uring virtual descriptor
-	OpVClose                  // close an io_uring virtual descriptor
+	OpFallocate               // fallocate - preallocate file space
+	OpOpenat                  // openat (virtual-only: installs into a vfd slot)
+	OpClose                   // close (virtual-only: frees a vfd slot)
 )
+
+// opVirtual is OR'd into an opcode to select virtual-file addressing.
+const opVirtual uint8 = 1 << 7
 
 // Op describes a single I/O operation submitted to a Scheduler.
 //
@@ -38,7 +47,6 @@ type Op struct {
 	opcode   uint8
 	sqeFlags uint8
 	f        *os.File
-	virtual  bool
 	vfd      uint32
 	dfd      int
 	path     []byte
@@ -46,6 +54,7 @@ type Op struct {
 	mode     uint32
 	buf      []byte
 	offset   int64
+	length   int64 // byte count for ops without a buffer (fallocate)
 	opFlags  uint32
 
 	Result struct {
@@ -105,8 +114,7 @@ func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
 // example unix.AT_FDCWD. vfd is the registered-file table index.
 func VOpenatOp(dfd int, path string, flags int, mode uint32, vfd uint32) Op {
 	return Op{
-		opcode:   OpVOpenat,
-		virtual:  true,
+		opcode:   OpOpenat | opVirtual,
 		vfd:      vfd,
 		dfd:      dfd,
 		path:     append([]byte(path), 0),
@@ -117,39 +125,53 @@ func VOpenatOp(dfd int, path string, flags int, mode uint32, vfd uint32) Op {
 
 // VCloseOp constructs a close operation for an io_uring virtual descriptor.
 func VCloseOp(vfd uint32) Op {
-	return Op{opcode: OpVClose, virtual: true, vfd: vfd}
+	return Op{opcode: OpClose | opVirtual, vfd: vfd}
 }
 
 // VReadOp constructs a positioned read using an io_uring virtual descriptor.
 func VReadOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpRead, virtual: true, vfd: vfd, buf: buf, offset: offset}
+	return Op{opcode: OpRead | opVirtual, vfd: vfd, buf: buf, offset: offset}
 }
 
 // VWriteOp constructs a positioned write using an io_uring virtual descriptor.
 func VWriteOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpWrite, virtual: true, vfd: vfd, buf: buf, offset: offset}
+	return Op{opcode: OpWrite | opVirtual, vfd: vfd, buf: buf, offset: offset}
 }
 
 // VFsyncOp constructs an fsync operation using an io_uring virtual descriptor.
 func VFsyncOp(vfd uint32) Op {
-	return Op{opcode: OpFsync, virtual: true, vfd: vfd}
+	return Op{opcode: OpFsync | opVirtual, vfd: vfd}
 }
 
 // VFdatasyncOp constructs an fdatasync operation using an io_uring virtual descriptor.
 func VFdatasyncOp(vfd uint32) Op {
-	return Op{opcode: OpFdatasync, virtual: true, vfd: vfd}
+	return Op{opcode: OpFdatasync | opVirtual, vfd: vfd}
 }
 
 // VReadFixedOp constructs a positioned read using both a virtual descriptor
 // and a pre-registered fixed buffer.
 func VReadFixedOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpReadFixed, virtual: true, vfd: vfd, buf: buf, offset: offset}
+	return Op{opcode: OpReadFixed | opVirtual, vfd: vfd, buf: buf, offset: offset}
 }
 
 // VWriteFixedOp constructs a positioned write using both a virtual
 // descriptor and a pre-registered fixed buffer.
 func VWriteFixedOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpWriteFixed, virtual: true, vfd: vfd, buf: buf, offset: offset}
+	return Op{opcode: OpWriteFixed | opVirtual, vfd: vfd, buf: buf, offset: offset}
+}
+
+// FallocateOp constructs an operation that preallocates size bytes of file
+// space from offset 0 (fallocate mode 0: reserve blocks and grow the file to
+// at least size). It mirrors sys.Fallocate.
+func FallocateOp(f *os.File, size int64) Op {
+	return Op{opcode: OpFallocate, f: f, length: size}
+}
+
+// VFallocateOp constructs a FallocateOp targeting an io_uring virtual
+// descriptor. It is barrier-ordered behind the slot's open like any other
+// fixed-file op, so it composes into an open→fallocate→write chain.
+func VFallocateOp(vfd uint32, size int64) Op {
+	return Op{opcode: OpFallocate | opVirtual, vfd: vfd, length: size}
 }
 
 // Link returns a copy of o linked to next with IOSQE_IO_LINK semantics.
@@ -167,8 +189,23 @@ func (o Op) isLinked() bool {
 	return o.sqeFlags&sqeLink != 0 && o.linked != nil
 }
 
+// isVirtual reports whether o addresses its file by virtual-table index (vfd)
+// rather than *os.File — i.e. the opVirtual bit is set.
+func (o *Op) isVirtual() bool {
+	return o.opcode&opVirtual != 0
+}
+
+// base returns the operation opcode with the virtual bit masked off, so the
+// scheduler switches on the operation regardless of addressing mode.
+func (o *Op) base() uint8 {
+	return o.opcode &^ opVirtual
+}
+
+// isVBarrier reports whether o is a virtual open or close — the ops that
+// serialize a vfd slot (subsequent ops on the slot park behind one). Openat and
+// close exist only in the virtual form, so the base opcode is enough.
 func (o *Op) isVBarrier() bool {
-	return o != nil && o.virtual && (o.opcode == OpVOpenat || o.opcode == OpVClose)
+	return o != nil && (o.base() == OpOpenat || o.base() == OpClose)
 }
 
 // Ticket is the per-Submit synchronization handle returned by Scheduler.
@@ -248,11 +285,9 @@ func (t *Ticket) Error() error {
 func countAndValidateOps(op *Op) (int32, error) {
 	var n int32
 	for p := op; p != nil; p = p.linked {
-		if p.virtual {
-			if p.opcode == OpVOpenat {
-				if len(p.path) <= 1 {
-					return 0, fmt.Errorf("iosched: op %d has empty virtual-open path", n)
-				}
+		if p.isVirtual() {
+			if p.base() == OpOpenat && len(p.path) <= 1 {
+				return 0, fmt.Errorf("iosched: op %d has empty virtual-open path", n)
 			}
 		} else if p.f == nil {
 			return 0, fmt.Errorf("iosched: op %d has nil file", n)
