@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
@@ -15,7 +18,7 @@ import (
 
 const benchStorageRoot = "/instance_storage"
 
-func benchFile(b *testing.B, size int64) *os.File {
+func benchFilePath(b *testing.B, size int64) string {
 	b.Helper()
 	if _, err := os.Stat(benchStorageRoot); os.IsNotExist(err) {
 		b.Skipf("%s not found", benchStorageRoot)
@@ -48,8 +51,23 @@ func benchFile(b *testing.B, size int64) *os.File {
 		b.Fatalf("sync: %v", err)
 	}
 	b.Cleanup(func() {
-		f.Close()
 		os.RemoveAll(dir)
+	})
+	if err := f.Close(); err != nil {
+		b.Fatalf("close %s: %v", path, err)
+	}
+	return path
+}
+
+func benchFile(b *testing.B, size int64) *os.File {
+	b.Helper()
+	path := benchFilePath(b, size)
+	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	if err != nil {
+		b.Fatalf("open %s: %v", path, err)
+	}
+	b.Cleanup(func() {
+		f.Close()
 	})
 	return f
 }
@@ -60,6 +78,143 @@ func reportSchedStats(b *testing.B, sched *iosched.URingScheduler) {
 		return
 	}
 	b.ReportMetric(float64(st.OpsPlaced)/float64(st.Syscalls), "ops/syscall")
+}
+
+const (
+	readBenchFileSize  = 1 << 30 // 1 GiB
+	readBenchBlockSize = 4096
+	readBenchBlocks    = readBenchFileSize / readBenchBlockSize
+	readBenchDepth     = 1024
+)
+
+func recordBenchErr(once *sync.Once, dst *error, err error) {
+	once.Do(func() {
+		*dst = err
+	})
+}
+
+func BenchmarkRegularIO(b *testing.B) {
+	if !iosched.IOUringAvailable {
+		b.Skip("io_uring not available")
+	}
+
+	path := benchFilePath(b, readBenchFileSize)
+	f, err := os.OpenFile(path, os.O_RDONLY, 0644)
+	if err != nil {
+		b.Fatalf("open %s: %v", path, err)
+	}
+	b.Cleanup(func() { f.Close() })
+
+	sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: readBenchDepth})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { sched.Close() })
+
+	var seq atomic.Uint64
+	var errOnce sync.Once
+	var benchErr error
+
+	b.SetBytes(readBenchBlockSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		buf := make([]byte, readBenchBlockSize)
+		for pb.Next() {
+			block := (seq.Add(1) - 1) % readBenchBlocks
+			offset := int64(block * readBenchBlockSize)
+			ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
+			if err != nil {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("submit: %w", err))
+				return
+			}
+			ticket.Wait()
+			if res := ticket.Op.Result; res.Err != nil {
+				ticket.Release()
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, res.Err))
+				return
+			} else if res.N != readBenchBlockSize {
+				ticket.Release()
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, res.N))
+				return
+			}
+			ticket.Release()
+		}
+	})
+	b.StopTimer()
+	if benchErr != nil {
+		b.Fatal(benchErr)
+	}
+	reportSchedStats(b, sched)
+}
+
+func BenchmarkDirectIO(b *testing.B) {
+	if !iosched.IOUringAvailable {
+		b.Skip("io_uring not available")
+	}
+
+	path := benchFilePath(b, readBenchFileSize)
+	sched, err := iosched.NewURingScheduler(iosched.URingConfig{
+		RingDepth: readBenchDepth,
+		VFiles:    1,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		if ticket, err := sched.Submit(iosched.VCloseOp(0)); err == nil {
+			ticket.Wait()
+			ticket.Release()
+		}
+		sched.Close()
+	})
+
+	openTicket, err := sched.Submit(iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_RDONLY, 0, 0))
+	if err != nil {
+		b.Fatalf("submit vopen: %v", err)
+	}
+	openTicket.Wait()
+	if err := openTicket.Error(); err != nil {
+		openTicket.Release()
+		b.Fatalf("vopen: %v", err)
+	}
+	openTicket.Release()
+
+	var seq atomic.Uint64
+	var errOnce sync.Once
+	var benchErr error
+
+	b.SetBytes(readBenchBlockSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		buf := make([]byte, readBenchBlockSize)
+		for pb.Next() {
+			block := (seq.Add(1) - 1) % readBenchBlocks
+			offset := int64(block * readBenchBlockSize)
+			ticket, err := sched.Submit(iosched.VReadOp(0, buf, offset))
+			if err != nil {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("submit: %w", err))
+				return
+			}
+			ticket.Wait()
+			if res := ticket.Op.Result; res.Err != nil {
+				ticket.Release()
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, res.Err))
+				return
+			} else if res.N != readBenchBlockSize {
+				ticket.Release()
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, res.N))
+				return
+			}
+			ticket.Release()
+		}
+	})
+	b.StopTimer()
+	if benchErr != nil {
+		b.Fatal(benchErr)
+	}
+	reportSchedStats(b, sched)
 }
 
 func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {

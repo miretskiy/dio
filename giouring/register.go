@@ -174,25 +174,22 @@ func (ring *Ring) RegisterFilesSparse(nr uint32) (uint, error) {
 
 	for {
 		ret, errno = ring.doRegisterErrno(RegisterFiles2, unsafe.Pointer(reg), uint32(unsafe.Sizeof(*reg)))
-		if errno != 0 {
-			break
+		if errno == 0 {
+			return ret, nil
 		}
-
 		if errno == syscall.EMFILE && !didIncrease {
 			didIncrease = true
 
 			err = increaseRlimitNofile(uint64(nr))
 			if err != nil {
-				break
+				return ret, err
 			}
 
 			continue
 		}
 
-		break
+		return ret, os.NewSyscallError("io_uring_register", errno)
 	}
-
-	return ret, err
 }
 
 // liburing: io_uring_register_files_tags - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_files_tags.3.en.html

@@ -43,6 +43,7 @@ type inflightEntry struct {
 type URingScheduler struct {
 	ring        *giouring.Ring
 	depth       uint32
+	vfiles      uint32
 	stagingHead atomic.Pointer[Ticket]
 	wakeup      chan struct{}
 
@@ -103,10 +104,17 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 	if err := ring.QueueInit(depth, flags); err != nil {
 		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
 	}
+	if cfg.VFiles > 0 {
+		if _, err := ring.RegisterFilesSparse(cfg.VFiles); err != nil {
+			ring.QueueExit()
+			return nil, fmt.Errorf("iosched: io_uring_register_files_sparse: %w", err)
+		}
+	}
 
 	s := &URingScheduler{
 		ring:   ring,
 		depth:  depth,
+		vfiles: cfg.VFiles,
 		wakeup: make(chan struct{}, 1),
 	}
 	s.shutdown.stop = make(chan struct{})
@@ -183,8 +191,12 @@ type coordinator struct {
 	freeSlots []int
 	nInflight int
 
+	parkedOps []*Ticket
+
 	closing bool
 }
+
+var barrierOp Ticket
 
 func (s *URingScheduler) loop() {
 	defer s.wg.Done()
@@ -195,6 +207,9 @@ func (s *URingScheduler) loop() {
 		ring:      s.ring,
 		inflight:  make([]inflightEntry, s.depth),
 		freeSlots: make([]int, s.depth),
+	}
+	if s.vfiles > 0 {
+		c.parkedOps = make([]*Ticket, s.vfiles)
 	}
 	for i := range s.depth {
 		c.freeSlots[i] = int(i)
@@ -208,6 +223,7 @@ func (s *URingScheduler) loop() {
 			c.failTicketList(batch, s.shutdown.err)
 			batch = nil
 			c.failStaged(s.shutdown.err)
+			c.failParked(s.shutdown.err)
 		} else {
 			batch = c.fillSlots(batch)
 		}
@@ -229,9 +245,12 @@ func (s *URingScheduler) loop() {
 			s.stop(ringErr)
 			c.failTicketList(batch, ringErr)
 			c.failStaged(ringErr)
+			c.failParked(ringErr)
 			return
 		}
-		c.reap()
+		if unparked := c.reap(); unparked != nil {
+			batch = c.filterRunnableAfter(unparked, batch)
+		}
 
 		select {
 		case <-s.shutdown.stop:
@@ -242,14 +261,16 @@ func (s *URingScheduler) loop() {
 }
 
 func (c *coordinator) collect(batch *Ticket) *Ticket {
+	runnable := batch
+
 	s := c.sched
-	if batch != nil {
+	if runnable != nil {
 		select {
 		case <-s.shutdown.stop:
 			c.closing = true
 		default:
 		}
-		return appendTickets(batch, reverseTickets(s.stagingHead.Swap(nil)))
+		return c.filterRunnableAfter(reverseTickets(s.stagingHead.Swap(nil)), runnable)
 	}
 
 	staged := s.stagingHead.Swap(nil)
@@ -259,7 +280,7 @@ func (c *coordinator) collect(batch *Ticket) *Ticket {
 			c.closing = true
 		default:
 		}
-		return reverseTickets(staged)
+		return c.filterRunnableAfter(reverseTickets(staged), nil)
 	}
 
 	if c.nInflight == 0 {
@@ -277,7 +298,7 @@ func (c *coordinator) collect(batch *Ticket) *Ticket {
 		}
 	}
 
-	return reverseTickets(s.stagingHead.Swap(nil))
+	return c.filterRunnableAfter(reverseTickets(s.stagingHead.Swap(nil)), nil)
 }
 
 func reverseTickets(head *Ticket) *Ticket {
@@ -306,17 +327,90 @@ func appendTickets(head, tail *Ticket) *Ticket {
 	}
 }
 
+func (c *coordinator) filterRunnable(head *Ticket) *Ticket {
+	return c.filterRunnableAfter(head, nil)
+}
+
+func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
+	var tail *Ticket
+	if runnable != nil {
+		tail = runnable
+		for tail.next != nil {
+			tail = tail.next
+		}
+	}
+
+	for head != nil {
+		t := head
+		head = head.next
+		t.next = nil
+
+		if need := int(t.pending.Load()); need > int(c.sched.depth) {
+			c.failTicket(t, fmt.Errorf("iosched: linked chain length %d exceeds ring depth %d", need, c.sched.depth))
+			continue
+		}
+
+		var err error
+		var parkSlot uint32
+		var parked bool
+
+		for op := &t.Op; op != nil; op = op.linked {
+			if !op.virtual {
+				continue
+			}
+			if c.sched.vfiles == 0 {
+				err = fmt.Errorf("iosched: virtual file ops require URingConfig.VFiles")
+				break
+			}
+			slot := op.vfd
+			if slot >= c.sched.vfiles {
+				err = fmt.Errorf("iosched: virtual file index %d outside configured table", slot)
+				break
+			}
+			if c.parkedOps[slot] != nil {
+				parked = true
+				parkSlot = slot
+				break
+			}
+		}
+
+		if err != nil {
+			c.failTicket(t, err)
+			continue
+		}
+		if parked {
+			c.parkTicket(parkSlot, t)
+			continue
+		}
+
+		for op := &t.Op; op != nil; op = op.linked {
+			if op.virtual && (op.opcode == OpVOpenat || op.opcode == OpVClose) {
+				c.parkedOps[op.vfd] = &barrierOp
+			}
+		}
+
+		if runnable == nil {
+			runnable = t
+		} else {
+			tail.next = t
+		}
+		tail = t
+	}
+	return runnable
+}
+
+func (c *coordinator) parkTicket(slot uint32, t *Ticket) {
+	if c.parkedOps[slot] == &barrierOp {
+		c.parkedOps[slot] = t
+		return
+	}
+	c.parkedOps[slot] = appendTickets(c.parkedOps[slot], t)
+}
+
 func (c *coordinator) fillSlots(head *Ticket) *Ticket {
 	for head != nil {
 		t := head
 		need := int(t.pending.Load())
-		if need > int(c.sched.depth) {
-			head = t.next
-			t.next = nil
-			err := fmt.Errorf("iosched: linked chain length %d exceeds ring depth %d", need, c.sched.depth)
-			c.failTicket(t, err)
-			continue
-		}
 		if need > len(c.freeSlots) {
 			return head
 		}
@@ -375,26 +469,52 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 }
 
 func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
-	fd := int(op.f.Fd())
+	fd := opFD(op)
+	buf := bufferPtr(op.buf)
 	switch op.opcode {
 	case OpRead:
-		sqe.PrepareRead(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset))
+		sqe.PrepareRead(fd, buf, uint32(len(op.buf)), uint64(op.offset))
 	case OpWrite:
-		sqe.PrepareWrite(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset))
+		sqe.PrepareWrite(fd, buf, uint32(len(op.buf)), uint64(op.offset))
 	case OpReadFixed:
-		sqe.PrepareReadFixed(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset), 0)
+		sqe.PrepareReadFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
 	case OpWriteFixed:
-		sqe.PrepareWriteFixed(fd, uintptr(unsafe.Pointer(&op.buf[0])), uint32(len(op.buf)), uint64(op.offset), 0)
+		sqe.PrepareWriteFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
 	case OpFsync:
 		sqe.PrepareFsync(fd, 0)
 	case OpFdatasync:
 		sqe.PrepareFsync(fd, giouring.FsyncDatasync)
+	case OpVOpenat:
+		sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, op.vfd)
+	case OpVClose:
+		sqe.PrepareCloseDirect(op.vfd)
 	default:
 		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
 	}
-	if op.sqeFlags&sqeLink != 0 && op.linked != nil {
-		sqe.SetFlags(uint32(giouring.SqeIOLink))
+	var sqeFlags uint32
+	if op.virtual && op.opcode != OpVOpenat && op.opcode != OpVClose {
+		sqeFlags |= uint32(giouring.SqeFixedFile)
 	}
+	if op.sqeFlags&sqeLink != 0 && op.linked != nil {
+		sqeFlags |= uint32(giouring.SqeIOLink)
+	}
+	if sqeFlags != 0 {
+		sqe.SetFlags(sqeFlags)
+	}
+}
+
+func opFD(op *Op) int {
+	if op.virtual {
+		return int(op.vfd)
+	}
+	return int(op.f.Fd())
+}
+
+func bufferPtr(buf []byte) uintptr {
+	if len(buf) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&buf[0]))
 }
 
 func (c *coordinator) submit() error {
@@ -415,8 +535,9 @@ func (c *coordinator) submit() error {
 	}
 }
 
-func (c *coordinator) reap() {
+func (c *coordinator) reap() *Ticket {
 	var count uint32
+	var ready, readyTail *Ticket
 	c.ring.ForEachCQE(func(cqe *giouring.CompletionQueueEvent) {
 		count++
 		slot := int(cqe.GetData64())
@@ -428,11 +549,53 @@ func (c *coordinator) reap() {
 		} else {
 			e.op.Result.N = int(cqe.Res)
 		}
+		if unparked := c.completeVOp(e.op); unparked != nil {
+			if ready == nil {
+				ready = unparked
+			} else {
+				readyTail.next = unparked
+			}
+			readyTail = unparked
+			for readyTail.next != nil {
+				readyTail = readyTail.next
+			}
+		}
 		completeTicket(e.t)
 	})
 	if count > 0 {
 		c.ring.CQAdvance(count)
 	}
+	return ready
+}
+
+func (c *coordinator) completeVOp(op *Op) *Ticket {
+	if !op.virtual || (op.opcode != OpVOpenat && op.opcode != OpVClose) || c.sched.vfiles == 0 {
+		return nil
+	}
+
+	index := op.vfd
+	parked := c.takeParked(index)
+
+	if op.opcode == OpVClose {
+		c.failTicketList(parked, syscall.EBADF)
+		return nil
+	}
+
+	if op.Result.Err != nil {
+		c.failTicketList(parked, op.Result.Err)
+		return nil
+	}
+
+	return parked
+}
+
+func (c *coordinator) takeParked(slot uint32) *Ticket {
+	head := c.parkedOps[slot]
+	c.parkedOps[slot] = nil
+	if head == &barrierOp {
+		return nil
+	}
+	return head
 }
 
 func (c *coordinator) releaseSlot(slot int) {
@@ -464,6 +627,16 @@ func (c *coordinator) failStaged(err error) {
 			return
 		}
 		c.failTicketList(reverseTickets(batch), err)
+	}
+}
+
+func (c *coordinator) failParked(err error) {
+	for i, t := range c.parkedOps {
+		c.parkedOps[i] = nil
+		if t == &barrierOp {
+			continue
+		}
+		c.failTicketList(t, err)
 	}
 }
 

@@ -4,6 +4,7 @@ package iosched_test
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/iosched"
@@ -29,6 +31,24 @@ func newURingSched(t *testing.T, cfg ...iosched.URingConfig) *iosched.URingSched
 	}
 	s, err := iosched.NewURingScheduler(c)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	return s
+}
+
+func newVURingSched(t *testing.T, cfg iosched.URingConfig) *iosched.URingScheduler {
+	t.Helper()
+	if !iosched.IOUringAvailable {
+		t.Skip("io_uring not available on this kernel")
+	}
+	s, err := iosched.NewURingScheduler(cfg)
+	if err != nil {
+		switch {
+		case errors.Is(err, unix.EINVAL), errors.Is(err, unix.EOPNOTSUPP), errors.Is(err, unix.ENOSYS):
+			t.Skipf("io_uring virtual files not available on this kernel: %v", err)
+		default:
+			require.NoError(t, err)
+		}
+	}
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
 }
@@ -358,6 +378,51 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 	for err := range errs {
 		require.NoError(t, err)
 	}
+}
+
+func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
+	s := newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 4})
+	vfd := uint32(0)
+
+	path := filepath.Join(t.TempDir(), "vopen.dat")
+	payload := []byte("virtual file payload")
+
+	openTicket, err := s.Submit(iosched.VOpenatOp(
+		unix.AT_FDCWD,
+		path,
+		unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC,
+		0o600,
+		vfd,
+	))
+	require.NoError(t, err)
+
+	writeTicket, err := s.Submit(iosched.VWriteOp(vfd, payload, 0))
+	require.NoError(t, err)
+
+	openTicket.Wait()
+	writeTicket.Wait()
+	defer openTicket.Release()
+	defer writeTicket.Release()
+
+	require.NoError(t, openTicket.Error())
+	require.NoError(t, writeTicket.Error())
+	require.Equal(t, len(payload), writeTicket.Op.Result.N)
+
+	readBuf := make([]byte, len(payload))
+	readTicket := submitOne(t, s, iosched.VReadOp(vfd, readBuf, 0))
+	defer readTicket.Release()
+	require.NoError(t, readTicket.Error())
+	require.Equal(t, payload, readBuf)
+
+	closeTicket := submitOne(t, s, iosched.VCloseOp(vfd))
+	defer closeTicket.Release()
+	require.NoError(t, closeTicket.Error())
+
+	closedSlotTicket, err := s.Submit(iosched.VWriteOp(vfd, payload, 0))
+	require.NoError(t, err)
+	closedSlotTicket.Wait()
+	defer closedSlotTicket.Release()
+	require.Error(t, closedSlotTicket.Error())
 }
 
 func newRegisteredPool(t *testing.T, s *iosched.URingScheduler) *mempool.SlabPool {

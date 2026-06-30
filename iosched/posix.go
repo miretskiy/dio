@@ -32,6 +32,12 @@ func (s *POSIXScheduler) Submit(op Op) (*Ticket, error) {
 
 	t := getTicket(op, n)
 	for p := &t.Op; p != nil; p = p.linked {
+		if p.virtual {
+			t.pending.Store(0)
+			t.wg.Done()
+			t.Release()
+			return nil, fmt.Errorf("iosched: virtual file ops require URingScheduler")
+		}
 		runPOSIXOp(p)
 		completeTicket(t)
 		if p.Result.Err != nil && p.isLinked() {

@@ -106,6 +106,25 @@ func TestPrepareCloseDirect(t *testing.T) {
 	Equal(t, int32(11), entry.SpliceFdIn)
 }
 
+func TestPrepareOpenatDirect(t *testing.T) {
+	entry := &SubmissionQueueEntry{}
+	path := []byte("direct.dat\x00")
+	entry.PrepareOpenatDirect(-100, path, 0x42, 0o600, 7)
+
+	Equal(t, uint8(18), entry.OpCode)
+	Equal(t, uint8(0), entry.Flags)
+	Equal(t, uint16(0), entry.IoPrio)
+	Equal(t, int32(-100), entry.Fd)
+	Equal(t, uint64(0), entry.Off)
+	Equal(t, uint64(uintptr(unsafe.Pointer(&path[0]))), entry.Addr)
+	Equal(t, uint32(0o600), entry.Len)
+	Equal(t, uint32(0x42), entry.OpcodeFlags)
+	Equal(t, uint64(0), entry.UserData)
+	Equal(t, uint16(0), entry.BufIG)
+	Equal(t, uint16(0), entry.Personality)
+	Equal(t, int32(8), entry.SpliceFdIn)
+}
+
 func TestPrepareReadv(t *testing.T) {
 	entry := &SubmissionQueueEntry{}
 	entry.PrepareReadv(10, uintptr(12345), 60, 10)

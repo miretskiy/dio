@@ -236,13 +236,13 @@ func (entry *SubmissionQueueEntry) PrepareNop() {
 
 // liburing: io_uring_prep_openat - https://manpages.debian.org/unstable/liburing-dev/io_uring_prep_openat.3.en.html
 func (entry *SubmissionQueueEntry) PrepareOpenat(dfd int, path []byte, flags int, mode uint32) {
-	entry.prepareRW(OpOpenat, dfd, uintptr(unsafe.Pointer(&path)), mode, 0)
+	entry.prepareRW(OpOpenat, dfd, byteSlicePtr(path), mode, 0)
 	entry.OpcodeFlags = uint32(flags)
 }
 
 // liburing: io_uring_prep_openat2 - https://manpages.debian.org/unstable/liburing-dev/io_uring_prep_openat2.3.en.html
 func (entry *SubmissionQueueEntry) PrepareOpenat2(dfd int, path []byte, openHow *unix.OpenHow) {
-	entry.prepareRW(OpOpenat, dfd, uintptr(unsafe.Pointer(&path)),
+	entry.prepareRW(OpOpenat, dfd, byteSlicePtr(path),
 		uint32(unsafe.Sizeof(*openHow)), uint64(uintptr(unsafe.Pointer(openHow))))
 }
 
@@ -262,6 +262,13 @@ func (entry *SubmissionQueueEntry) PrepareOpenatDirect(dfd int, path []byte, fla
 		fileIndex--
 	}
 	entry.setTargetFixedFile(fileIndex)
+}
+
+func byteSlicePtr(buf []byte) uintptr {
+	if len(buf) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&buf[0]))
 }
 
 // liburing: io_uring_prep_poll_add - https://manpages.debian.org/unstable/liburing-dev/io_uring_prep_poll_add.3.en.html

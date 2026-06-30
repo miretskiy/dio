@@ -66,4 +66,8 @@ type URingConfig struct {
 
 	// SQPOLL enables IORING_SETUP_SQPOLL.
 	SQPOLL bool
+
+	// VFiles registers a sparse virtual-file table of this size. Virtual-file
+	// ops require a non-zero table.
+	VFiles uint32
 }
