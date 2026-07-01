@@ -469,7 +469,30 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 }
 
 func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
-	fd := opFD(op)
+	// A "direct descriptor" (a.k.a. registered/fixed file) is a file held in
+	// io_uring's own table and named by a slot index, not a process fd.
+	// IOSQE_FIXED_FILE is the switch into that world: it tells the kernel to read
+	// the SQE's fd field as a registered slot index rather than a process fd. So
+	// it belongs on virtual read/write/fsync/fallocate — ops that name their file
+	// through the fd field.
+	//
+	// openat and close instead reach the table through the separate file_index
+	// field (the *Direct helpers set it via setTargetFixedFile), not the fd
+	// field, so they must NOT set IOSQE_FIXED_FILE — for close,
+	// io_uring_prep_close_direct(3) mandates this explicitly. Each clears it in
+	// its case below.
+	var sqeFlags uint32
+	var fd int
+	if op.isVirtual() {
+		sqeFlags |= uint32(giouring.SqeFixedFile)
+		fd = int(op.vfd)
+	} else {
+		fd = int(op.f.Fd())
+	}
+	if op.isLinked() {
+		sqeFlags |= uint32(giouring.SqeIOLink)
+	}
+
 	buf := bufferPtr(op.buf)
 	switch op.base() {
 	case OpRead:
@@ -487,29 +510,34 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 	case OpFallocate:
 		sqe.PrepareFallocate(fd, 0, uint64(op.offset), uint64(op.length))
 	case OpOpenat:
-		sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, op.vfd)
+		// openat's fd field is the dirfd (a real fd / AT_FDCWD), not a registered
+		// index, so IOSQE_FIXED_FILE must stay off. The direct form installs the
+		// opened file into registered slot fd (carried in file_index); the plain
+		// form returns a regular fd in the completion result.
+		sqeFlags &^= uint32(giouring.SqeFixedFile)
+		if op.isVirtual() {
+			sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, uint32(fd))
+		} else {
+			sqe.PrepareOpenat(op.dfd, op.path, op.openFlag, op.mode)
+		}
 	case OpClose:
-		sqe.PrepareCloseDirect(op.vfd)
+		// Closes direct descriptor fd. Per io_uring_prep_close_direct(3) the
+		// application must not set IOSQE_FIXED_FILE even though it targets a
+		// direct descriptor: the slot rides in file_index (set by
+		// PrepareCloseDirect), not the fd field.
+		sqeFlags &^= uint32(giouring.SqeFixedFile)
+		if op.isVirtual() {
+			sqe.PrepareCloseDirect(uint32(fd))
+		} else {
+			sqe.PrepareClose(fd)
+		}
 	default:
 		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
 	}
-	var sqeFlags uint32
-	if op.isVirtual() && !op.isVBarrier() {
-		sqeFlags |= uint32(giouring.SqeFixedFile)
-	}
-	if op.sqeFlags&sqeLink != 0 && op.linked != nil {
-		sqeFlags |= uint32(giouring.SqeIOLink)
-	}
+
 	if sqeFlags != 0 {
 		sqe.SetFlags(sqeFlags)
 	}
-}
-
-func opFD(op *Op) int {
-	if op.isVirtual() {
-		return int(op.vfd)
-	}
-	return int(op.f.Fd())
 }
 
 func bufferPtr(buf []byte) uintptr {

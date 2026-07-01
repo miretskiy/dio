@@ -12,9 +12,6 @@ import (
 // Opcode identifies the type of I/O operation. The low 7 bits name the
 // operation; the opVirtual high bit marks the virtual-file addressing mode —
 // the file is an io_uring registered-table index (vfd) rather than an *os.File.
-// A V*Op constructor sets the bit; base() masks it off, so the switches stay
-// single-armed and isVirtual is one test. Openat and Close exist only in the
-// virtual form (this package opens/closes files only into the table).
 const (
 	OpRead       uint8 = iota // pread - positioned read
 	OpWrite                   // pwrite - positioned write
@@ -105,6 +102,23 @@ func ReadFixedOp(f *os.File, buf []byte, offset int64) Op {
 // WriteFixedOp constructs a positioned write using a pre-registered fixed buffer.
 func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
 	return Op{opcode: OpWriteFixed, f: f, buf: buf, offset: offset}
+}
+
+// OpenatOp constructs a plain openat operation that opens path and returns the
+// new regular file descriptor in Result.N. The caller owns that fd and must
+// close it. To open directly into the registered-file table instead — no
+// process fd — use VOpenatOp.
+//
+// The dfd argument is the directory fd passed to openat(2), for example
+// unix.AT_FDCWD.
+func OpenatOp(dfd int, path string, flags int, mode uint32) Op {
+	return Op{
+		opcode:   OpOpenat,
+		dfd:      dfd,
+		path:     append([]byte(path), 0),
+		openFlag: flags,
+		mode:     mode,
+	}
 }
 
 // VOpenatOp constructs an openat operation that installs the opened file
@@ -202,10 +216,11 @@ func (o *Op) base() uint8 {
 }
 
 // isVBarrier reports whether o is a virtual open or close — the ops that
-// serialize a vfd slot (subsequent ops on the slot park behind one). Openat and
-// close exist only in the virtual form, so the base opcode is enough.
+// serialize a vfd slot (subsequent ops on the slot park behind one). Only the
+// virtual form addresses a slot, so a plain (non-virtual) openat is not a
+// barrier.
 func (o *Op) isVBarrier() bool {
-	return o != nil && (o.base() == OpOpenat || o.base() == OpClose)
+	return o.isVirtual() && (o.base() == OpOpenat || o.base() == OpClose)
 }
 
 // Ticket is the per-Submit synchronization handle returned by Scheduler.
@@ -285,11 +300,16 @@ func (t *Ticket) Error() error {
 func countAndValidateOps(op *Op) (int32, error) {
 	var n int32
 	for p := op; p != nil; p = p.linked {
-		if p.isVirtual() {
-			if p.base() == OpOpenat && len(p.path) <= 1 {
-				return 0, fmt.Errorf("iosched: op %d has empty virtual-open path", n)
+		switch {
+		case p.base() == OpOpenat:
+			// openat carries a path and no *os.File in either addressing mode.
+			if len(p.path) <= 1 {
+				return 0, fmt.Errorf("iosched: op %d has empty open path", n)
 			}
-		} else if p.f == nil {
+		case p.isVirtual():
+			// virtual read/write/fsync/close name a registered slot; the index is
+			// range-checked against the table at submission time.
+		case p.f == nil:
 			return 0, fmt.Errorf("iosched: op %d has nil file", n)
 		}
 		n++

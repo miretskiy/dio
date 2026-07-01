@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestTicketReleaseNilSafeIdempotentAndPendingSafe(t *testing.T) {
@@ -131,4 +133,10 @@ func BenchmarkTicketGetCompleteRelease(b *testing.B) {
 		completeTicket(ticket)
 		ticket.Release()
 	}
+}
+
+func TestIsVbarrier(t *testing.T) {
+	// Mostly to silence unused isVBarrier warning on non-linux
+	var op Op
+	require.False(t, op.isVBarrier())
 }

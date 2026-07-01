@@ -155,6 +155,16 @@ func runPOSIXOp(op *Op, f *os.File) {
 		op.Result.Err = sys.Fdatasync(f)
 	case OpFallocate:
 		op.Result.Err = sys.Fallocate(f, op.length)
+	case OpOpenat:
+		// Plain openat: open the path and hand the raw fd back in Result.N; the
+		// caller owns it. (The virtual/direct form is handled in runVirtualOp.)
+		name := string(op.path[:len(op.path)-1])
+		fd, err := unix.Openat(op.dfd, name, op.openFlag, op.mode)
+		if err != nil {
+			op.Result.Err = err
+			return
+		}
+		op.Result.N = fd
 	default:
 		op.Result.Err = fmt.Errorf("iosched: invalid opcode %d", op.opcode)
 	}
