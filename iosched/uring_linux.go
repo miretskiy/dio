@@ -503,6 +503,10 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 		sqe.PrepareReadFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
 	case OpWriteFixed:
 		sqe.PrepareWriteFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
+	case OpReadv:
+		sqe.PrepareReadv(fd, iovecsPtr(op.iovecs), uint32(len(op.iovecs)), uint64(op.offset))
+	case OpWritev:
+		sqe.PrepareWritev(fd, iovecsPtr(op.iovecs), uint32(len(op.iovecs)), uint64(op.offset))
 	case OpFsync:
 		sqe.PrepareFsync(fd, 0)
 	case OpFdatasync:
@@ -545,6 +549,13 @@ func bufferPtr(buf []byte) uintptr {
 		return 0
 	}
 	return uintptr(unsafe.Pointer(&buf[0]))
+}
+
+func iovecsPtr(iovs []syscall.Iovec) uintptr {
+	if len(iovs) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&iovs[0]))
 }
 
 func (c *coordinator) submit() error {

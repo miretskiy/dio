@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/miretskiy/dio/internal/buildutil"
 )
@@ -22,6 +23,8 @@ const (
 	OpFallocate               // fallocate - preallocate file space
 	OpOpenat                  // openat (virtual-only: installs into a vfd slot)
 	OpClose                   // close (virtual-only: frees a vfd slot)
+	OpReadv                   // preadv - vectored positioned read
+	OpWritev                  // pwritev - vectored positioned write
 )
 
 // opVirtual is OR'd into an opcode to select virtual-file addressing.
@@ -50,6 +53,8 @@ type Op struct {
 	openFlag int
 	mode     uint32
 	buf      []byte
+	bufs     [][]byte        // vectored buffers (readv/writev)
+	iovecs   []syscall.Iovec // kernel iovec array built from bufs; pinned by the Op
 	offset   int64
 	length   int64 // byte count for ops without a buffer (fallocate)
 	opFlags  uint32
@@ -102,6 +107,46 @@ func ReadFixedOp(f *os.File, buf []byte, offset int64) Op {
 // WriteFixedOp constructs a positioned write using a pre-registered fixed buffer.
 func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
 	return Op{opcode: OpWriteFixed, f: f, buf: buf, offset: offset}
+}
+
+// ReadvOp constructs a vectored positioned read: bufs are filled from
+// consecutive file offsets starting at offset (preadv semantics). Result.N is
+// the total bytes read across all buffers.
+func ReadvOp(f *os.File, bufs [][]byte, offset int64) Op {
+	return Op{opcode: OpReadv, f: f, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+}
+
+// WritevOp constructs a vectored positioned write: bufs are written to
+// consecutive file offsets starting at offset (pwritev semantics). Result.N is
+// the total bytes written across all buffers.
+func WritevOp(f *os.File, bufs [][]byte, offset int64) Op {
+	return Op{opcode: OpWritev, f: f, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+}
+
+// VReadvOp constructs a vectored positioned read against an io_uring virtual
+// descriptor.
+func VReadvOp(vfd uint32, bufs [][]byte, offset int64) Op {
+	return Op{opcode: OpReadv | opVirtual, vfd: vfd, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+}
+
+// VWritevOp constructs a vectored positioned write against an io_uring virtual
+// descriptor.
+func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
+	return Op{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+}
+
+// makeIovecs builds a kernel iovec array from bufs, skipping empty buffers. The
+// iovec bases point into the caller's buffers; the Op retains bufs so the GC
+// keeps those backing arrays alive until the kernel completes the SQE.
+func makeIovecs(bufs [][]byte) []syscall.Iovec {
+	iovs := make([]syscall.Iovec, 0, len(bufs))
+	for _, b := range bufs {
+		if len(b) == 0 {
+			continue
+		}
+		iovs = append(iovs, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
+	}
+	return iovs
 }
 
 // OpenatOp constructs a plain openat operation that opens path and returns the

@@ -155,6 +155,10 @@ func runPOSIXOp(op *Op, f *os.File) {
 		op.Result.Err = sys.Fdatasync(f)
 	case OpFallocate:
 		op.Result.Err = sys.Fallocate(f, op.length)
+	case OpReadv:
+		op.Result.N, op.Result.Err = vectoredPOSIX(syscall.Pread, int(f.Fd()), op.bufs, op.offset)
+	case OpWritev:
+		op.Result.N, op.Result.Err = vectoredPOSIX(syscall.Pwrite, int(f.Fd()), op.bufs, op.offset)
 	case OpOpenat:
 		// Plain openat: open the path and hand the raw fd back in Result.N; the
 		// caller owns it. (The virtual/direct form is handled in runVirtualOp.)
@@ -190,4 +194,27 @@ func ignoringEINTR(fn ioFn, fd int, p []byte, offset int64) (int, error) {
 			return n, err
 		}
 	}
+}
+
+// vectoredPOSIX emulates preadv/pwritev with per-buffer positioned scalar I/O,
+// keeping the POSIX backend portable (darwin lacks positioned vectored I/O in
+// x/sys/unix). Buffers map to consecutive file offsets starting at offset; a
+// short transfer (EOF on read, or a short write) stops the loop, matching a
+// single preadv/pwritev's short-count semantics.
+func vectoredPOSIX(fn ioFn, fd int, bufs [][]byte, offset int64) (int, error) {
+	total := 0
+	for _, b := range bufs {
+		if len(b) == 0 {
+			continue
+		}
+		n, err := ignoringEINTR(fn, fd, b, offset+int64(total))
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n < len(b) {
+			break
+		}
+	}
+	return total, nil
 }
