@@ -61,7 +61,7 @@ func TestCoordinatorFailAllInflightCompletesOnlyRemainingLinkedOps(t *testing.T)
 }
 
 func newVCoordinator(n uint32) coordinator {
-	s := &URingScheduler{depth: 16, vfiles: n}
+	s := &URingScheduler{URingConfig: URingConfig{RingDepth: 16, VFiles: n}}
 	return coordinator{sched: s, parkedOps: make([]*Ticket, n)}
 }
 

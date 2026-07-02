@@ -273,6 +273,11 @@ type Ticket struct {
 	// Intrusive lock-free MPSC link.
 	next *Ticket
 
+	// group, when non-nil, is the head of a chain (linked via next) of follower
+	// tickets whose writes were coalesced into this leader's single writev. The
+	// leader's one completion fans out to the whole group. See coalesce.go.
+	group *Ticket
+
 	// The embedded operation.
 	Op Op
 
@@ -299,6 +304,7 @@ func putTicket(t *Ticket) {
 	clearResults(&t.Op)
 	t.Op = Op{}
 	t.next = nil
+	t.group = nil
 	t.pending.Store(0)
 	t.released.Store(true)
 	ticketPool.Put(t)

@@ -70,4 +70,8 @@ type URingConfig struct {
 	// VFiles registers a sparse virtual-file table of this size. Virtual-file
 	// ops require a non-zero table.
 	VFiles uint32
+
+	// DisableCoalescing turns off write coalescing (contiguous same-file plain
+	// writes in a batch merged into one writev). Coalescing is on by default.
+	DisableCoalescing bool
 }

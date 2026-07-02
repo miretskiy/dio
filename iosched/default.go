@@ -41,3 +41,10 @@ func WithRingDepth(n uint32) Option { return func(c *URingConfig) { c.RingDepth 
 // WithSQPOLL enables IORING_SETUP_SQPOLL, dedicating a kernel thread to poll the
 // submission queue.
 func WithSQPOLL() Option { return func(c *URingConfig) { c.SQPOLL = true } }
+
+// WithEnableCoalesce toggles write coalescing (contiguous same-file plain writes
+// in a batch merged into one writev). It is enabled by default; pass false to
+// turn it off. The POSIX backend ignores it.
+func WithEnableCoalesce(enable bool) Option {
+	return func(c *URingConfig) { c.DisableCoalescing = !enable }
+}

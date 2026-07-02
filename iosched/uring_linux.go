@@ -41,9 +41,9 @@ type inflightEntry struct {
 // an intrusive lock-free MPSC stack and wake the coordinator with a buffered(1)
 // doorbell.
 type URingScheduler struct {
+	URingConfig
+
 	ring        *giouring.Ring
-	depth       uint32
-	vfiles      uint32
 	stagingHead atomic.Pointer[Ticket]
 	wakeup      chan struct{}
 
@@ -94,6 +94,7 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 	if depth == 0 {
 		depth = defaultRingDepth
 	}
+	cfg.RingDepth = depth // store the effective depth back into the config
 
 	var flags uint32
 	if cfg.SQPOLL {
@@ -112,10 +113,9 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 	}
 
 	s := &URingScheduler{
-		ring:   ring,
-		depth:  depth,
-		vfiles: cfg.VFiles,
-		wakeup: make(chan struct{}, 1),
+		URingConfig: cfg,
+		ring:        ring,
+		wakeup:      make(chan struct{}, 1),
 	}
 	s.shutdown.stop = make(chan struct{})
 
@@ -193,6 +193,9 @@ type coordinator struct {
 
 	parkedOps []*Ticket
 
+	// coalesce is reused each batch to gather write-coalescing candidates.
+	coalesce []*Ticket
+
 	closing bool
 }
 
@@ -205,58 +208,83 @@ func (s *URingScheduler) loop() {
 	c := coordinator{
 		sched:     s,
 		ring:      s.ring,
-		inflight:  make([]inflightEntry, s.depth),
-		freeSlots: make([]int, s.depth),
+		inflight:  make([]inflightEntry, s.RingDepth),
+		freeSlots: make([]int, s.RingDepth),
 	}
-	if s.vfiles > 0 {
-		c.parkedOps = make([]*Ticket, s.vfiles)
+	if s.VFiles > 0 {
+		c.parkedOps = make([]*Ticket, s.VFiles)
 	}
-	for i := range s.depth {
+	c.coalesce = make([]*Ticket, 0, s.RingDepth)
+	for i := range s.RingDepth {
 		c.freeSlots[i] = int(i)
 	}
 
+	// serve runs the steady state; shutdownPending settles everything the
+	// coordinator still owns once it stops. Close is handled only here.
+	batch, err := c.serve(!s.DisableCoalescing)
+	c.shutdownPending(batch, err)
+}
+
+// serve is the steady-state submit/reap loop. It returns when a close is
+// signaled (nil error) or the ring fails fatally (the error), along with the
+// batch it had collected but not yet placed. c.closing is checked only here.
+func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
+	s := c.sched
 	var batch *Ticket
 	for {
 		batch = c.collect(batch)
-		before := c.nInflight
 		if c.closing {
-			c.failTicketList(batch, s.shutdown.err)
-			batch = nil
-			c.failStaged(s.shutdown.err)
-			c.failParked(s.shutdown.err)
-		} else {
-			batch = c.fillSlots(batch)
+			return batch, nil
 		}
+		if coalesce {
+			batch = c.coalesceBatch(batch)
+		}
+		before := c.nInflight
+		batch = c.fillSlots(batch)
 		if placed := c.nInflight - before; placed > 0 {
 			s.stats.syscalls.Add(1)
 			s.stats.opsPlaced.Add(uint64(placed))
 		}
-
 		if c.nInflight == 0 {
-			if c.closing {
-				return
-			}
 			continue
 		}
-
 		if err := c.submit(); err != nil {
-			ringErr := fmt.Errorf("iosched: ring error: %w", err)
-			c.failAllInflight(ringErr)
-			s.stop(ringErr)
-			c.failTicketList(batch, ringErr)
-			c.failStaged(ringErr)
-			c.failParked(ringErr)
-			return
+			return batch, fmt.Errorf("iosched: ring error: %w", err)
 		}
 		if unparked := c.reap(); unparked != nil {
 			batch = c.filterRunnableAfter(unparked, batch)
 		}
+	}
+}
 
-		select {
-		case <-s.shutdown.stop:
-			c.closing = true
-		default:
+// shutdownPending settles everything still owned after serve returns. A fatal
+// ring error fails the in-flight SQEs (they can no longer complete); a graceful
+// close drains them, since the kernel still owns their buffers until the ring
+// exits. Either way, every not-yet-placed ticket is failed.
+func (c *coordinator) shutdownPending(batch *Ticket, err error) {
+	s := c.sched
+	if err != nil {
+		s.stop(err)
+		c.failAllInflight(err)
+	}
+	c.failTicketList(batch, s.shutdown.err)
+	c.failStaged(s.shutdown.err)
+	c.failParked(s.shutdown.err)
+	if err == nil {
+		c.drainInflight()
+	}
+}
+
+// drainInflight reaps the SQEs still in flight after a graceful close so the
+// kernel is done with their buffers before the ring exits. Parked tickets were
+// already failed, so reap unparks nothing here.
+func (c *coordinator) drainInflight() {
+	for c.nInflight > 0 {
+		if err := c.submit(); err != nil {
+			c.failAllInflight(fmt.Errorf("iosched: ring error draining on close: %w", err))
+			return
 		}
+		c.reap()
 	}
 }
 
@@ -345,8 +373,8 @@ func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
 		head = head.next
 		t.next = nil
 
-		if need := int(t.pending.Load()); need > int(c.sched.depth) {
-			c.failTicket(t, fmt.Errorf("iosched: linked chain length %d exceeds ring depth %d", need, c.sched.depth))
+		if need := int(t.pending.Load()); need > int(c.sched.RingDepth) {
+			c.failTicket(t, fmt.Errorf("iosched: linked chain length %d exceeds ring depth %d", need, c.sched.RingDepth))
 			continue
 		}
 
@@ -358,12 +386,12 @@ func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
 			if !op.isVirtual() {
 				continue
 			}
-			if c.sched.vfiles == 0 {
+			if c.sched.VFiles == 0 {
 				err = fmt.Errorf("iosched: virtual file ops require URingConfig.VFiles")
 				break
 			}
 			slot := op.vfd
-			if slot >= c.sched.vfiles {
+			if slot >= c.sched.VFiles {
 				err = fmt.Errorf("iosched: virtual file index %d outside configured table", slot)
 				break
 			}
@@ -407,6 +435,42 @@ func (c *coordinator) parkTicket(slot uint32, t *Ticket) {
 	c.parkedOps[slot] = appendTickets(c.parkedOps[slot], t)
 }
 
+// coalesceBatch rewrites the runnable batch, merging contiguous same-file plain
+// writes into single writev leaders (see coalesce.go). Non-coalescible ops pass
+// through unchanged. Merged followers leave the batch — the leader's completion
+// fans out to them — so this both shrinks SQE usage and preserves each caller's
+// ticket. Returns the batch to place.
+func (c *coordinator) coalesceBatch(head *Ticket) *Ticket {
+	cands := c.coalesce[:0]
+	var pass, passTail *Ticket
+	for head != nil {
+		t := head
+		head = head.next
+		t.next = nil
+		if (&t.Op).coalescibleWrite() {
+			cands = append(cands, t)
+			continue
+		}
+		if passTail == nil {
+			pass, passTail = t, t
+		} else {
+			passTail.next = t
+			passTail = t
+		}
+	}
+	for _, leader := range groupCoalescibleWrites(cands) {
+		leader.next = nil
+		if passTail == nil {
+			pass, passTail = leader, leader
+		} else {
+			passTail.next = leader
+			passTail = leader
+		}
+	}
+	c.coalesce = cands[:0] // retain the (possibly grown) backing for reuse
+	return pass
+}
+
 func (c *coordinator) fillSlots(head *Ticket) *Ticket {
 	for head != nil {
 		t := head
@@ -446,7 +510,7 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 		if err := buildutil.Assert(sqe != nil); err != nil {
 			err = fmt.Errorf(
 				"iosched: GetSQE returned nil; slot=%d nInflight=%d freeSlots=%d depth=%d: %w",
-				slot, c.nInflight, len(c.freeSlots)+1, c.sched.depth, err,
+				slot, c.nInflight, len(c.freeSlots)+1, c.sched.RingDepth, err,
 			)
 			c.freeSlots = append(c.freeSlots, slot)
 			c.failAllInflight(err)
@@ -585,6 +649,12 @@ func (c *coordinator) reap() *Ticket {
 		e := c.inflight[slot]
 		c.releaseSlot(slot)
 
+		if e.t.group != nil {
+			// Coalesced writev: one CQE completes the whole group of tickets.
+			completeCoalescedWrite(e.t, cqe.Res)
+			return
+		}
+
 		if cqe.Res < 0 {
 			e.op.Result.Err = syscall.Errno(-cqe.Res)
 		} else {
@@ -610,7 +680,7 @@ func (c *coordinator) reap() *Ticket {
 }
 
 func (c *coordinator) completeVOp(op *Op) *Ticket {
-	if !op.isVBarrier() || c.sched.vfiles == 0 {
+	if !op.isVBarrier() || c.sched.VFiles == 0 {
 		return nil
 	}
 
@@ -653,10 +723,14 @@ func (c *coordinator) failAllInflight(err error) {
 		if !e.valid {
 			continue
 		}
+		c.releaseSlot(i)
+		if e.t.group != nil {
+			failCoalescedWrite(e.t, err)
+			continue
+		}
 		if e.op.Result.Err == nil {
 			e.op.Result.Err = err
 		}
-		c.releaseSlot(i)
 		completeTicket(e.t)
 	}
 }
@@ -684,6 +758,11 @@ func (c *coordinator) failParked(err error) {
 func (c *coordinator) failTicket(t *Ticket, err error) {
 	// failTicket is for tickets not represented by inflight entries. Inflight
 	// SQEs complete through reap or failAllInflight one SQE at a time.
+	if t.group != nil {
+		// Coalesced writev leader: fan the failure out to the whole group.
+		failCoalescedWrite(t, err)
+		return
+	}
 	for op := &t.Op; op != nil; op = op.linked {
 		if op.Result.Err == nil {
 			op.Result.Err = err
