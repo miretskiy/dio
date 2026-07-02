@@ -86,7 +86,9 @@ func groupCoalescibleWrites(cands []*Ticket) []*Ticket {
 // its own byte count is still len(Op.buf) at completion.
 func coalesceRun(run []*Ticket) {
 	leader := run[0]
-	iovecs := make([]syscall.Iovec, 0, len(run))
+	// Back the iovecs inline on the leader when the run fits (no heap alloc); the
+	// leader Op is stable in its ticket, so iovecs may alias leader.Op.iovecsBuf.
+	iovecs := leader.Op.iovecsBacking(len(run))
 	for _, m := range run {
 		b := m.Op.buf
 		if len(b) == 0 {
@@ -109,44 +111,77 @@ func coalesceRun(run []*Ticket) {
 	}
 }
 
-// completeCoalescedWrite fans a coalesced writev's single completion out to the
-// leader and its followers. On full success each member's Result.N is its own
-// buffer length; on a short write or error every member fails — retriable, since
-// positioned writes are idempotent, so the caller simply re-issues the write.
-func completeCoalescedWrite(leader *Ticket, res int32) {
-	if res < 0 {
-		failCoalescedWrite(leader, syscall.Errno(-res))
-		return
+// completeCoalescedGroup fans a finished coalesced leader's result out to its
+// followers. reap calls it once the leader's whole chain has completed — the
+// writev, plus a linked fdatasync when the slot is durable — having recorded
+// each op's CQE result and driven leader.pending to zero. A write error, a
+// durability (fdatasync) error, or a short write fails the whole group; all are
+// retriable, since positioned writes are idempotent, so the caller re-issues.
+func completeCoalescedGroup(leader *Ticket) {
+	written := leader.Op.Result.N // total bytes the writev reported
+	err := leader.Op.Result.Err
+	if err == nil && leader.Op.linked != nil {
+		err = leader.Op.linked.Result.Err // the linked fdatasync's result
 	}
-	total := len(leader.Op.buf)
+	// Distribute the written bytes across members in writev order — leader first,
+	// then followers by ascending offset. A fully covered member succeeds; the
+	// boundary member gets its partial count and io.ErrShortWrite; members past
+	// the end get zero and io.ErrShortWrite. A hard write or fdatasync error gives
+	// every member zero and that error. Positioned writes are idempotent, so a
+	// short or failed member is safely retriable.
+	remaining := written
+	distributeWrite(&leader.Op, &remaining, err)
 	for m := leader.group; m != nil; m = m.next {
-		total += len(m.Op.buf)
-	}
-	if int(res) < total {
-		failCoalescedWrite(leader, io.ErrShortWrite)
-		return
+		distributeWrite(&m.Op, &remaining, err)
 	}
 	// Complete followers first, capturing next before each completion (the owner
-	// may Release the ticket as soon as it is woken); complete the leader last so
-	// its group chain stays intact throughout.
+	// may Release the ticket the moment it is woken); leader last so the group
+	// chain stays intact throughout.
 	for m := leader.group; m != nil; {
 		next := m.next
-		m.Op.Result.N = len(m.Op.buf)
 		completeTicket(m)
 		m = next
 	}
-	leader.Op.Result.N = len(leader.Op.buf)
-	completeTicket(leader)
+	leader.wg.Done() // leader.pending already reached zero in reap
 }
 
-// failCoalescedWrite completes the whole group with err (leader last).
+// distributeWrite records how much of op.buf the coalesced writev covered and
+// advances remaining. A hard error zeroes N and records err; otherwise the op
+// gets min(remaining, len) bytes, and a short count records io.ErrShortWrite.
+func distributeWrite(op *Op, remaining *int, err error) {
+	if err != nil {
+		op.Result.N = 0
+		op.Result.Err = err
+		return
+	}
+	n := min(len(op.buf), *remaining)
+	*remaining -= n
+	op.Result.N = n
+	if n < len(op.buf) {
+		op.Result.Err = io.ErrShortWrite
+	}
+}
+
+// failCoalescedWrite fails a whole coalesced group with err. It is used by the
+// shutdown/error paths, where the leader may be un-placed or have SQEs still in
+// flight, so it forces each ticket's pending to zero in one step — making it
+// idempotent, since failAllInflight can reach a multi-SQE leader once per SQE.
+// The leader is done last so the group chain stays intact.
 func failCoalescedWrite(leader *Ticket, err error) {
 	for m := leader.group; m != nil; {
 		next := m.next
-		m.Op.Result.Err = err
-		completeTicket(m)
+		if m.Op.Result.Err == nil {
+			m.Op.Result.Err = err
+		}
+		if n := m.pending.Swap(0); n > 0 {
+			m.wg.Done()
+		}
 		m = next
 	}
-	leader.Op.Result.Err = err
-	completeTicket(leader)
+	if leader.Op.Result.Err == nil {
+		leader.Op.Result.Err = err
+	}
+	if n := leader.pending.Swap(0); n > 0 {
+		leader.wg.Done()
+	}
 }

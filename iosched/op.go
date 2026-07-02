@@ -54,7 +54,7 @@ type Op struct {
 	mode     uint32
 	buf      []byte
 	bufs     [][]byte        // vectored buffers (readv/writev)
-	iovecs   []syscall.Iovec // kernel iovec array built from bufs; pinned by the Op
+	iovecs   []syscall.Iovec // kernel iovec array (from bufs, or a coalesced run); pinned by the Op
 	offset   int64
 	length   int64 // byte count for ops without a buffer (fallocate)
 	opFlags  uint32
@@ -62,16 +62,30 @@ type Op struct {
 	Result struct {
 		N   int
 		Err error
+		// seq is the completion order — the coordinator's reap counter when this
+		// op's CQE was processed. Unexported and not part of the public result; it
+		// lets tests confirm linked ordering (e.g. a write completes before its
+		// linked fdatasync).
+		seq uint64
 	}
 
 	// The exception path for linked SQEs.
 	linked *Op
+
+	// iovecsBuf backs iovecs inline — no heap allocation — for vectored ops with
+	// up to 16 buffers, including coalesced write runs; longer runs fall back to a
+	// heap slice. It amortizes the allocation, not always avoids it. iovecs may
+	// point into it, so an Op must be stable (addressed via *Op, e.g. inside a
+	// ticket) before iovecs is built; see buildIovecs and coalesceRun.
+	iovecsBuf [16]syscall.Iovec
 }
 
-// Result is the public shape of Op.Result.
+// Result is the public shape of Op.Result. It carries an unexported
+// completion-order field used only by tests; callers see N and Err.
 type Result = struct {
 	N   int
 	Err error
+	seq uint64
 }
 
 // SQE linking flag bits stored in Op.sqeFlags.
@@ -113,40 +127,55 @@ func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
 // consecutive file offsets starting at offset (preadv semantics). Result.N is
 // the total bytes read across all buffers.
 func ReadvOp(f *os.File, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpReadv, f: f, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+	return Op{opcode: OpReadv, f: f, bufs: bufs, offset: offset}
 }
 
 // WritevOp constructs a vectored positioned write: bufs are written to
 // consecutive file offsets starting at offset (pwritev semantics). Result.N is
 // the total bytes written across all buffers.
 func WritevOp(f *os.File, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpWritev, f: f, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+	return Op{opcode: OpWritev, f: f, bufs: bufs, offset: offset}
 }
 
 // VReadvOp constructs a vectored positioned read against an io_uring virtual
 // descriptor.
 func VReadvOp(vfd uint32, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpReadv | opVirtual, vfd: vfd, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+	return Op{opcode: OpReadv | opVirtual, vfd: vfd, bufs: bufs, offset: offset}
 }
 
 // VWritevOp constructs a vectored positioned write against an io_uring virtual
 // descriptor.
 func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, iovecs: makeIovecs(bufs), offset: offset}
+	return Op{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, offset: offset}
 }
 
-// makeIovecs builds a kernel iovec array from bufs, skipping empty buffers. The
-// iovec bases point into the caller's buffers; the Op retains bufs so the GC
-// keeps those backing arrays alive until the kernel completes the SQE.
-func makeIovecs(bufs [][]byte) []syscall.Iovec {
-	iovs := make([]syscall.Iovec, 0, len(bufs))
+// buildIovecs fills o.iovecs from o.bufs (skipping empty buffers), backed by the
+// inline iovecsBuf when the vector count fits and a fresh slice otherwise. The
+// iovec bases point into o.bufs, which o retains so the backing arrays stay alive
+// until the kernel completes the SQE. o must be stable (addressed via *Op) since
+// iovecs may alias o.iovecsBuf, so this is called at placement, not construction.
+func (o *Op) buildIovecs() {
+	o.iovecs = appendIovecs(o.iovecsBacking(len(o.bufs)), o.bufs)
+}
+
+// iovecsBacking returns an empty slice with capacity for n iovecs, backed by the
+// inline iovecsBuf when n fits, else a fresh allocation.
+func (o *Op) iovecsBacking(n int) []syscall.Iovec {
+	if n <= len(o.iovecsBuf) {
+		return o.iovecsBuf[:0]
+	}
+	return make([]syscall.Iovec, 0, n)
+}
+
+// appendIovecs appends an iovec for each non-empty buffer to dst.
+func appendIovecs(dst []syscall.Iovec, bufs [][]byte) []syscall.Iovec {
 	for _, b := range bufs {
 		if len(b) == 0 {
 			continue
 		}
-		iovs = append(iovs, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
+		dst = append(dst, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
 	}
-	return iovs
+	return dst
 }
 
 // OpenatOp constructs a plain openat operation that opens path and returns the
@@ -281,6 +310,21 @@ type Ticket struct {
 	// The embedded operation.
 	Op Op
 
+	// pending is the ticket's single counter, used for three things in order:
+	//
+	//  1. At submit it holds the op count — how many SQEs the ticket will place —
+	//     so the coordinator reserves that many ring slots before placing any
+	//     (see filterRunnableAfter, fillSlots).
+	//  2. As each linked op's CQE is reaped it is decremented. io_uring posts one
+	//     CQE per linked SQE, including canceled ones after an error, so the count
+	//     is exact; reaching zero means every op finished and the ticket is done.
+	//  3. Release reads zero to know the coordinator is finished with the ticket
+	//     and it is safe to return to the pool.
+	//
+	// wg is not a second counter: it is the blocking-wait latch, set once (Add(1)
+	// at submit, Done() when pending hits zero). The count lives in an atomic so
+	// Release can read it without blocking; the wait lives in a WaitGroup so a
+	// ticket can be pool-reused without a per-Submit allocation.
 	wg       sync.WaitGroup
 	pending  atomic.Int32
 	released atomic.Bool

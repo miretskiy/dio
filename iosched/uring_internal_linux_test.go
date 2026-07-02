@@ -70,8 +70,8 @@ func TestCoordinatorFilterParksVUseBehindOpeningSlot(t *testing.T) {
 	c.parkedOps[7] = &barrierOp
 
 	ticket := getTicket(VWriteOp(7, []byte("x"), 0), 1)
-	runnable := c.filterRunnable(ticket)
-	if runnable != nil {
+	runnable := c.filterRunnable(nil, ticket)
+	if len(runnable) != 0 {
 		t.Fatalf("filter returned runnable ticket behind opening slot")
 	}
 	if c.parkedOps[7] != ticket {
@@ -86,9 +86,9 @@ func TestCoordinatorFilterParksBehindRunnableVOpenBarrier(t *testing.T) {
 	write := getTicket(VWriteOp(fd, []byte("x"), 0), 1)
 	open.next = write
 
-	runnable := c.filterRunnable(open)
-	if runnable != open || runnable.next != nil {
-		t.Fatalf("runnable list: got %p next=%p, want only open %p", runnable, runnable.next, open)
+	runnable := c.filterRunnable(nil, open)
+	if len(runnable) != 1 || runnable[0] != open {
+		t.Fatalf("runnable: got %v, want only open %p", runnable, open)
 	}
 	if c.parkedOps[7] != write {
 		t.Fatalf("parked write: got %p want %p", c.parkedOps[7], write)

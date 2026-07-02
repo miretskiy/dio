@@ -101,13 +101,15 @@ func TestCoalescibleWrite(t *testing.T) {
 	}
 }
 
-func TestCompleteCoalescedWrite(t *testing.T) {
+func TestCompleteCoalescedGroup(t *testing.T) {
 	fa := os.NewFile(100, "a")
-	// leader(4) + follower(6); leader keeps its own buf for its length.
+	// leader(4) + follower(6); leader keeps its own buf for its length. reap
+	// records each op's result and drives leader.pending to zero before calling
+	// completeCoalescedGroup, so the fixtures start the leader at pending zero.
 	newLeader := func() (*Ticket, *Ticket) {
 		leader := &Ticket{Op: WriteOp(fa, make([]byte, 4), 0)}
 		follower := &Ticket{Op: WriteOp(fa, make([]byte, 6), 4)}
-		leader.pending.Store(1)
+		leader.pending.Store(0)
 		leader.wg.Add(1)
 		follower.pending.Store(1)
 		follower.wg.Add(1)
@@ -118,7 +120,8 @@ func TestCompleteCoalescedWrite(t *testing.T) {
 
 	t.Run("full success splits by buffer length", func(t *testing.T) {
 		leader, follower := newLeader()
-		completeCoalescedWrite(leader, 10)
+		leader.Op.Result.N = 10 // writev wrote all 10 bytes
+		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
 		require.NoError(t, leader.Op.Result.Err)
@@ -127,21 +130,101 @@ func TestCompleteCoalescedWrite(t *testing.T) {
 		require.Equal(t, 6, follower.Op.Result.N)
 	})
 
-	t.Run("short write fails all, retriable", func(t *testing.T) {
+	t.Run("short write: leader fully covered, boundary member short", func(t *testing.T) {
 		leader, follower := newLeader()
-		completeCoalescedWrite(leader, 8) // < 10
+		leader.Op.Result.N = 8 // writev wrote 8 of 10; leader(4) full, follower gets 4 of 6
+		completeCoalescedGroup(leader)
+		leader.Wait()
+		follower.Wait()
+		require.NoError(t, leader.Op.Result.Err)
+		require.Equal(t, 4, leader.Op.Result.N)
+		require.ErrorIs(t, follower.Op.Result.Err, io.ErrShortWrite)
+		require.Equal(t, 4, follower.Op.Result.N)
+	})
+
+	t.Run("short write within leader zeroes followers", func(t *testing.T) {
+		leader, follower := newLeader()
+		leader.Op.Result.N = 3 // < leader's 4: leader partial (3), follower 0
+		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
 		require.ErrorIs(t, leader.Op.Result.Err, io.ErrShortWrite)
+		require.Equal(t, 3, leader.Op.Result.N)
 		require.ErrorIs(t, follower.Op.Result.Err, io.ErrShortWrite)
+		require.Equal(t, 0, follower.Op.Result.N)
 	})
 
-	t.Run("error fails all with errno", func(t *testing.T) {
+	t.Run("write error zeroes all with errno", func(t *testing.T) {
 		leader, follower := newLeader()
-		completeCoalescedWrite(leader, -int32(syscall.EIO))
+		leader.Op.Result.Err = syscall.EIO
+		completeCoalescedGroup(leader)
+		leader.Wait()
+		follower.Wait()
+		require.ErrorIs(t, leader.Op.Result.Err, syscall.EIO)
+		require.Equal(t, 0, leader.Op.Result.N)
+		require.ErrorIs(t, follower.Op.Result.Err, syscall.EIO)
+		require.Equal(t, 0, follower.Op.Result.N)
+	})
+
+	t.Run("fdatasync error fails all", func(t *testing.T) {
+		leader, follower := newLeader()
+		leader.Op.Result.N = 10 // writev succeeded
+		sync := VFdatasyncOp(0)
+		sync.Result.Err = syscall.EIO // durability failed
+		leader.Op.linked = &sync
+		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
 		require.ErrorIs(t, leader.Op.Result.Err, syscall.EIO)
 		require.ErrorIs(t, follower.Op.Result.Err, syscall.EIO)
 	})
+}
+
+func TestOpBuildIovecs(t *testing.T) {
+	// <= 8 buffers: backed by the inline iovecsBuf (cap == 8), no heap alloc.
+	small := WritevOp(nil, [][]byte{make([]byte, 4), make([]byte, 6)}, 0)
+	small.buildIovecs()
+	require.Len(t, small.iovecs, 2)
+	require.Equal(t, cap(small.iovecsBuf), cap(small.iovecs), "small run should use the inline buffer")
+	require.Equal(t, uint64(4), small.iovecs[0].Len)
+	require.Equal(t, uint64(6), small.iovecs[1].Len)
+
+	// empty buffers are skipped.
+	skip := WritevOp(nil, [][]byte{make([]byte, 4), nil, make([]byte, 2)}, 0)
+	skip.buildIovecs()
+	require.Len(t, skip.iovecs, 2)
+
+	// > 16 buffers: falls back to a heap slice (cap != inline).
+	bufs := make([][]byte, 17)
+	for i := range bufs {
+		bufs[i] = make([]byte, 1)
+	}
+	big := WritevOp(nil, bufs, 0)
+	big.buildIovecs()
+	require.Len(t, big.iovecs, 17)
+	require.NotEqual(t, cap(big.iovecsBuf), cap(big.iovecs), "large run should not use the inline buffer")
+}
+
+func TestFailCoalescedWrite(t *testing.T) {
+	fa := os.NewFile(100, "a")
+	leader := &Ticket{Op: WriteOp(fa, make([]byte, 4), 0)}
+	follower := &Ticket{Op: WriteOp(fa, make([]byte, 6), 4)}
+	leader.pending.Store(2) // writev + linked fdatasync
+	leader.wg.Add(1)
+	follower.pending.Store(1)
+	follower.wg.Add(1)
+	leader.Op.opcode = OpWritev
+	leader.group = follower
+
+	// Idempotent: failAllInflight can reach a multi-SQE leader once per SQE, so a
+	// second call must be a no-op, not a double wg.Done.
+	failCoalescedWrite(leader, syscall.EIO)
+	failCoalescedWrite(leader, syscall.EIO)
+
+	leader.Wait()
+	follower.Wait()
+	require.ErrorIs(t, leader.Op.Result.Err, syscall.EIO)
+	require.ErrorIs(t, follower.Op.Result.Err, syscall.EIO)
+	require.Equal(t, int32(0), leader.pending.Load())
+	require.Equal(t, int32(0), follower.pending.Load())
 }

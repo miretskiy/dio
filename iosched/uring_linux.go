@@ -193,8 +193,23 @@ type coordinator struct {
 
 	parkedOps []*Ticket
 
+	// syncMode[slot] is the durability of each virtual slot, from its open flags;
+	// syncSlots counts the durable ones so linkDurableSyncs is skipped when none.
+	syncMode  []syncMode
+	syncSlots int
+
+	// reapSeq is a monotonic completion counter stamped onto each op's result as
+	// its CQE is reaped, recording completion order (used by tests).
+	reapSeq uint64
+
 	// coalesce is reused each batch to gather write-coalescing candidates.
 	coalesce []*Ticket
+
+	// batchBuf backs the coordinator's working batch — the drained staging stack
+	// reversed into FIFO order, plus carried-over and unparked tickets — as a
+	// contiguous slice, so the pipeline iterates cache-friendly memory rather than
+	// chasing the intrusive next pointers.
+	batchBuf []*Ticket
 }
 
 var barrierOp Ticket
@@ -211,26 +226,29 @@ func (s *URingScheduler) loop() {
 	}
 	if s.VFiles > 0 {
 		c.parkedOps = make([]*Ticket, s.VFiles)
+		c.syncMode = make([]syncMode, s.VFiles)
 	}
 	c.coalesce = make([]*Ticket, 0, s.RingDepth)
+	c.batchBuf = make([]*Ticket, 0, 64)
 	for i := range s.RingDepth {
 		c.freeSlots[i] = int(i)
 	}
 
 	// serve runs the steady state; shutdownPending settles everything the
 	// coordinator still owns once it stops. Close is handled only here.
-	batch, err := c.serve(!s.DisableCoalescing)
-	c.shutdownPending(batch, err)
+	carry, err := c.serve(!s.DisableCoalescing)
+	c.shutdownPending(carry, err)
 }
 
 // serve is the steady-state submit/reap loop. It returns when a close is
 // signaled (nil error) or the ring fails fatally (the error), along with the
-// batch it had collected but not yet placed.
-func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
+// tickets it had collected but not yet placed. carry holds the unplaced
+// remainder (plus tickets unparked by reap) across iterations.
+func (c *coordinator) serve(coalesce bool) ([]*Ticket, error) {
 	s := c.sched
-	var batch *Ticket
+	var carry []*Ticket
 	for {
-		batch = c.collect(batch)
+		batch := c.collect(carry)
 		select {
 		case <-s.shutdown.stop:
 			return batch, nil
@@ -239,8 +257,11 @@ func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
 		if coalesce {
 			batch = c.coalesceBatch(batch)
 		}
+		if c.syncSlots > 0 {
+			batch = c.linkDurableSyncs(batch)
+		}
 		before := c.nInflight
-		batch = c.fillSlots(batch)
+		carry = c.fillSlots(batch)
 		if placed := c.nInflight - before; placed > 0 {
 			s.stats.syscalls.Add(1)
 			s.stats.opsPlaced.Add(uint64(placed))
@@ -249,10 +270,10 @@ func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
 			continue
 		}
 		if err := c.submit(); err != nil {
-			return batch, fmt.Errorf("iosched: ring error: %w", err)
+			return carry, fmt.Errorf("iosched: ring error: %w", err)
 		}
 		if unparked := c.reap(); unparked != nil {
-			batch = c.filterRunnableAfter(unparked, batch)
+			carry = c.filterRunnable(carry, unparked)
 		}
 	}
 }
@@ -266,12 +287,12 @@ func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
 //
 // (1) and (2) never started, so fail them. (3) the kernel owns: on a clean close
 // reap it to completion; on a ring error it can't complete, so fail it too.
-func (c *coordinator) shutdownPending(batch *Ticket, err error) {
+func (c *coordinator) shutdownPending(batch []*Ticket, err error) {
 	s := c.sched
 	if err != nil {
 		s.stop(err) // record the ring error for the tickets failed below
 	}
-	c.failTicketList(batch, s.shutdown.err)
+	c.failTicketSlice(batch, s.shutdown.err)
 	c.failStaged(s.shutdown.err)
 	c.failParked(s.shutdown.err)
 	if err != nil {
@@ -294,14 +315,21 @@ func (c *coordinator) drainInflight() {
 	}
 }
 
-func (c *coordinator) collect(batch *Ticket) *Ticket {
+func (c *coordinator) collect(carry []*Ticket) []*Ticket {
 	s := c.sched
-	if batch != nil {
-		return c.filterRunnableAfter(reverseTickets(s.stagingHead.Swap(nil)), batch)
+	// Compact the carried-over tickets to the front of the reusable buffer, then
+	// append newly staged (and, when idle, awaited) tickets after them.
+	c.batchBuf = append(c.batchBuf[:0], carry...)
+
+	if len(c.batchBuf) > 0 {
+		// Already have work: drain any newly staged tickets without blocking.
+		c.batchBuf = c.filterRunnable(c.batchBuf, reverseTickets(s.stagingHead.Swap(nil)))
+		return c.batchBuf
 	}
 
 	if staged := s.stagingHead.Swap(nil); staged != nil {
-		return c.filterRunnableAfter(reverseTickets(staged), nil)
+		c.batchBuf = c.filterRunnable(c.batchBuf, reverseTickets(staged))
+		return c.batchBuf
 	}
 
 	// No work: wait for the doorbell, or wake on close. When ops are in flight we
@@ -318,7 +346,8 @@ func (c *coordinator) collect(batch *Ticket) *Ticket {
 		}
 	}
 
-	return c.filterRunnableAfter(reverseTickets(s.stagingHead.Swap(nil)), nil)
+	c.batchBuf = c.filterRunnable(c.batchBuf, reverseTickets(s.stagingHead.Swap(nil)))
+	return c.batchBuf
 }
 
 func reverseTickets(head *Ticket) *Ticket {
@@ -347,19 +376,12 @@ func appendTickets(head, tail *Ticket) *Ticket {
 	}
 }
 
-func (c *coordinator) filterRunnable(head *Ticket) *Ticket {
-	return c.filterRunnableAfter(head, nil)
-}
-
-func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
-	var tail *Ticket
-	if runnable != nil {
-		tail = runnable
-		for tail.next != nil {
-			tail = tail.next
-		}
-	}
-
+// filterRunnable appends the runnable tickets from the linked list head (drained
+// staging, or reap's unparked list) onto batch, returning the extended slice. A
+// ticket whose chain is too long or names a bad slot is failed; one behind an
+// in-flight barrier is parked; a barrier in a runnable ticket marks its slot so
+// later ops on it park.
+func (c *coordinator) filterRunnable(batch []*Ticket, head *Ticket) []*Ticket {
 	for head != nil {
 		t := head
 		head = head.next
@@ -409,14 +431,17 @@ func (c *coordinator) filterRunnableAfter(head, runnable *Ticket) *Ticket {
 			}
 		}
 
-		if runnable == nil {
-			runnable = t
-		} else {
-			tail.next = t
-		}
-		tail = t
+		batch = append(batch, t)
 	}
-	return runnable
+	return batch
+}
+
+// failTicketSlice fails every ticket in batch (used for the unplaced remainder
+// at shutdown; the linked staging and parked lists use failTicketList).
+func (c *coordinator) failTicketSlice(batch []*Ticket, err error) {
+	for _, t := range batch {
+		c.failTicket(t, err)
+	}
 }
 
 func (c *coordinator) parkTicket(slot uint32, t *Ticket) {
@@ -427,54 +452,36 @@ func (c *coordinator) parkTicket(slot uint32, t *Ticket) {
 	c.parkedOps[slot] = appendTickets(c.parkedOps[slot], t)
 }
 
-// coalesceBatch rewrites the runnable batch, merging contiguous same-file plain
-// writes into single writev leaders (see coalesce.go). Non-coalescible ops pass
-// through unchanged. Merged followers leave the batch — the leader's completion
-// fans out to them — so this both shrinks SQE usage and preserves each caller's
-// ticket. Returns the batch to place.
-func (c *coordinator) coalesceBatch(head *Ticket) *Ticket {
+// coalesceBatch rewrites the runnable batch in place, merging contiguous
+// same-file plain writes into single writev leaders (see coalesce.go).
+// Non-coalescible ops pass through unchanged. Merged followers leave the batch —
+// the leader's completion fans out to them — so this both shrinks SQE usage and
+// preserves each caller's ticket. It reuses c.coalesce to gather candidates and
+// the batch's own backing for the result, and returns the batch to place.
+func (c *coordinator) coalesceBatch(batch []*Ticket) []*Ticket {
 	cands := c.coalesce[:0]
-	var pass, passTail *Ticket
-	for head != nil {
-		t := head
-		head = head.next
-		t.next = nil
+	pass := batch[:0] // reuse the batch backing; pass is always a prefix of it
+	for _, t := range batch {
 		if (&t.Op).coalescibleWrite() {
 			cands = append(cands, t)
-			continue
-		}
-		if passTail == nil {
-			pass, passTail = t, t
 		} else {
-			passTail.next = t
-			passTail = t
+			pass = append(pass, t)
 		}
 	}
-	for _, leader := range groupCoalescibleWrites(cands) {
-		leader.next = nil
-		if passTail == nil {
-			pass, passTail = leader, leader
-		} else {
-			passTail.next = leader
-			passTail = leader
-		}
-	}
-	c.coalesce = cands[:0] // retain the (possibly grown) backing for reuse
+	pass = append(pass, groupCoalescibleWrites(cands)...) // leaders + singletons
+	c.coalesce = cands[:0]                                // retain the (grown) backing
 	return pass
 }
 
-func (c *coordinator) fillSlots(head *Ticket) *Ticket {
-	for head != nil {
-		t := head
+func (c *coordinator) fillSlots(batch []*Ticket) []*Ticket {
+	for i, t := range batch {
 		need := int(t.pending.Load())
 		if need > len(c.freeSlots) {
-			return head
+			return batch[i:] // ring is full; carry the rest to the next iteration
 		}
-		head = t.next
-		t.next = nil
 		c.placeTicket(t, need)
 	}
-	return nil
+	return batch[:0]
 }
 
 func (c *coordinator) failTicketList(t *Ticket, err error) {
@@ -558,8 +565,14 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 	case OpWriteFixed:
 		sqe.PrepareWriteFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
 	case OpReadv:
+		if op.iovecs == nil { // user vectored op; coalesced runs are prebuilt
+			op.buildIovecs()
+		}
 		sqe.PrepareReadv(fd, iovecsPtr(op.iovecs), uint32(len(op.iovecs)), uint64(op.offset))
 	case OpWritev:
+		if op.iovecs == nil {
+			op.buildIovecs()
+		}
 		sqe.PrepareWritev(fd, iovecsPtr(op.iovecs), uint32(len(op.iovecs)), uint64(op.offset))
 	case OpFsync:
 		sqe.PrepareFsync(fd, 0)
@@ -574,7 +587,10 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 		// form returns a regular fd in the completion result.
 		sqeFlags &^= uint32(giouring.SqeFixedFile)
 		if op.isVirtual() {
-			sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, uint32(fd))
+			// Strip O_SYNC/O_DSYNC: durability for a slot is emulated with a linked
+			// sync per coalesced run (linkDurableSyncs), not per write by the kernel.
+			// completeVOp records the slot's mode from the original op.openFlag.
+			sqe.PrepareOpenatDirect(op.dfd, op.path, stripSyncFlags(op.openFlag), op.mode, uint32(fd))
 		} else {
 			sqe.PrepareOpenat(op.dfd, op.path, op.openFlag, op.mode)
 		}
@@ -639,17 +655,24 @@ func (c *coordinator) reap() *Ticket {
 		e := c.inflight[slot]
 		c.releaseSlot(slot)
 
-		if e.t.group != nil {
-			// Coalesced writev: one CQE completes the whole group of tickets.
-			completeCoalescedWrite(e.t, cqe.Res)
-			return
-		}
-
+		c.reapSeq++
+		e.op.Result.seq = c.reapSeq
 		if cqe.Res < 0 {
 			e.op.Result.Err = syscall.Errno(-cqe.Res)
 		} else {
 			e.op.Result.N = int(cqe.Res)
 		}
+
+		if e.t.group != nil {
+			// Coalesced leader. Its chain is the writev, plus a linked fdatasync
+			// when the slot is durable, so it can span more than one CQE; fan out
+			// to the group only once the whole chain is done (pending hits zero).
+			if e.t.pending.Add(-1) == 0 {
+				completeCoalescedGroup(e.t)
+			}
+			return
+		}
+
 		if unparked := c.completeVOp(e.op); unparked != nil {
 			if ready == nil {
 				ready = unparked
@@ -678,6 +701,7 @@ func (c *coordinator) completeVOp(op *Op) *Ticket {
 	parked := c.takeParked(index)
 
 	if op.base() == OpClose {
+		c.noteSyncMode(index, syncNone) // slot freed
 		c.failTicketList(parked, syscall.EBADF)
 		return nil
 	}
@@ -687,6 +711,7 @@ func (c *coordinator) completeVOp(op *Op) *Ticket {
 		return nil
 	}
 
+	c.noteSyncMode(index, openatSyncMode(op.openFlag)) // open succeeded
 	return parked
 }
 
