@@ -195,8 +195,6 @@ type coordinator struct {
 
 	// coalesce is reused each batch to gather write-coalescing candidates.
 	coalesce []*Ticket
-
-	closing bool
 }
 
 var barrierOp Ticket
@@ -227,14 +225,16 @@ func (s *URingScheduler) loop() {
 
 // serve is the steady-state submit/reap loop. It returns when a close is
 // signaled (nil error) or the ring fails fatally (the error), along with the
-// batch it had collected but not yet placed. c.closing is checked only here.
+// batch it had collected but not yet placed.
 func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
 	s := c.sched
 	var batch *Ticket
 	for {
 		batch = c.collect(batch)
-		if c.closing {
+		select {
+		case <-s.shutdown.stop:
 			return batch, nil
+		default:
 		}
 		if coalesce {
 			batch = c.coalesceBatch(batch)
@@ -257,20 +257,26 @@ func (c *coordinator) serve(coalesce bool) (*Ticket, error) {
 	}
 }
 
-// shutdownPending settles everything still owned after serve returns. A fatal
-// ring error fails the in-flight SQEs (they can no longer complete); a graceful
-// close drains them, since the kernel still owns their buffers until the ring
-// exits. Either way, every not-yet-placed ticket is failed.
+// shutdownPending completes every ticket the coordinator still owns once serve
+// returns, so no caller waits forever. Three kinds can remain:
+//
+//  1. staged — an add that raced the close, or slipped in as the ring failed;
+//  2. collected but not yet placed (batch), or parked behind a barrier;
+//  3. in flight — already handed to the kernel.
+//
+// (1) and (2) never started, so fail them. (3) the kernel owns: on a clean close
+// reap it to completion; on a ring error it can't complete, so fail it too.
 func (c *coordinator) shutdownPending(batch *Ticket, err error) {
 	s := c.sched
 	if err != nil {
-		s.stop(err)
-		c.failAllInflight(err)
+		s.stop(err) // record the ring error for the tickets failed below
 	}
 	c.failTicketList(batch, s.shutdown.err)
 	c.failStaged(s.shutdown.err)
 	c.failParked(s.shutdown.err)
-	if err == nil {
+	if err != nil {
+		c.failAllInflight(err)
+	} else {
 		c.drainInflight()
 	}
 }
@@ -289,39 +295,25 @@ func (c *coordinator) drainInflight() {
 }
 
 func (c *coordinator) collect(batch *Ticket) *Ticket {
-	runnable := batch
-
 	s := c.sched
-	if runnable != nil {
-		select {
-		case <-s.shutdown.stop:
-			c.closing = true
-		default:
-		}
-		return c.filterRunnableAfter(reverseTickets(s.stagingHead.Swap(nil)), runnable)
+	if batch != nil {
+		return c.filterRunnableAfter(reverseTickets(s.stagingHead.Swap(nil)), batch)
 	}
 
-	staged := s.stagingHead.Swap(nil)
-	if staged != nil {
-		select {
-		case <-s.shutdown.stop:
-			c.closing = true
-		default:
-		}
+	if staged := s.stagingHead.Swap(nil); staged != nil {
 		return c.filterRunnableAfter(reverseTickets(staged), nil)
 	}
 
+	// No work: wait for the doorbell, or wake on close. When ops are in flight we
+	// must not block — we still need to reap them — so only poll the doorbell.
 	if c.nInflight == 0 {
 		select {
 		case <-s.wakeup:
 		case <-s.shutdown.stop:
-			c.closing = true
 		}
 	} else {
 		select {
 		case <-s.wakeup:
-		case <-s.shutdown.stop:
-			c.closing = true
 		default:
 		}
 	}
@@ -499,7 +491,6 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 		err := fmt.Errorf("iosched: insufficient free SQE slots; need=%d free=%d", need, len(c.freeSlots))
 		c.failTicket(t, err)
 		c.sched.stop(err)
-		c.closing = true
 		return
 	}
 	for op := &t.Op; op != nil; op = op.linked {
@@ -516,7 +507,6 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 			c.failAllInflight(err)
 			c.failTicket(t, err)
 			c.sched.stop(err)
-			c.closing = true
 			return
 		}
 

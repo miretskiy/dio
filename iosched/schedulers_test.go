@@ -2,6 +2,7 @@ package iosched_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -44,4 +45,44 @@ func runOp(t *testing.T, s iosched.Scheduler, op iosched.Op) iosched.Result {
 	ticket.Wait()
 	require.NoError(t, ticket.Error())
 	return ticket.Op.Result
+}
+
+// TestSchedulerCloseCompletesPending is the shutdown contract: no ticket is left
+// unfinished. It submits a burst, closes without waiting, then waits every
+// ticket under a timeout — each must return (completed, or failed with the close
+// error), never hang.
+func TestSchedulerCloseCompletesPending(t *testing.T) {
+	forEachScheduler(t, func(t *testing.T, s iosched.Scheduler) {
+		f := newEmptyFile(t)
+		const n = 64
+		buf := make([]byte, 512)
+		tickets := make([]*iosched.Ticket, n)
+		for i := range n {
+			tk, err := s.Submit(iosched.WriteOp(f, buf, int64(i*len(buf))))
+			require.NoError(t, err)
+			tickets[i] = tk
+		}
+
+		require.NoError(t, s.Close()) // close without waiting for the burst
+
+		done := make(chan struct{})
+		go func() {
+			for _, tk := range tickets {
+				tk.Wait()
+			}
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("tickets did not all finish after Close")
+		}
+
+		for _, tk := range tickets {
+			if err := tk.Error(); err != nil {
+				require.ErrorContains(t, err, "closed") // completed, or the close error
+			}
+			tk.Release()
+		}
+	})
 }
