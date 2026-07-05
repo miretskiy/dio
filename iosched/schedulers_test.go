@@ -44,7 +44,7 @@ func runOp(t *testing.T, s iosched.Scheduler, op iosched.Op) iosched.Result {
 	require.NoError(t, err)
 	ticket.Wait()
 	require.NoError(t, ticket.Error())
-	return ticket.Op.Result
+	return ticket.Result()
 }
 
 // TestSchedulerCloseCompletesPending is the shutdown contract: no ticket is left

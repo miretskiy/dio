@@ -5,30 +5,36 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/miretskiy/dio/internal/buildutil"
 )
 
-// Opcode identifies the type of I/O operation. The low 7 bits name the
-// operation; the opVirtual high bit marks the virtual-file addressing mode —
-// the file is an io_uring registered-table index (vfd) rather than an *os.File.
+// Opcode identifies the type of I/O operation. The low bits name the operation;
+// the opVirtual and opFixed high bits are addressing/buffer flags. kind() returns
+// the operation with those flags masked off.
 const (
-	OpRead       uint8 = iota // pread - positioned read
-	OpWrite                   // pwrite - positioned write
-	OpFsync                   // fsync - flush data and metadata
-	OpFdatasync               // fdatasync - flush data
-	OpReadFixed               // pread via IORING_OP_READ_FIXED
-	OpWriteFixed              // pwrite via IORING_OP_WRITE_FIXED
-	OpFallocate               // fallocate - preallocate file space
-	OpOpenat                  // openat (virtual-only: installs into a vfd slot)
-	OpClose                   // close (virtual-only: frees a vfd slot)
-	OpReadv                   // preadv - vectored positioned read
-	OpWritev                  // pwritev - vectored positioned write
+	OpRead  uint8 = iota // pread - positioned read
+	OpReadv              // preadv - vectored positioned read
+
+	OpWrite  // pwrite - positioned write
+	OpWritev // pwritev - vectored positioned write
+
+	OpOpenat // openat - installs into a vfd slot, or returns a fd
+	OpClose  // close - frees a vfd slot, or closes a regular fd
+
+	OpFsync     // fsync - flush data and metadata
+	OpFdatasync // fdatasync - flush data
+	OpFallocate // fallocate - preallocate file space
 )
 
-// opVirtual is OR'd into an opcode to select virtual-file addressing.
-const opVirtual uint8 = 1 << 7
+// Opcode flags OR'd into an opcode. opVirtual selects virtual-file addressing
+// (the file is a registered-table index, not an *os.File); opFixed selects a
+// pre-registered fixed buffer (IORING_OP_*_FIXED). They compose; kind() masks
+// both off.
+const (
+	opFixed   uint8 = 1 << 6
+	opVirtual uint8 = 1 << 7
+)
 
 // Op describes a single I/O operation submitted to a Scheduler.
 //
@@ -53,45 +59,52 @@ type Op struct {
 	openFlag int
 	mode     uint32
 	buf      []byte
-	bufs     [][]byte        // vectored buffers (readv/writev)
-	iovecs   []syscall.Iovec // kernel iovec array (from bufs, or a coalesced run); pinned by the Op
+	bufs     [][]byte // vectored buffers (readv/writev); iovecs are built at placement
 	offset   int64
 	length   int64 // byte count for ops without a buffer (fallocate)
 	opFlags  uint32
 
-	Result struct {
-		N   int
-		Err error
-		// seq is the completion order — the coordinator's reap counter when this
-		// op's CQE was processed. Unexported and not part of the public result; it
-		// lets tests confirm linked ordering (e.g. a write completes before its
-		// linked fdatasync).
-		seq uint64
-	}
+	// result is the op's completion outcome, valid once the ticket is ready. It is
+	// unexported; callers read it through Ticket.Result, Ticket.Error, Ticket.N.
+	result Result
 
 	// The exception path for linked SQEs.
 	linked *Op
-
-	// iovecsBuf backs iovecs inline — no heap allocation — for vectored ops with
-	// up to 16 buffers, including coalesced write runs; longer runs fall back to a
-	// heap slice. It amortizes the allocation, not always avoids it. iovecs may
-	// point into it, so an Op must be stable (addressed via *Op, e.g. inside a
-	// ticket) before iovecs is built; see buildIovecs and coalesceRun.
-	iovecsBuf [16]syscall.Iovec
 }
 
-// Result is the public shape of Op.Result. It carries an unexported
-// completion-order field used only by tests; callers see N and Err.
-type Result = struct {
+// Result is an op's completion outcome: N bytes transferred (or, for a plain
+// openat, the returned file descriptor) and Err.
+type Result struct {
 	N   int
 	Err error
+	// seq is a test-only completion-order counter (dio's reap sequence, stamped in
+	// reap); it lets a test confirm a write completes before its linked fdatasync.
 	seq uint64
 }
 
-// SQE linking flag bits stored in Op.sqeFlags.
+// SQE linking flag bits stored in Op.sqeFlags, marking how a linked follower is
+// chained after this op.
 const (
-	sqeLink uint8 = 1 << 0 // IOSQE_IO_LINK
+	sqeLink     uint8 = 1 << 0 // IOSQE_IO_LINK: a failure cancels the rest of the chain
+	sqeHardLink uint8 = 1 << 1 // IOSQE_IO_HARDLINK: the chain survives a failure
 )
+
+// opFlags bits stored in Op.opFlags.
+const (
+	opDurable uint32 = 1 << 0 // flush the write (fdatasync) before the ticket completes
+)
+
+// Durable requests that this write's data be flushed to stable storage
+// (fdatasync) before the ticket completes: the io_uring backend links the sync
+// after the write (once per coalesced run — see linkDurableSyncs); the POSIX
+// backend syncs inline. It has no effect on non-write ops.
+func (o Op) Durable() Op {
+	o.opFlags |= opDurable
+	return o
+}
+
+// durable reports whether o requests a post-write fdatasync.
+func (o *Op) durable() bool { return o.opFlags&opDurable != 0 }
 
 // ReadOp constructs a positioned-read operation.
 func ReadOp(f *os.File, buf []byte, offset int64) Op {
@@ -115,12 +128,12 @@ func FdatasyncOp(f *os.File) Op {
 
 // ReadFixedOp constructs a positioned read using a pre-registered fixed buffer.
 func ReadFixedOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpReadFixed, f: f, buf: buf, offset: offset}
+	return Op{opcode: OpRead | opFixed, f: f, buf: buf, offset: offset}
 }
 
 // WriteFixedOp constructs a positioned write using a pre-registered fixed buffer.
 func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpWriteFixed, f: f, buf: buf, offset: offset}
+	return Op{opcode: OpWrite | opFixed, f: f, buf: buf, offset: offset}
 }
 
 // ReadvOp constructs a vectored positioned read: bufs are filled from
@@ -147,35 +160,6 @@ func VReadvOp(vfd uint32, bufs [][]byte, offset int64) Op {
 // descriptor.
 func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
 	return Op{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, offset: offset}
-}
-
-// buildIovecs fills o.iovecs from o.bufs (skipping empty buffers), backed by the
-// inline iovecsBuf when the vector count fits and a fresh slice otherwise. The
-// iovec bases point into o.bufs, which o retains so the backing arrays stay alive
-// until the kernel completes the SQE. o must be stable (addressed via *Op) since
-// iovecs may alias o.iovecsBuf, so this is called at placement, not construction.
-func (o *Op) buildIovecs() {
-	o.iovecs = appendIovecs(o.iovecsBacking(len(o.bufs)), o.bufs)
-}
-
-// iovecsBacking returns an empty slice with capacity for n iovecs, backed by the
-// inline iovecsBuf when n fits, else a fresh allocation.
-func (o *Op) iovecsBacking(n int) []syscall.Iovec {
-	if n <= len(o.iovecsBuf) {
-		return o.iovecsBuf[:0]
-	}
-	return make([]syscall.Iovec, 0, n)
-}
-
-// appendIovecs appends an iovec for each non-empty buffer to dst.
-func appendIovecs(dst []syscall.Iovec, bufs [][]byte) []syscall.Iovec {
-	for _, b := range bufs {
-		if len(b) == 0 {
-			continue
-		}
-		dst = append(dst, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
-	}
-	return dst
 }
 
 // OpenatOp constructs a plain openat operation that opens path and returns the
@@ -216,6 +200,15 @@ func VCloseOp(vfd uint32) Op {
 	return Op{opcode: OpClose | opVirtual, vfd: vfd}
 }
 
+// CloseOp closes f's descriptor through the scheduler; the scheduler drains f's
+// in-flight ops before the close runs. Op holds f for the duration to keep the
+// descriptor alive. From here dio owns the close: closing or otherwise using f
+// again is a use-after-close, which — as with any descriptor — dio does not
+// guard against.
+func CloseOp(f *os.File) Op {
+	return Op{opcode: OpClose, f: f}
+}
+
 // VReadOp constructs a positioned read using an io_uring virtual descriptor.
 func VReadOp(vfd uint32, buf []byte, offset int64) Op {
 	return Op{opcode: OpRead | opVirtual, vfd: vfd, buf: buf, offset: offset}
@@ -239,13 +232,13 @@ func VFdatasyncOp(vfd uint32) Op {
 // VReadFixedOp constructs a positioned read using both a virtual descriptor
 // and a pre-registered fixed buffer.
 func VReadFixedOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpReadFixed | opVirtual, vfd: vfd, buf: buf, offset: offset}
+	return Op{opcode: OpRead | opVirtual | opFixed, vfd: vfd, buf: buf, offset: offset}
 }
 
 // VWriteFixedOp constructs a positioned write using both a virtual
 // descriptor and a pre-registered fixed buffer.
 func VWriteFixedOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpWriteFixed | opVirtual, vfd: vfd, buf: buf, offset: offset}
+	return Op{opcode: OpWrite | opVirtual | opFixed, vfd: vfd, buf: buf, offset: offset}
 }
 
 // FallocateOp constructs an operation that preallocates size bytes of file
@@ -256,46 +249,43 @@ func FallocateOp(f *os.File, size int64) Op {
 }
 
 // VFallocateOp constructs a FallocateOp targeting an io_uring virtual
-// descriptor. It is barrier-ordered behind the slot's open like any other
-// fixed-file op, so it composes into an open→fallocate→write chain.
+// descriptor. Compose it into an open→fallocate→write chain with Op.Link when the
+// file must exist and be sized before its first write; the coordinator imposes no
+// slot ordering of its own (see Scheduler.Submit).
 func VFallocateOp(vfd uint32, size int64) Op {
 	return Op{opcode: OpFallocate | opVirtual, vfd: vfd, length: size}
 }
 
-// Link returns a copy of o linked to next with IOSQE_IO_LINK semantics.
-func (o Op) Link(next Op) Op {
+// Link returns a copy of o with next chained after it (IOSQE_IO_LINK): if any op
+// in the chain fails, the rest are canceled.
+func (o Op) Link(next Op) Op { return o.chain(next, sqeLink) }
+
+// HardLink is like Link but with IOSQE_IO_HARDLINK: a failure does not cancel the
+// rest of the chain — each linked op runs regardless of the previous result.
+func (o Op) HardLink(next Op) Op { return o.chain(next, sqeHardLink) }
+
+func (o Op) chain(next Op, flag uint8) Op {
 	tail := &o
 	for tail.linked != nil {
 		tail = tail.linked
 	}
-	tail.sqeFlags |= sqeLink
+	tail.sqeFlags |= flag
 	tail.linked = &next
 	return o
 }
 
-func (o Op) isLinked() bool {
-	return o.sqeFlags&sqeLink != 0 && o.linked != nil
-}
+func (o *Op) isLinked() bool { return o.linked != nil }
 
 // isVirtual reports whether o addresses its file by virtual-table index (vfd)
 // rather than *os.File — i.e. the opVirtual bit is set.
-func (o *Op) isVirtual() bool {
-	return o.opcode&opVirtual != 0
-}
+func (o *Op) isVirtual() bool { return o.opcode&opVirtual != 0 }
 
-// base returns the operation opcode with the virtual bit masked off, so the
-// scheduler switches on the operation regardless of addressing mode.
-func (o *Op) base() uint8 {
-	return o.opcode &^ opVirtual
-}
+// isFixed reports whether o uses a pre-registered fixed buffer — the opFixed bit.
+func (o *Op) isFixed() bool { return o.opcode&opFixed != 0 }
 
-// isVBarrier reports whether o is a virtual open or close — the ops that
-// serialize a vfd slot (subsequent ops on the slot park behind one). Only the
-// virtual form addresses a slot, so a plain (non-virtual) openat is not a
-// barrier.
-func (o *Op) isVBarrier() bool {
-	return o.isVirtual() && (o.base() == OpOpenat || o.base() == OpClose)
-}
+// kind returns the operation with the opVirtual/opFixed flags masked off, so the
+// scheduler switches on the operation regardless of addressing or buffer mode.
+func (o *Op) kind() uint8 { return o.opcode &^ (opVirtual | opFixed) }
 
 // Ticket is the per-Submit synchronization handle returned by Scheduler.
 type Ticket struct {
@@ -385,18 +375,27 @@ func (t *Ticket) Error() error {
 		return nil
 	}
 	for op := &t.Op; op != nil; op = op.linked {
-		if op.Result.Err != nil {
-			return op.Result.Err
+		if op.result.Err != nil {
+			return op.result.Err
 		}
 	}
 	return nil
 }
 
+// Result returns the completion outcome of the ticket's root op, valid after
+// Wait. For a linked chain this is the first op; Error reports the first error
+// across the whole chain.
+func (t *Ticket) Result() Result { return t.Op.result }
+
+// N returns the bytes transferred by the ticket's root op (or, for a plain
+// openat, the returned file descriptor), valid after Wait.
+func (t *Ticket) N() int { return t.Op.result.N }
+
 func countAndValidateOps(op *Op) (int32, error) {
 	var n int32
 	for p := op; p != nil; p = p.linked {
 		switch {
-		case p.base() == OpOpenat:
+		case p.kind() == OpOpenat:
 			// openat carries a path and no *os.File in either addressing mode.
 			if len(p.path) <= 1 {
 				return 0, fmt.Errorf("iosched: op %d has empty open path", n)
@@ -414,7 +413,7 @@ func countAndValidateOps(op *Op) (int32, error) {
 
 func clearResults(op *Op) {
 	for p := op; p != nil; p = p.linked {
-		p.Result = Result{}
+		p.result = Result{}
 	}
 }
 

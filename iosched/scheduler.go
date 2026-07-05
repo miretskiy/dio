@@ -1,21 +1,8 @@
 // Package iosched provides pluggable I/O scheduling for positioned reads and writes.
 //
-// # Architecture
-//
 // The primary abstraction is Scheduler. On Linux, URingScheduler submits ops
 // through io_uring. POSIXScheduler implements the same Submit/Ticket lifecycle
 // with blocking POSIX file operations.
-//
-// # Signals (EINTR)
-//
-// Schedulers absorb EINTR internally: a completed op's Result.Err is never
-// syscall.EINTR, so callers handle only terminal errors and short transfers.
-//
-// Go's runtime preempts goroutines with SIGURG (since 1.14), which interrupts
-// in-flight blocking syscalls, so EINTR is routine for any code entering the
-// kernel. The standard library retries it for callers (internal/poll); this
-// package does the same. How each backend retries is documented at its
-// implementation.
 package iosched
 
 import (
@@ -29,14 +16,54 @@ var errSchedulerClosed = errors.New("iosched: scheduler closed")
 
 // Scheduler is the async I/O submission interface.
 type Scheduler interface {
-	// Submit enqueues op for asynchronous execution and returns a Ticket.
-	// The caller must call Ticket.Wait before reading results or releasing
-	// the Ticket. Linked operations are attached with Op.Link.
+	// Submit hands op to the scheduler for execution, possibly asynchronously,
+	// and returns a Ticket to await it. The scheduler is a lean pipe: it moves
+	// bytes between the caller and the kernel and reports completions. It does not
+	// model files, order your operations, or manage their lifecycle — those are
+	// the caller's.
 	//
-	// Submit does not implement backpressure; callers that need admission
-	// control wrap the scheduler with their own semaphore or queue. It does,
-	// however, handle EINTR internally (see the package doc), so callers never
-	// retry interrupted syscalls themselves — Result.Err is never EINTR.
+	// Guaranteed:
+	//   - Every op eventually completes exactly once. The Ticket becomes ready
+	//     after Ticket.Wait; then Ticket.Result, Ticket.N, and Ticket.Error hold
+	//     the outcome. A linked chain completes as one unit.
+	//   - EINTR is absorbed internally, so Result.Err is never EINTR (see the
+	//     package doc); callers handle only terminal errors and short transfers.
+	//   - A linked chain (Op.Link) executes in order — each op starts only after
+	//     the previous one completed — and a failure short-circuits the rest with
+	//     ECANCELED.
+	//
+	// NOT guaranteed:
+	//   - Any ordering between separate Submits. Independent ops — even to the
+	//     same file or offset — may execute and complete in any order and
+	//     concurrently. Submit order is not execution order.
+	//   - Any implicit sequencing of virtual-file lifecycle ops. An open does not
+	//     hold back later writes to its slot, a close does not wait for the slot's
+	//     other ops, and a reopen is not ordered after a prior close. The
+	//     scheduler places what it is given.
+	//
+	// If you need ordering, encode it — the scheduler will not reconstruct it:
+	//   - Wait: submit the prerequisite, Ticket.Wait for it, then submit the
+	//     dependents. Simplest, and right when the prerequisite is rare (open a
+	//     file once, then stream many writes to it).
+	//   - Link: chain dependents after the prerequisite with Op.Link so the
+	//     kernel orders them with no round-trip. Right for a linear dependency
+	//     (write→fdatasync, or close→reopen of a recycled slot). A link is
+	//     strictly linear — no fan-out or fan-in — so N independent writes cannot
+	//     be "ordered before" one op without serializing them; use Wait (or a
+	//     caller-side join) for that.
+	//
+	// On virtual files specifically: a slot's ops must not race its open or close.
+	// The kernel resolves an async op's fixed file when it issues the op, not at
+	// submission, so a write must not be submitted before its open has completed,
+	// every write must have completed before the slot is closed, and a reopen must
+	// follow the prior close. A close concurrent with the slot's in-flight ops can
+	// clear the slot out from under them and fail them with EBADF. Order all of it
+	// with Wait — await the open, and await the writes' completion before closing;
+	// the scheduler does not.
+	//
+	// Submit implements no backpressure: it is a non-blocking handoff onto a
+	// lock-free staging queue. Callers that need admission control wrap the
+	// scheduler with their own semaphore, token bucket, or queue.
 	Submit(op Op) (*Ticket, error)
 
 	// Close shuts down the scheduler. Callers must stop submitting before

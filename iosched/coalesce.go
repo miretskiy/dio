@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"io"
 	"slices"
-	"syscall"
 	"unsafe"
 )
 
@@ -12,7 +11,7 @@ import (
 // (unlinked) plain positioned write. Fixed-buffer, linked, read, sync, openat,
 // and close ops are never coalesced.
 func (o *Op) coalescibleWrite() bool {
-	return o.base() == OpWrite && o.linked == nil && o.sqeFlags&sqeLink == 0
+	return o.kind() == OpWrite && !o.isFixed() && o.linked == nil && o.sqeFlags&sqeLink == 0
 }
 
 // sameWriteTarget reports whether two writes address the same file: the same
@@ -86,18 +85,15 @@ func groupCoalescibleWrites(cands []*Ticket) []*Ticket {
 // its own byte count is still len(Op.buf) at completion.
 func coalesceRun(run []*Ticket) {
 	leader := run[0]
-	// Back the iovecs inline on the leader when the run fits (no heap alloc); the
-	// leader Op is stable in its ticket, so iovecs may alias leader.Op.iovecsBuf.
-	iovecs := leader.Op.iovecsBacking(len(run))
 	for _, m := range run {
-		b := m.Op.buf
-		if len(b) == 0 {
-			continue
-		}
-		iovecs = append(iovecs, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
+		// A run is durable if any member is: the merged writev gets one sync,
+		// covering every member (an extra sync on a non-durable member is harmless).
+		leader.Op.opFlags |= m.Op.opFlags & opDurable
 	}
+	// The leader becomes a writev; its iovecs are built at placement from the
+	// leader's own buf plus each follower's (walking the group). The leader keeps
+	// its own Op.buf, so its byte count at completion is still len(Op.buf).
 	leader.Op.opcode = OpWritev | (leader.Op.opcode & opVirtual)
-	leader.Op.iovecs = iovecs
 
 	var tail *Ticket
 	for _, f := range run[1:] {
@@ -118,10 +114,10 @@ func coalesceRun(run []*Ticket) {
 // durability (fdatasync) error, or a short write fails the whole group; all are
 // retriable, since positioned writes are idempotent, so the caller re-issues.
 func completeCoalescedGroup(leader *Ticket) {
-	written := leader.Op.Result.N // total bytes the writev reported
-	err := leader.Op.Result.Err
+	written := leader.Op.result.N // total bytes the writev reported
+	err := leader.Op.result.Err
 	if err == nil && leader.Op.linked != nil {
-		err = leader.Op.linked.Result.Err // the linked fdatasync's result
+		err = leader.Op.linked.result.Err // the linked fdatasync's result
 	}
 	// Distribute the written bytes across members in writev order — leader first,
 	// then followers by ascending offset. A fully covered member succeeds; the
@@ -150,15 +146,15 @@ func completeCoalescedGroup(leader *Ticket) {
 // gets min(remaining, len) bytes, and a short count records io.ErrShortWrite.
 func distributeWrite(op *Op, remaining *int, err error) {
 	if err != nil {
-		op.Result.N = 0
-		op.Result.Err = err
+		op.result.N = 0
+		op.result.Err = err
 		return
 	}
 	n := min(len(op.buf), *remaining)
 	*remaining -= n
-	op.Result.N = n
+	op.result.N = n
 	if n < len(op.buf) {
-		op.Result.Err = io.ErrShortWrite
+		op.result.Err = io.ErrShortWrite
 	}
 }
 
@@ -170,16 +166,16 @@ func distributeWrite(op *Op, remaining *int, err error) {
 func failCoalescedWrite(leader *Ticket, err error) {
 	for m := leader.group; m != nil; {
 		next := m.next
-		if m.Op.Result.Err == nil {
-			m.Op.Result.Err = err
+		if m.Op.result.Err == nil {
+			m.Op.result.Err = err
 		}
 		if n := m.pending.Swap(0); n > 0 {
 			m.wg.Done()
 		}
 		m = next
 	}
-	if leader.Op.Result.Err == nil {
-		leader.Op.Result.Err = err
+	if leader.Op.result.Err == nil {
+		leader.Op.result.Err = err
 	}
 	if n := leader.pending.Swap(0); n > 0 {
 		leader.wg.Done()

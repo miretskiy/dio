@@ -42,7 +42,7 @@ func TestPOSIXVirtualOpenFallocateWriteChain(t *testing.T) {
 	got := make([]byte, len(payload))
 	rd := submitAndWait(t, s, iosched.VReadOp(vfd, got, 0))
 	require.NoError(t, rd.Error())
-	require.Equal(t, len(payload), rd.Op.Result.N)
+	require.Equal(t, len(payload), rd.Result().N)
 	require.Equal(t, payload, got)
 	rd.Release()
 
@@ -57,9 +57,9 @@ func TestPOSIXVirtualOpenFallocateWriteChain(t *testing.T) {
 }
 
 // TestPOSIXVirtualSlotRecycle documents that on the POSIX backend a slot can be
-// closed and immediately reopened (synchronous execution, no barrier), so slot
-// recycling has no backend-specific hazard here — unlike the io_uring barrier,
-// where a reopen parked behind a close is failed EBADF.
+// closed and immediately reopened (synchronous execution), so slot recycling has
+// no backend-specific hazard here. On either backend the caller sequences close
+// before reopen; the scheduler does not (see Scheduler.Submit).
 func TestPOSIXVirtualSlotRecycle(t *testing.T) {
 	s := iosched.NewPOSIXScheduler()
 	t.Cleanup(func() { require.NoError(t, s.Close()) })

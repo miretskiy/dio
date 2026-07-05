@@ -4,8 +4,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 )
 
 func TestTicketReleaseNilSafeIdempotentAndPendingSafe(t *testing.T) {
@@ -47,12 +45,12 @@ func TestTicketErrorReturnsFirstLinkedError(t *testing.T) {
 			linked: &Op{},
 		},
 	}
-	ticket.Op.linked.Result.Err = second
+	ticket.Op.linked.result.Err = second
 	if got := ticket.Error(); got != second {
 		t.Fatalf("root success: got %v want %v", got, second)
 	}
 
-	ticket.Op.Result.Err = first
+	ticket.Op.result.Err = first
 	if got := ticket.Error(); got != first {
 		t.Fatalf("root failure: got %v want %v", got, first)
 	}
@@ -67,14 +65,14 @@ func TestOpLinkAppendsToExistingChain(t *testing.T) {
 	second := errors.New("second")
 
 	op := Op{}.Link(Op{}).Link(Op{})
-	op.linked.Result.Err = first
-	op.linked.linked.Result.Err = second
+	op.linked.result.Err = first
+	op.linked.linked.result.Err = second
 
 	ticket := &Ticket{Op: op}
 	if got := ticket.Error(); got != first {
 		t.Fatalf("first linked error: got %v want %v", got, first)
 	}
-	op.linked.Result.Err = nil
+	op.linked.result.Err = nil
 	if got := ticket.Error(); got != second {
 		t.Fatalf("second linked error: got %v want %v", got, second)
 	}
@@ -133,10 +131,4 @@ func BenchmarkTicketGetCompleteRelease(b *testing.B) {
 		completeTicket(ticket)
 		ticket.Release()
 	}
-}
-
-func TestIsVbarrier(t *testing.T) {
-	// Mostly to silence unused isVBarrier warning on non-linux
-	var op Op
-	require.False(t, op.isVBarrier())
 }

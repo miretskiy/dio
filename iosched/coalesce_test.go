@@ -28,17 +28,16 @@ func TestGroupCoalescibleWrites(t *testing.T) {
 		out := groupCoalescibleWrites([]*Ticket{w(fa, 10, 2), w(fa, 0, 4), w(fa, 4, 6)})
 		require.Len(t, out, 1)
 		leader := out[0]
-		require.Equal(t, OpWritev, leader.Op.base())
+		require.Equal(t, OpWritev, leader.Op.kind())
 		require.Equal(t, int64(0), leader.Op.offset) // lowest offset is the leader
 		require.Equal(t, 3, groupLen(leader))
-		require.Len(t, leader.Op.iovecs, 3)
 	})
 
 	t.Run("gap splits into two runs", func(t *testing.T) {
 		out := groupCoalescibleWrites([]*Ticket{w(fa, 0, 4), w(fa, 100, 4)})
 		require.Len(t, out, 2)
 		for _, l := range out {
-			require.Equal(t, OpWrite, l.Op.base()) // untouched singletons
+			require.Equal(t, OpWrite, l.Op.kind()) // untouched singletons
 			require.Nil(t, l.group)
 		}
 	})
@@ -53,7 +52,7 @@ func TestGroupCoalescibleWrites(t *testing.T) {
 		require.Len(t, out, 2) // fa[0,4] merged; fb[0] singleton
 		var merged, single int
 		for _, l := range out {
-			if l.Op.base() == OpWritev {
+			if l.Op.kind() == OpWritev {
 				merged++
 				require.Equal(t, 2, groupLen(l))
 			} else {
@@ -72,7 +71,7 @@ func TestGroupCoalescibleWrites(t *testing.T) {
 	t.Run("virtual contiguous merges", func(t *testing.T) {
 		out := groupCoalescibleWrites([]*Ticket{vw(1, 0, 4), vw(1, 4, 4)})
 		require.Len(t, out, 1)
-		require.Equal(t, OpWritev, out[0].Op.base())
+		require.Equal(t, OpWritev, out[0].Op.kind())
 		require.True(t, out[0].Op.isVirtual()) // virtual bit preserved
 		require.Equal(t, 2, groupLen(out[0]))
 	})
@@ -120,89 +119,64 @@ func TestCompleteCoalescedGroup(t *testing.T) {
 
 	t.Run("full success splits by buffer length", func(t *testing.T) {
 		leader, follower := newLeader()
-		leader.Op.Result.N = 10 // writev wrote all 10 bytes
+		leader.Op.result.N = 10 // writev wrote all 10 bytes
 		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
-		require.NoError(t, leader.Op.Result.Err)
-		require.NoError(t, follower.Op.Result.Err)
-		require.Equal(t, 4, leader.Op.Result.N)
-		require.Equal(t, 6, follower.Op.Result.N)
+		require.NoError(t, leader.Op.result.Err)
+		require.NoError(t, follower.Op.result.Err)
+		require.Equal(t, 4, leader.Op.result.N)
+		require.Equal(t, 6, follower.Op.result.N)
 	})
 
 	t.Run("short write: leader fully covered, boundary member short", func(t *testing.T) {
 		leader, follower := newLeader()
-		leader.Op.Result.N = 8 // writev wrote 8 of 10; leader(4) full, follower gets 4 of 6
+		leader.Op.result.N = 8 // writev wrote 8 of 10; leader(4) full, follower gets 4 of 6
 		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
-		require.NoError(t, leader.Op.Result.Err)
-		require.Equal(t, 4, leader.Op.Result.N)
-		require.ErrorIs(t, follower.Op.Result.Err, io.ErrShortWrite)
-		require.Equal(t, 4, follower.Op.Result.N)
+		require.NoError(t, leader.Op.result.Err)
+		require.Equal(t, 4, leader.Op.result.N)
+		require.ErrorIs(t, follower.Op.result.Err, io.ErrShortWrite)
+		require.Equal(t, 4, follower.Op.result.N)
 	})
 
 	t.Run("short write within leader zeroes followers", func(t *testing.T) {
 		leader, follower := newLeader()
-		leader.Op.Result.N = 3 // < leader's 4: leader partial (3), follower 0
+		leader.Op.result.N = 3 // < leader's 4: leader partial (3), follower 0
 		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
-		require.ErrorIs(t, leader.Op.Result.Err, io.ErrShortWrite)
-		require.Equal(t, 3, leader.Op.Result.N)
-		require.ErrorIs(t, follower.Op.Result.Err, io.ErrShortWrite)
-		require.Equal(t, 0, follower.Op.Result.N)
+		require.ErrorIs(t, leader.Op.result.Err, io.ErrShortWrite)
+		require.Equal(t, 3, leader.Op.result.N)
+		require.ErrorIs(t, follower.Op.result.Err, io.ErrShortWrite)
+		require.Equal(t, 0, follower.Op.result.N)
 	})
 
 	t.Run("write error zeroes all with errno", func(t *testing.T) {
 		leader, follower := newLeader()
-		leader.Op.Result.Err = syscall.EIO
+		leader.Op.result.Err = syscall.EIO
 		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
-		require.ErrorIs(t, leader.Op.Result.Err, syscall.EIO)
-		require.Equal(t, 0, leader.Op.Result.N)
-		require.ErrorIs(t, follower.Op.Result.Err, syscall.EIO)
-		require.Equal(t, 0, follower.Op.Result.N)
+		require.ErrorIs(t, leader.Op.result.Err, syscall.EIO)
+		require.Equal(t, 0, leader.Op.result.N)
+		require.ErrorIs(t, follower.Op.result.Err, syscall.EIO)
+		require.Equal(t, 0, follower.Op.result.N)
 	})
 
 	t.Run("fdatasync error fails all", func(t *testing.T) {
 		leader, follower := newLeader()
-		leader.Op.Result.N = 10 // writev succeeded
+		leader.Op.result.N = 10 // writev succeeded
 		sync := VFdatasyncOp(0)
-		sync.Result.Err = syscall.EIO // durability failed
+		sync.result.Err = syscall.EIO // durability failed
 		leader.Op.linked = &sync
 		completeCoalescedGroup(leader)
 		leader.Wait()
 		follower.Wait()
-		require.ErrorIs(t, leader.Op.Result.Err, syscall.EIO)
-		require.ErrorIs(t, follower.Op.Result.Err, syscall.EIO)
+		require.ErrorIs(t, leader.Op.result.Err, syscall.EIO)
+		require.ErrorIs(t, follower.Op.result.Err, syscall.EIO)
 	})
-}
-
-func TestOpBuildIovecs(t *testing.T) {
-	// <= 8 buffers: backed by the inline iovecsBuf (cap == 8), no heap alloc.
-	small := WritevOp(nil, [][]byte{make([]byte, 4), make([]byte, 6)}, 0)
-	small.buildIovecs()
-	require.Len(t, small.iovecs, 2)
-	require.Equal(t, cap(small.iovecsBuf), cap(small.iovecs), "small run should use the inline buffer")
-	require.Equal(t, uint64(4), small.iovecs[0].Len)
-	require.Equal(t, uint64(6), small.iovecs[1].Len)
-
-	// empty buffers are skipped.
-	skip := WritevOp(nil, [][]byte{make([]byte, 4), nil, make([]byte, 2)}, 0)
-	skip.buildIovecs()
-	require.Len(t, skip.iovecs, 2)
-
-	// > 16 buffers: falls back to a heap slice (cap != inline).
-	bufs := make([][]byte, 17)
-	for i := range bufs {
-		bufs[i] = make([]byte, 1)
-	}
-	big := WritevOp(nil, bufs, 0)
-	big.buildIovecs()
-	require.Len(t, big.iovecs, 17)
-	require.NotEqual(t, cap(big.iovecsBuf), cap(big.iovecs), "large run should not use the inline buffer")
 }
 
 func TestFailCoalescedWrite(t *testing.T) {
@@ -223,8 +197,8 @@ func TestFailCoalescedWrite(t *testing.T) {
 
 	leader.Wait()
 	follower.Wait()
-	require.ErrorIs(t, leader.Op.Result.Err, syscall.EIO)
-	require.ErrorIs(t, follower.Op.Result.Err, syscall.EIO)
+	require.ErrorIs(t, leader.Op.result.Err, syscall.EIO)
+	require.ErrorIs(t, follower.Op.result.Err, syscall.EIO)
 	require.Equal(t, int32(0), leader.pending.Load())
 	require.Equal(t, int32(0), follower.pending.Load())
 }

@@ -191,12 +191,15 @@ type coordinator struct {
 	freeSlots []int
 	nInflight int
 
-	parkedOps []*Ticket
+	// iovecBufs[slot] backs the iovec array for a vectored/coalesced op placed in
+	// that SQE slot. The array must stay valid from submission to CQE — exactly the
+	// slot's in-flight window — so it lives here, per slot, reused (and grown) when
+	// the slot is next filled. This keeps the iovec backing off every Op.
+	iovecBufs [][]syscall.Iovec
 
-	// syncMode[slot] is the durability of each virtual slot, from its open flags;
-	// syncSlots counts the durable ones so linkDurableSyncs is skipped when none.
-	syncMode  []syncMode
-	syncSlots int
+	// drain tracks in-flight data ops per file so a close can wait for its file to
+	// quiesce before it runs (see drain_linux.go).
+	drain drainTable
 
 	// reapSeq is a monotonic completion counter stamped onto each op's result as
 	// its CQE is reaped, recording completion order (used by tests).
@@ -212,8 +215,6 @@ type coordinator struct {
 	batchBuf []*Ticket
 }
 
-var barrierOp Ticket
-
 func (s *URingScheduler) loop() {
 	defer s.wg.Done()
 	defer s.ring.QueueExit()
@@ -223,13 +224,11 @@ func (s *URingScheduler) loop() {
 		ring:      s.ring,
 		inflight:  make([]inflightEntry, s.RingDepth),
 		freeSlots: make([]int, s.RingDepth),
-	}
-	if s.VFiles > 0 {
-		c.parkedOps = make([]*Ticket, s.VFiles)
-		c.syncMode = make([]syncMode, s.VFiles)
+		iovecBufs: make([][]syscall.Iovec, s.RingDepth),
 	}
 	c.coalesce = make([]*Ticket, 0, s.RingDepth)
 	c.batchBuf = make([]*Ticket, 0, 64)
+	c.drain = newDrainTable(int(s.VFiles) + drainDenseMargin)
 	for i := range s.RingDepth {
 		c.freeSlots[i] = int(i)
 	}
@@ -257,9 +256,7 @@ func (c *coordinator) serve(coalesce bool) ([]*Ticket, error) {
 		if coalesce {
 			batch = c.coalesceBatch(batch)
 		}
-		if c.syncSlots > 0 {
-			batch = c.linkDurableSyncs(batch)
-		}
+		batch = c.linkDurableSyncs(batch)
 		before := c.nInflight
 		carry = c.fillSlots(batch)
 		if placed := c.nInflight - before; placed > 0 {
@@ -272,8 +269,9 @@ func (c *coordinator) serve(coalesce bool) ([]*Ticket, error) {
 		if err := c.submit(); err != nil {
 			return carry, fmt.Errorf("iosched: ring error: %w", err)
 		}
-		if unparked := c.reap(); unparked != nil {
-			carry = c.filterRunnable(carry, unparked)
+		// A reap can free closes the drain was holding; place them next iteration.
+		if released := c.reap(); len(released) > 0 {
+			carry = append(carry, released...)
 		}
 	}
 }
@@ -282,7 +280,7 @@ func (c *coordinator) serve(coalesce bool) ([]*Ticket, error) {
 // returns, so no caller waits forever. Three kinds can remain:
 //
 //  1. staged — an add that raced the close, or slipped in as the ring failed;
-//  2. collected but not yet placed (batch), or parked behind a barrier;
+//  2. collected but not yet placed (batch);
 //  3. in flight — already handed to the kernel.
 //
 // (1) and (2) never started, so fail them. (3) the kernel owns: on a clean close
@@ -294,24 +292,29 @@ func (c *coordinator) shutdownPending(batch []*Ticket, err error) {
 	}
 	c.failTicketSlice(batch, s.shutdown.err)
 	c.failStaged(s.shutdown.err)
-	c.failParked(s.shutdown.err)
 	if err != nil {
 		c.failAllInflight(err)
 	} else {
 		c.drainInflight()
 	}
+	// Closes still held for a slot that never drained (or was force-failed) will
+	// never be placed, so fail them too.
+	c.failDrainHeld(s.shutdown.err)
 }
 
 // drainInflight reaps the SQEs still in flight after a graceful close so the
-// kernel is done with their buffers before the ring exits. Parked tickets were
-// already failed, so reap unparks nothing here.
+// kernel is done with their buffers before the ring exits. A reap here can free
+// a held close, but we are shutting down and will place nothing more, so those
+// are failed rather than re-queued.
 func (c *coordinator) drainInflight() {
 	for c.nInflight > 0 {
 		if err := c.submit(); err != nil {
 			c.failAllInflight(fmt.Errorf("iosched: ring error draining on close: %w", err))
 			return
 		}
-		c.reap()
+		for _, t := range c.reap() {
+			c.failTicket(t, c.sched.shutdown.err)
+		}
 	}
 }
 
@@ -361,26 +364,13 @@ func reverseTickets(head *Ticket) *Ticket {
 	return out
 }
 
-func appendTickets(head, tail *Ticket) *Ticket {
-	if head == nil {
-		return tail
-	}
-	if tail == nil {
-		return head
-	}
-	for t := head; ; t = t.next {
-		if t.next == nil {
-			t.next = tail
-			return head
-		}
-	}
-}
-
-// filterRunnable appends the runnable tickets from the linked list head (drained
-// staging, or reap's unparked list) onto batch, returning the extended slice. A
-// ticket whose chain is too long or names a bad slot is failed; one behind an
-// in-flight barrier is parked; a barrier in a runnable ticket marks its slot so
-// later ops on it park.
+// filterRunnable appends the valid tickets from the linked list head (drained
+// staging) onto batch, returning the extended slice. A ticket is failed if its
+// chain is longer than the ring depth, or if it names a virtual slot with no
+// table configured or an index outside it. The coordinator imposes no ordering
+// between ops on a slot: an open must complete before ops that use the slot, and
+// a close/reopen must be sequenced against the slot's other ops — that ordering
+// is the caller's, expressed with Ticket.Wait or Op.Link (see Scheduler.Submit).
 func (c *coordinator) filterRunnable(batch []*Ticket, head *Ticket) []*Ticket {
 	for head != nil {
 		t := head
@@ -393,9 +383,6 @@ func (c *coordinator) filterRunnable(batch []*Ticket, head *Ticket) []*Ticket {
 		}
 
 		var err error
-		var parkSlot uint32
-		var parked bool
-
 		for op := &t.Op; op != nil; op = op.linked {
 			if !op.isVirtual() {
 				continue
@@ -404,31 +391,14 @@ func (c *coordinator) filterRunnable(batch []*Ticket, head *Ticket) []*Ticket {
 				err = fmt.Errorf("iosched: virtual file ops require URingConfig.VFiles")
 				break
 			}
-			slot := op.vfd
-			if slot >= c.sched.VFiles {
-				err = fmt.Errorf("iosched: virtual file index %d outside configured table", slot)
-				break
-			}
-			if c.parkedOps[slot] != nil {
-				parked = true
-				parkSlot = slot
+			if op.vfd >= c.sched.VFiles {
+				err = fmt.Errorf("iosched: virtual file index %d outside configured table", op.vfd)
 				break
 			}
 		}
-
 		if err != nil {
 			c.failTicket(t, err)
 			continue
-		}
-		if parked {
-			c.parkTicket(parkSlot, t)
-			continue
-		}
-
-		for op := &t.Op; op != nil; op = op.linked {
-			if op.isVBarrier() {
-				c.parkedOps[op.vfd] = &barrierOp
-			}
 		}
 
 		batch = append(batch, t)
@@ -442,14 +412,6 @@ func (c *coordinator) failTicketSlice(batch []*Ticket, err error) {
 	for _, t := range batch {
 		c.failTicket(t, err)
 	}
-}
-
-func (c *coordinator) parkTicket(slot uint32, t *Ticket) {
-	if c.parkedOps[slot] == &barrierOp {
-		c.parkedOps[slot] = t
-		return
-	}
-	c.parkedOps[slot] = appendTickets(c.parkedOps[slot], t)
 }
 
 // coalesceBatch rewrites the runnable batch in place, merging contiguous
@@ -473,15 +435,50 @@ func (c *coordinator) coalesceBatch(batch []*Ticket) []*Ticket {
 	return pass
 }
 
+// fillSlots places as many tickets as fit into free SQEs and returns the unplaced
+// remainder to carry to the next iteration. It runs in two passes: pass 1 places
+// every non-close ticket, counting each slot's in-flight data ops; pass 2 then
+// places or holds closes. The order matters because coalesceBatch can move a
+// trailing close ahead of the writes it must follow — deferring closes to pass 2
+// guarantees the drain sees their batch-mates counted first. A held close is not
+// carried; reap releases it once its slot drains.
 func (c *coordinator) fillSlots(batch []*Ticket) []*Ticket {
-	for i, t := range batch {
+	var carry, closes []*Ticket
+	ringFull := false
+	for _, t := range batch {
+		if c.isDrainClose(t) {
+			closes = append(closes, t)
+			continue
+		}
+		if ringFull {
+			carry = append(carry, t)
+			continue
+		}
 		need := int(t.pending.Load())
 		if need > len(c.freeSlots) {
-			return batch[i:] // ring is full; carry the rest to the next iteration
+			ringFull = true
+			carry = append(carry, t)
+			continue
 		}
 		c.placeTicket(t, need)
 	}
-	return batch[:0]
+	for _, t := range closes {
+		if c.holdClose(t) {
+			continue
+		}
+		if ringFull {
+			carry = append(carry, t)
+			continue
+		}
+		need := int(t.pending.Load())
+		if need > len(c.freeSlots) {
+			ringFull = true
+			carry = append(carry, t)
+			continue
+		}
+		c.placeTicket(t, need)
+	}
+	return carry
 }
 
 func (c *coordinator) failTicketList(t *Ticket, err error) {
@@ -517,7 +514,11 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 			return
 		}
 
-		prepareSQE(sqe, op)
+		var iovecs []syscall.Iovec
+		if k := op.kind(); k == OpReadv || k == OpWritev {
+			iovecs = c.slotIovecs(slot, t, op)
+		}
+		prepareSQE(sqe, op, iovecs)
 		sqe.SetData64(uint64(slot))
 
 		c.inflight[slot] = inflightEntry{
@@ -526,10 +527,11 @@ func (c *coordinator) placeTicket(t *Ticket, need int) {
 			valid: true,
 		}
 		c.nInflight++
+		c.drainInc(op)
 	}
 }
 
-func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
+func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iovec) {
 	// A "direct descriptor" (a.k.a. registered/fixed file) is a file held in
 	// io_uring's own table and named by a slot index, not a process fd.
 	// IOSQE_FIXED_FILE is the switch into that world: it tells the kernel to read
@@ -551,29 +553,31 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 		fd = int(op.f.Fd())
 	}
 	if op.isLinked() {
-		sqeFlags |= uint32(giouring.SqeIOLink)
+		if op.sqeFlags&sqeHardLink != 0 {
+			sqeFlags |= uint32(giouring.SqeIOHardlink)
+		} else {
+			sqeFlags |= uint32(giouring.SqeIOLink)
+		}
 	}
 
 	buf := bufferPtr(op.buf)
-	switch op.base() {
+	switch op.kind() {
 	case OpRead:
-		sqe.PrepareRead(fd, buf, uint32(len(op.buf)), uint64(op.offset))
+		if op.isFixed() {
+			sqe.PrepareReadFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
+		} else {
+			sqe.PrepareRead(fd, buf, uint32(len(op.buf)), uint64(op.offset))
+		}
 	case OpWrite:
-		sqe.PrepareWrite(fd, buf, uint32(len(op.buf)), uint64(op.offset))
-	case OpReadFixed:
-		sqe.PrepareReadFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
-	case OpWriteFixed:
-		sqe.PrepareWriteFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
+		if op.isFixed() {
+			sqe.PrepareWriteFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
+		} else {
+			sqe.PrepareWrite(fd, buf, uint32(len(op.buf)), uint64(op.offset))
+		}
 	case OpReadv:
-		if op.iovecs == nil { // user vectored op; coalesced runs are prebuilt
-			op.buildIovecs()
-		}
-		sqe.PrepareReadv(fd, iovecsPtr(op.iovecs), uint32(len(op.iovecs)), uint64(op.offset))
+		sqe.PrepareReadv(fd, iovecsPtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
 	case OpWritev:
-		if op.iovecs == nil {
-			op.buildIovecs()
-		}
-		sqe.PrepareWritev(fd, iovecsPtr(op.iovecs), uint32(len(op.iovecs)), uint64(op.offset))
+		sqe.PrepareWritev(fd, iovecsPtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
 	case OpFsync:
 		sqe.PrepareFsync(fd, 0)
 	case OpFdatasync:
@@ -587,10 +591,9 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op) {
 		// form returns a regular fd in the completion result.
 		sqeFlags &^= uint32(giouring.SqeFixedFile)
 		if op.isVirtual() {
-			// Strip O_SYNC/O_DSYNC: durability for a slot is emulated with a linked
-			// sync per coalesced run (linkDurableSyncs), not per write by the kernel.
-			// completeVOp records the slot's mode from the original op.openFlag.
-			sqe.PrepareOpenatDirect(op.dfd, op.path, stripSyncFlags(op.openFlag), op.mode, uint32(fd))
+			// Durability is per-write (Op.Durable/Op.Sync via linkDurableSyncs), not a
+			// property of the open, so open flags pass through unchanged.
+			sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, uint32(fd))
 		} else {
 			sqe.PrepareOpenat(op.dfd, op.path, op.openFlag, op.mode)
 		}
@@ -621,6 +624,35 @@ func bufferPtr(buf []byte) uintptr {
 	return uintptr(unsafe.Pointer(&buf[0]))
 }
 
+// slotIovecs builds the iovec array for a vectored op into the op's SQE-slot
+// buffer, reusing and growing it. A user vectored op supplies its buffers in
+// op.bufs; a coalesced writev leader (no bufs) supplies them as its own buf plus
+// each follower's, walked via the ticket's group. The result is valid until the
+// slot's CQE, when the slot — and this buffer — is reused.
+func (c *coordinator) slotIovecs(slot int, t *Ticket, op *Op) []syscall.Iovec {
+	iv := c.iovecBufs[slot][:0]
+	if op.bufs != nil {
+		for _, b := range op.bufs {
+			iv = appendIovec(iv, b)
+		}
+	} else {
+		iv = appendIovec(iv, op.buf)
+		for m := t.group; m != nil; m = m.next {
+			iv = appendIovec(iv, m.Op.buf)
+		}
+	}
+	c.iovecBufs[slot] = iv
+	return iv
+}
+
+// appendIovec appends an iovec for b unless b is empty.
+func appendIovec(iv []syscall.Iovec, b []byte) []syscall.Iovec {
+	if len(b) == 0 {
+		return iv
+	}
+	return append(iv, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
+}
+
 func iovecsPtr(iovs []syscall.Iovec) uintptr {
 	if len(iovs) == 0 {
 		return 0
@@ -646,9 +678,9 @@ func (c *coordinator) submit() error {
 	}
 }
 
-func (c *coordinator) reap() *Ticket {
+func (c *coordinator) reap() []*Ticket {
 	var count uint32
-	var ready, readyTail *Ticket
+	var released []*Ticket
 	c.ring.ForEachCQE(func(cqe *giouring.CompletionQueueEvent) {
 		count++
 		slot := int(cqe.GetData64())
@@ -656,11 +688,18 @@ func (c *coordinator) reap() *Ticket {
 		c.releaseSlot(slot)
 
 		c.reapSeq++
-		e.op.Result.seq = c.reapSeq
+		e.op.result.seq = c.reapSeq
 		if cqe.Res < 0 {
-			e.op.Result.Err = syscall.Errno(-cqe.Res)
+			e.op.result.Err = syscall.Errno(-cqe.Res)
 		} else {
-			e.op.Result.N = int(cqe.Res)
+			e.op.result.N = int(cqe.Res)
+		}
+
+		// A completed data op may drain its slot and free a held close; that close
+		// still needs an SQE, so hand it back to the next placement pass. Done
+		// before the group branch so a coalesced leader's ops are counted too.
+		if closeTkt := c.drainDec(e.op); closeTkt != nil {
+			released = append(released, closeTkt)
 		}
 
 		if e.t.group != nil {
@@ -673,55 +712,12 @@ func (c *coordinator) reap() *Ticket {
 			return
 		}
 
-		if unparked := c.completeVOp(e.op); unparked != nil {
-			if ready == nil {
-				ready = unparked
-			} else {
-				readyTail.next = unparked
-			}
-			readyTail = unparked
-			for readyTail.next != nil {
-				readyTail = readyTail.next
-			}
-		}
 		completeTicket(e.t)
 	})
 	if count > 0 {
 		c.ring.CQAdvance(count)
 	}
-	return ready
-}
-
-func (c *coordinator) completeVOp(op *Op) *Ticket {
-	if !op.isVBarrier() || c.sched.VFiles == 0 {
-		return nil
-	}
-
-	index := op.vfd
-	parked := c.takeParked(index)
-
-	if op.base() == OpClose {
-		c.noteSyncMode(index, syncNone) // slot freed
-		c.failTicketList(parked, syscall.EBADF)
-		return nil
-	}
-
-	if op.Result.Err != nil {
-		c.failTicketList(parked, op.Result.Err)
-		return nil
-	}
-
-	c.noteSyncMode(index, openatSyncMode(op.openFlag)) // open succeeded
-	return parked
-}
-
-func (c *coordinator) takeParked(slot uint32) *Ticket {
-	head := c.parkedOps[slot]
-	c.parkedOps[slot] = nil
-	if head == &barrierOp {
-		return nil
-	}
-	return head
+	return released
 }
 
 func (c *coordinator) releaseSlot(slot int) {
@@ -743,8 +739,8 @@ func (c *coordinator) failAllInflight(err error) {
 			failCoalescedWrite(e.t, err)
 			continue
 		}
-		if e.op.Result.Err == nil {
-			e.op.Result.Err = err
+		if e.op.result.Err == nil {
+			e.op.result.Err = err
 		}
 		completeTicket(e.t)
 	}
@@ -760,16 +756,6 @@ func (c *coordinator) failStaged(err error) {
 	}
 }
 
-func (c *coordinator) failParked(err error) {
-	for i, t := range c.parkedOps {
-		c.parkedOps[i] = nil
-		if t == &barrierOp {
-			continue
-		}
-		c.failTicketList(t, err)
-	}
-}
-
 func (c *coordinator) failTicket(t *Ticket, err error) {
 	// failTicket is for tickets not represented by inflight entries. Inflight
 	// SQEs complete through reap or failAllInflight one SQE at a time.
@@ -779,8 +765,8 @@ func (c *coordinator) failTicket(t *Ticket, err error) {
 		return
 	}
 	for op := &t.Op; op != nil; op = op.linked {
-		if op.Result.Err == nil {
-			op.Result.Err = err
+		if op.result.Err == nil {
+			op.result.Err = err
 		}
 	}
 	if n := t.pending.Swap(0); n > 0 {

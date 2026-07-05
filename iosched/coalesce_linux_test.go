@@ -108,9 +108,9 @@ func TestURing_CoalescedShortWrite(t *testing.T) {
 		// The coalesced writev filled exactly one page: the first buffer fully,
 		// the second only up to the seal (96 of 200 bytes).
 		require.NoError(t, ta.Error())
-		require.Equal(t, firstLen, ta.Op.Result.N)
+		require.Equal(t, firstLen, ta.Result().N)
 		require.ErrorIs(t, tb.Error(), io.ErrShortWrite)
-		require.Equal(t, 96, tb.Op.Result.N)
+		require.Equal(t, 96, tb.Result().N)
 		ta.Release()
 		tb.Release()
 		return

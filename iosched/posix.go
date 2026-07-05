@@ -20,8 +20,9 @@ import (
 // under the requested index; subsequent fixed-file ops resolve the fd from the
 // table. This keeps virtual-file consumers portable to non-io_uring hosts (and
 // runnable in tests) — it does not reproduce io_uring's per-op file pinning, so
-// the caller must not close a slot with ops still in flight, the same quiescence
-// contract the uring backend's barrier already implies.
+// the caller must not close a slot with ops still in flight. Sequencing a slot's
+// ops (open before use, close after) is the caller's responsibility on both
+// backends; neither orders them for you (see Scheduler.Submit).
 type POSIXScheduler struct {
 	closed atomic.Bool
 
@@ -53,9 +54,9 @@ func (s *POSIXScheduler) Submit(op Op) (*Ticket, error) {
 			runPOSIXOp(p, p.f)
 		}
 		completeTicket(t)
-		if p.Result.Err != nil && p.isLinked() {
+		if p.result.Err != nil && p.isLinked() {
 			for p = p.linked; p != nil; p = p.linked {
-				p.Result.Err = syscall.ECANCELED
+				p.result.Err = syscall.ECANCELED
 				completeTicket(t)
 			}
 			break
@@ -84,14 +85,14 @@ func (s *POSIXScheduler) Close() error {
 // as regular ones (the lock guards only the table) — this backend must not
 // serialize I/O, or it would mask the races the uring backend exposes.
 func (s *POSIXScheduler) runVirtualOp(op *Op) {
-	switch op.base() {
+	switch op.kind() {
 	case OpOpenat:
 		// op.path is NUL-terminated (VOpenatOp appends it for the uring path);
 		// Openat wants a Go string.
 		name := string(op.path[:len(op.path)-1])
 		fd, err := unix.Openat(op.dfd, name, op.openFlag, op.mode)
 		if err != nil {
-			op.Result.Err = err
+			op.result.Err = err
 			return
 		}
 		s.mu.Lock()
@@ -103,7 +104,7 @@ func (s *POSIXScheduler) runVirtualOp(op *Op) {
 			// double-open is a loud bug, not a silent fd leak.
 			s.mu.Unlock()
 			_ = os.NewFile(uintptr(fd), name).Close()
-			op.Result.Err = syscall.EBADF
+			op.result.Err = syscall.EBADF
 			return
 		}
 		s.vfiles[op.vfd] = os.NewFile(uintptr(fd), name)
@@ -114,16 +115,16 @@ func (s *POSIXScheduler) runVirtualOp(op *Op) {
 		delete(s.vfiles, op.vfd)
 		s.mu.Unlock()
 		if f == nil {
-			op.Result.Err = syscall.EBADF
+			op.result.Err = syscall.EBADF
 			return
 		}
-		op.Result.Err = f.Close()
+		op.result.Err = f.Close()
 	default:
 		// Resolve the descriptor under the lock, but run the I/O outside it.
 		if f := s.vFile(op.vfd); f != nil {
 			runPOSIXOp(op, f)
 		} else {
-			op.Result.Err = syscall.EBADF
+			op.result.Err = syscall.EBADF
 		}
 	}
 }
@@ -138,40 +139,54 @@ func (s *POSIXScheduler) vFile(vfd uint32) *os.File {
 // runPOSIXOp executes a positioned-I/O or sync op against f synchronously. f is
 // op.f for regular ops and the table-resolved descriptor for virtual ops.
 func runPOSIXOp(op *Op, f *os.File) {
-	switch op.base() {
-	case OpRead, OpReadFixed:
+	switch op.kind() {
+	case OpRead:
 		if len(op.buf) == 0 {
 			return
 		}
-		op.Result.N, op.Result.Err = ignoringEINTR(syscall.Pread, int(f.Fd()), op.buf, op.offset)
-	case OpWrite, OpWriteFixed:
+		op.result.N, op.result.Err = ignoringEINTR(syscall.Pread, int(f.Fd()), op.buf, op.offset)
+	case OpWrite:
 		if len(op.buf) == 0 {
 			return
 		}
-		op.Result.N, op.Result.Err = ignoringEINTR(syscall.Pwrite, int(f.Fd()), op.buf, op.offset)
+		op.result.N, op.result.Err = ignoringEINTR(syscall.Pwrite, int(f.Fd()), op.buf, op.offset)
+		posixDurable(op, f)
 	case OpFsync:
-		op.Result.Err = f.Sync()
+		op.result.Err = f.Sync()
 	case OpFdatasync:
-		op.Result.Err = sys.Fdatasync(f)
+		op.result.Err = sys.Fdatasync(f)
 	case OpFallocate:
-		op.Result.Err = sys.Fallocate(f, op.length)
+		op.result.Err = sys.Fallocate(f, op.length)
+	case OpClose:
+		op.result.Err = f.Close()
 	case OpReadv:
-		op.Result.N, op.Result.Err = vectoredPOSIX(syscall.Pread, int(f.Fd()), op.bufs, op.offset)
+		op.result.N, op.result.Err = vectoredPOSIX(syscall.Pread, int(f.Fd()), op.bufs, op.offset)
 	case OpWritev:
-		op.Result.N, op.Result.Err = vectoredPOSIX(syscall.Pwrite, int(f.Fd()), op.bufs, op.offset)
+		op.result.N, op.result.Err = vectoredPOSIX(syscall.Pwrite, int(f.Fd()), op.bufs, op.offset)
+		posixDurable(op, f)
 	case OpOpenat:
 		// Plain openat: open the path and hand the raw fd back in Result.N; the
 		// caller owns it. (The virtual/direct form is handled in runVirtualOp.)
 		name := string(op.path[:len(op.path)-1])
 		fd, err := unix.Openat(op.dfd, name, op.openFlag, op.mode)
 		if err != nil {
-			op.Result.Err = err
+			op.result.Err = err
 			return
 		}
-		op.Result.N = fd
+		op.result.N = fd
 	default:
-		op.Result.Err = fmt.Errorf("iosched: invalid opcode %d", op.opcode)
+		op.result.Err = fmt.Errorf("iosched: invalid opcode %d", op.opcode)
 	}
+}
+
+// posixDurable applies a write's requested post-write sync (Op.Durable/Op.Sync)
+// inline — the POSIX backend has no linked-sync mechanism, so it syncs here after
+// the write completes. It is a no-op if the write errored or wanted no sync.
+func posixDurable(op *Op, f *os.File) {
+	if op.result.Err != nil || !op.durable() {
+		return
+	}
+	op.result.Err = sys.Fdatasync(f)
 }
 
 // ioFn is the signature shared by syscall.Pread and syscall.Pwrite: positioned

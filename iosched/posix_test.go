@@ -56,20 +56,20 @@ func TestPOSIXScheduler(t *testing.T) {
 	require.NoError(t, err)
 
 	ticket := submitAndWait(t, s, iosched.WriteOp(f, payload, 0))
-	require.NoError(t, ticket.Op.Result.Err)
-	require.Equal(t, len(payload), ticket.Op.Result.N)
+	require.NoError(t, ticket.Result().Err)
+	require.Equal(t, len(payload), ticket.Result().N)
 	ticket.Release()
 
 	got := make([]byte, len(payload))
 	ticket = submitAndWait(t, s, iosched.ReadOp(f, got, 0))
-	require.NoError(t, ticket.Op.Result.Err)
-	require.Equal(t, len(got), ticket.Op.Result.N)
+	require.NoError(t, ticket.Result().Err)
+	require.Equal(t, len(got), ticket.Result().N)
 	ticket.Release()
 	require.Equal(t, payload, got)
 
 	ticket = submitAndWait(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
 	require.NoError(t, ticket.Error())
-	require.Equal(t, len(payload), ticket.Op.Result.N)
+	require.Equal(t, len(payload), ticket.Result().N)
 	ticket.Release()
 }
 

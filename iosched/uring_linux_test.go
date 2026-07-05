@@ -83,7 +83,7 @@ func submitResult(t *testing.T, s *iosched.URingScheduler, op iosched.Op) iosche
 	t.Helper()
 	ticket := submitOne(t, s, op)
 	defer ticket.Release()
-	return ticket.Op.Result
+	return ticket.Result()
 }
 
 func linkAll(ops ...iosched.Op) iosched.Op {
@@ -148,7 +148,7 @@ func TestURing_GroupCommit(t *testing.T) {
 
 	for i, ticket := range tickets {
 		ticket.Wait()
-		res := ticket.Op.Result
+		res := ticket.Result()
 		require.NoError(t, res.Err, "chunk %d", i)
 		require.Equal(t, 4096, res.N, "chunk %d", i)
 		ticket.Release()
@@ -174,7 +174,7 @@ func TestURing_LinkedOps_WriteFdatasync(t *testing.T) {
 	ticket := submitOne(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
 	defer ticket.Release()
 	require.NoError(t, ticket.Error())
-	require.Equal(t, 4096, ticket.Op.Result.N)
+	require.Equal(t, 4096, ticket.Result().N)
 }
 
 func TestURing_Concurrent(t *testing.T) {
@@ -205,7 +205,7 @@ func TestURing_Concurrent(t *testing.T) {
 					return
 				}
 				ticket.Wait()
-				res := ticket.Op.Result
+				res := ticket.Result()
 				ticket.Release()
 				if res.Err != nil {
 					errs <- fmt.Errorf("read at %d: %w", offset, res.Err)
@@ -279,7 +279,7 @@ func TestURing_SQPOLL(t *testing.T) {
 	buf := make([]byte, 4096)
 	ticket := submitOne(t, s, iosched.ReadOp(f, buf, 0))
 	defer ticket.Release()
-	require.NoError(t, ticket.Op.Result.Err)
+	require.NoError(t, ticket.Result().Err)
 	require.Equal(t, data, buf)
 }
 
@@ -350,7 +350,7 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 				}
 				ticket.Wait()
 
-				r0 := ticket.Op.Result
+				r0 := ticket.Result()
 				if r0.Err != nil {
 					ticket.Release()
 					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, r0.N, r0.Err)
@@ -387,26 +387,22 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vopen.dat")
 	payload := []byte("virtual file payload")
 
-	openTicket, err := s.Submit(iosched.VOpenatOp(
+	openTicket := submitOne(t, s, iosched.VOpenatOp(
 		unix.AT_FDCWD,
 		path,
 		unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC,
 		0o600,
 		vfd,
 	))
-	require.NoError(t, err)
-
-	writeTicket, err := s.Submit(iosched.VWriteOp(vfd, payload, 0))
-	require.NoError(t, err)
-
-	openTicket.Wait()
-	writeTicket.Wait()
 	defer openTicket.Release()
-	defer writeTicket.Release()
-
 	require.NoError(t, openTicket.Error())
+
+	// The slot is live only once the open has completed; the caller orders the
+	// write after it (here by waiting the open), since the scheduler does not.
+	writeTicket := submitOne(t, s, iosched.VWriteOp(vfd, payload, 0))
+	defer writeTicket.Release()
 	require.NoError(t, writeTicket.Error())
-	require.Equal(t, len(payload), writeTicket.Op.Result.N)
+	require.Equal(t, len(payload), writeTicket.Result().N)
 
 	readBuf := make([]byte, len(payload))
 	readTicket := submitOne(t, s, iosched.VReadOp(vfd, readBuf, 0))
@@ -492,7 +488,7 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 
 	for i, ticket := range tickets {
 		ticket.Wait()
-		require.NoError(t, ticket.Op.Result.Err, "chunk %d write failed", i)
+		require.NoError(t, ticket.Result().Err, "chunk %d write failed", i)
 		slots[i].Release()
 		ticket.Release()
 	}
@@ -546,7 +542,7 @@ func TestURing_Ticket_DeferReleaseAndDoubleRelease(t *testing.T) {
 	defer ticket.Release()
 
 	ticket.Wait()
-	require.NoError(t, ticket.Op.Result.Err)
+	require.NoError(t, ticket.Result().Err)
 	require.Equal(t, data, buf)
 	ticket.Release()
 }
