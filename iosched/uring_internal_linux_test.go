@@ -14,6 +14,7 @@ func TestCoordinatorFailAllInflightCompletesEachLinkedOp(t *testing.T) {
 	c := coordinator{
 		inflight:  make([]inflightEntry, 2),
 		freeSlots: make([]int, 0, 2),
+		iovecBufs: make([][]syscall.Iovec, 2),
 		nInflight: 2,
 	}
 	c.inflight[0] = inflightEntry{t: ticket, op: &ticket.Op, valid: true}
@@ -41,6 +42,7 @@ func TestCoordinatorFailAllInflightCompletesOnlyRemainingLinkedOps(t *testing.T)
 	c := coordinator{
 		inflight:  make([]inflightEntry, 1),
 		freeSlots: make([]int, 0, 1),
+		iovecBufs: make([][]syscall.Iovec, 1),
 		nInflight: 1,
 	}
 	c.inflight[0] = inflightEntry{t: ticket, op: ticket.Op.linked, valid: true}
@@ -132,5 +134,29 @@ func TestSlotIovecs(t *testing.T) {
 	iv := c.slotIovecs(1, leader, &leader.Op)
 	if len(iv) != 3 || iv[0].Len != 4 || iv[1].Len != 6 || iv[2].Len != 2 {
 		t.Fatalf("coalesced iovecs: got %+v want lens [4 6 2]", iv)
+	}
+}
+
+func TestReleaseSlotClearsIovecs(t *testing.T) {
+	c := coordinator{
+		inflight:  make([]inflightEntry, 2),
+		freeSlots: make([]int, 0, 2),
+		iovecBufs: make([][]syscall.Iovec, 2),
+	}
+	// Build a 3-iovec run into slot 0, then release the slot.
+	uv := &Ticket{Op: WritevOp(nil, [][]byte{make([]byte, 4), make([]byte, 6), make([]byte, 8)}, 0)}
+	if iv := c.slotIovecs(0, uv, &uv.Op); len(iv) != 3 {
+		t.Fatalf("slotIovecs len: got %d want 3", len(iv))
+	}
+	c.nInflight = 1
+	c.releaseSlot(0)
+
+	// The backing is retained for reuse, but no Base pointer survives to pin a
+	// buffer.
+	b := c.iovecBufs[0]
+	for i, iv := range b[:cap(b)] {
+		if iv.Base != nil {
+			t.Fatalf("iovec[%d].Base not cleared after releaseSlot", i)
+		}
 	}
 }

@@ -722,6 +722,18 @@ func (c *coordinator) reap() []*Ticket {
 
 func (c *coordinator) releaseSlot(slot int) {
 	c.inflight[slot] = inflightEntry{}
+	// The op is done (its CQE was reaped). c.iovecBufs[slot] is the reused array of
+	// iovec descriptors ({Base *byte, Len}) built for it; each Base points into a
+	// caller buffer. Zeroing the descriptors drops those pointers so a completed
+	// op's buffers aren't pinned for GC — it does not touch the caller's data. The
+	// pointer outlives putTicket zeroing the Op (Base aliases the buffer's array,
+	// not the Op's slice header), which is why we drop it here. Clearing the
+	// written region then truncating leaves the [len:cap] tail nil, so a slot that
+	// next holds a non-vectored op clears nothing. Clear, not nil: nil would drop
+	// the backing and re-allocate on the next vectored op, the reuse this per-slot
+	// buffer exists for.
+	clear(c.iovecBufs[slot])
+	c.iovecBufs[slot] = c.iovecBufs[slot][:0]
 	c.freeSlots = append(c.freeSlots, slot)
 	c.nInflight--
 }
