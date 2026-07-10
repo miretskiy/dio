@@ -17,8 +17,6 @@ import (
 // gets a single sync, not one per follower. It covers both virtual and regular
 // targets — durability is uniform.
 func TestLinkDurableSyncs(t *testing.T) {
-	var c coordinator
-
 	mk := func(op Op) *Ticket {
 		tk := &Ticket{Op: op}
 		tk.pending.Store(1)
@@ -32,7 +30,7 @@ func TestLinkDurableSyncs(t *testing.T) {
 	leader.Op.opcode = OpWritev | opVirtual
 	leader.group = mk(VWriteOp(0, make([]byte, 8), 8))
 
-	c.linkDurableSyncs([]*Ticket{vdata, vplain, regData, leader})
+	linkDurableSyncs([]*Ticket{vdata, vplain, regData, leader})
 
 	require.NotNil(t, vdata.Op.linked)
 	require.Equal(t, OpFdatasync, vdata.Op.linked.kind())

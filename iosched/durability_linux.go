@@ -12,13 +12,18 @@ func (o *Op) syncOp() Op {
 	return FdatasyncOp(o.f)
 }
 
-// linkDurableSyncs appends one linked sync after every batch write that requests
-// durability (Op.Durable or Op.Sync) and does not already carry a linked op. A
-// coalesced run is a single writev whose members' durability flags were merged
-// onto the leader (see coalesceRun), so a whole run costs one sync — the
-// amortization write coalescing buys. The sync is one extra SQE, so the ticket's
-// pending count grows by one.
-func (c *coordinator) linkDurableSyncs(batch []*Ticket) []*Ticket {
+// linkDurableSyncs appends one linked fdatasync after each batch write that asked
+// for durability (Op.Durable) and does not already carry a linked op, so its data
+// reaches stable storage before the ticket completes. The sync is one extra SQE,
+// so the ticket's pending count grows by one.
+//
+// It is deliberately simple. A coalesced run is already a single writev carrying
+// the merged durability flag (see coalesceWrites), so the whole run costs one
+// sync — the amortization coalescing buys. Separate, non-contiguous writes to the
+// same file each get their own sync; we do not try to find same-file writes and
+// fold them under one trailing sync (link them all, then a single fdatasync),
+// which is more complex and unlikely to be faster.
+func linkDurableSyncs(batch []*Ticket) []*Ticket {
 	for _, t := range batch {
 		op := &t.Op
 		if op.linked != nil {

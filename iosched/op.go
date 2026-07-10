@@ -249,9 +249,10 @@ func FallocateOp(f *os.File, size int64) Op {
 }
 
 // VFallocateOp constructs a FallocateOp targeting an io_uring virtual
-// descriptor. Compose it into an open→fallocate→write chain with Op.Link when the
-// file must exist and be sized before its first write; the coordinator imposes no
-// slot ordering of its own (see Scheduler.Submit).
+// descriptor. Compose it into an open→fallocate→write chain with Op.Link to fuse a
+// slab's creation and first write into one submission. Independent later writes to
+// the slot need not be linked: the scheduler orders them after the slot's open (see
+// Scheduler.Submit).
 func VFallocateOp(vfd uint32, size int64) Op {
 	return Op{opcode: OpFallocate | opVirtual, vfd: vfd, length: size}
 }

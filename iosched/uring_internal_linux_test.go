@@ -17,8 +17,8 @@ func TestCoordinatorFailAllInflightCompletesEachLinkedOp(t *testing.T) {
 		iovecBufs: make([][]syscall.Iovec, 2),
 		nInflight: 2,
 	}
-	c.inflight[0] = inflightEntry{t: ticket, op: &ticket.Op, valid: true}
-	c.inflight[1] = inflightEntry{t: ticket, op: ticket.Op.linked, valid: true}
+	c.inflight[0] = inflightEntry{t: ticket, op: &ticket.Op}
+	c.inflight[1] = inflightEntry{t: ticket, op: ticket.Op.linked}
 
 	c.failAllInflight(err)
 	ticket.Wait()
@@ -45,7 +45,7 @@ func TestCoordinatorFailAllInflightCompletesOnlyRemainingLinkedOps(t *testing.T)
 		iovecBufs: make([][]syscall.Iovec, 1),
 		nInflight: 1,
 	}
-	c.inflight[0] = inflightEntry{t: ticket, op: ticket.Op.linked, valid: true}
+	c.inflight[0] = inflightEntry{t: ticket, op: ticket.Op.linked}
 
 	c.failAllInflight(err)
 	ticket.Wait()
@@ -97,20 +97,6 @@ func TestDrainTable(t *testing.T) {
 	}
 	if len(d.sparse) != 0 {
 		t.Fatalf("sparse not emptied: %d entries", len(d.sparse))
-	}
-}
-
-func TestDrainTableRangeHeld(t *testing.T) {
-	d := newDrainTable(4)
-	tA, tB := &Ticket{}, &Ticket{}
-	d.set(0, fdDrain{inflight: 1, close: tA})  // dense, held
-	d.set(50, fdDrain{inflight: 1, close: tB}) // sparse, held
-	d.set(2, fdDrain{inflight: 1})             // in-flight, no close held
-
-	held := map[*Ticket]bool{}
-	d.rangeHeld(func(tk *Ticket) { held[tk] = true })
-	if len(held) != 2 || !held[tA] || !held[tB] {
-		t.Fatalf("rangeHeld: got %v want {tA, tB}", held)
 	}
 }
 

@@ -19,10 +19,12 @@ import (
 // with a userspace descriptor table: VOpenat opens a real fd and records it
 // under the requested index; subsequent fixed-file ops resolve the fd from the
 // table. This keeps virtual-file consumers portable to non-io_uring hosts (and
-// runnable in tests) — it does not reproduce io_uring's per-op file pinning, so
-// the caller must not close a slot with ops still in flight. Sequencing a slot's
-// ops (open before use, close after) is the caller's responsibility on both
-// backends; neither orders them for you (see Scheduler.Submit).
+// runnable in tests). Because each op runs synchronously to completion before
+// Submit returns, the scheduler's ordering guarantees hold here for free: a close
+// submitted after a slot's writes runs after them (use-before-close), matching
+// the uring backend's close-drain, with no per-op pinning needed. Open-before-use
+// and reopen-after-close ordering is still the caller's on both backends (see
+// Scheduler.Submit).
 type POSIXScheduler struct {
 	closed atomic.Bool
 

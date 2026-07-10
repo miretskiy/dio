@@ -8,31 +8,32 @@ import (
 	"github.com/miretskiy/dio/internal/buildutil"
 )
 
-// The close-drain makes a close wait for its file's in-flight ops to complete
-// before it runs. io_uring won't order a close after already-submitted writes
-// (it resolves an async op's fixed file at issue, not submission, so a close can
-// clear the file out from under a queued write — verified on Linux). Rather than
-// push a completion-join onto every caller, the coordinator tracks in-flight ops
-// per file and holds a close until the file quiesces.
+// The close-drain makes a close wait for its file's in-flight data ops to
+// complete before it runs. io_uring won't order a close after already-submitted
+// writes (it resolves an async op's fixed file at issue, not submission, so a
+// close can clear the file out from under a queued write — verified on Linux).
+// Rather than push a completion-join onto every caller, the coordinator counts
+// in-flight data ops per file; a close whose file is not yet quiescent simply
+// stays in c.pending (closeBlocked) and is retried each round until reap drains
+// the count to zero. The pending buffer is the wait list — no separate held-close
+// slot is needed.
 //
 // Virtual slots and regular descriptors share one integer key space — a slot is
 // its index, a regular fd is VFiles+fd — so the drain is written once, keyed,
 // with the virtual/regular distinction confined to drainKey. State is stored
 // densely for keys near zero (all slots, low fds) and in a lazily-allocated map
-// for the sparse tail; only files with in-flight ops or a pending close hold an
-// entry, so both are bounded by in-flight concurrency (≤ ring depth), not by the
-// number of files ever touched.
+// for the sparse tail; only files with in-flight ops hold an entry, so the table
+// is bounded by in-flight concurrency (≤ ring depth), not by the number of files
+// ever touched.
 
 // drainDenseMargin sizes the dense region past the slot range, so regular fds up
 // to this many get array (not map) storage.
 const drainDenseMargin = 1024
 
-// fdDrain tracks one file: inflight counts placed-but-unreaped data ops (the ops
-// a close must wait for), and close is a close held until they drain. The zero
-// value means "not tracked".
+// fdDrain tracks one file: inflight counts its placed-but-unreaped data ops — the
+// ops a close on that file must wait for. The zero value means "not tracked".
 type fdDrain struct {
 	inflight int32
-	close    *Ticket
 }
 
 // drainTable maps a unified file key to its fdDrain: a dense slice for keys in
@@ -72,28 +73,13 @@ func (d *drainTable) set(key int, v fdDrain) {
 	d.sparse[key] = v
 }
 
-// rangeHeld calls fn for every held close (used at shutdown).
-func (d *drainTable) rangeHeld(fn func(*Ticket)) {
-	for i := range d.dense {
-		if c := d.dense[i].close; c != nil {
-			fn(c)
-		}
-	}
-	for _, v := range d.sparse {
-		if v.close != nil {
-			fn(v.close)
-		}
-	}
-}
-
 // drainKey maps an op to its unified file key: a virtual op's slot index, or
-// VFiles+fd for a regular op. This is the only virtual/regular branch in the
-// drain.
+// VFiles+fd for a regular op, so virtual slots and regular fds never collide.
 func (c *coordinator) drainKey(op *Op) int {
 	if op.isVirtual() {
-		return int(op.vfd)
+		return op.fd()
 	}
-	return int(c.sched.VFiles) + int(op.f.Fd())
+	return int(c.sched.VFiles) + op.fd()
 }
 
 // drainDataOp reports whether op counts toward its file's drain — any op that
@@ -119,10 +105,11 @@ func (c *coordinator) drainInc(op *Op) {
 }
 
 // drainDec records a completed data op. When its file reaches zero in-flight ops
-// the entry is dropped and any close waiting on it is returned to be placed.
-func (c *coordinator) drainDec(op *Op) *Ticket {
+// the entry is dropped; a close deferred on it in c.pending then places on the
+// next round (see closeBlocked).
+func (c *coordinator) drainDec(op *Op) {
 	if !drainDataOp(op) {
-		return nil
+		return
 	}
 	key := c.drainKey(op)
 	e := c.drain.get(key)
@@ -131,41 +118,15 @@ func (c *coordinator) drainDec(op *Op) *Ticket {
 	// otherwise underflow to -1 silently and mis-time a close.
 	if err := buildutil.Assert(e.inflight > 0); err != nil {
 		c.sched.stop(fmt.Errorf("iosched: drain underflow for key %d: %w", key, err))
-		return nil
+		return
 	}
 	e.inflight--
-	if e.inflight > 0 {
-		c.drain.set(key, e)
-		return nil
-	}
-	held := e.close
-	c.drain.set(key, fdDrain{}) // quiescent: forget it
-	return held
+	c.drain.set(key, e) // set drops the entry when e reaches the zero value
 }
 
-// isDrainClose reports whether t is a close the drain governs. Both virtual and
-// regular closes qualify.
-func (c *coordinator) isDrainClose(t *Ticket) bool {
-	return t.Op.kind() == OpClose
-}
-
-// holdClose defers t as its file's pending close if the file still has in-flight
-// ops, returning true; it returns false if the file is quiescent and the close
-// may be placed now. A file has one open→close lifecycle at a time, so at most
-// one close is ever held on it.
-func (c *coordinator) holdClose(t *Ticket) bool {
-	key := c.drainKey(&t.Op)
-	e := c.drain.get(key)
-	if e.inflight == 0 {
-		return false
-	}
-	e.close = t
-	c.drain.set(key, e)
-	return true
-}
-
-// failDrainHeld fails every close still held at shutdown so no caller waits
-// forever.
-func (c *coordinator) failDrainHeld(err error) {
-	c.drain.rangeHeld(func(t *Ticket) { c.failTicket(t, err) })
+// closeBlocked reports whether the close ticket t must wait: its file still has
+// in-flight data ops the close-drain holds it behind. A blocked close stays in
+// c.pending and is retried; reap drains the count and unblocks it.
+func (c *coordinator) closeBlocked(t *Ticket) bool {
+	return c.drain.get(c.drainKey(&t.Op)).inflight > 0
 }

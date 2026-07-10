@@ -1,17 +1,14 @@
 package iosched
 
 import (
-	"cmp"
 	"io"
-	"slices"
-	"unsafe"
 )
 
 // coalescibleWrite reports whether o may be merged into a writev: a standalone
 // (unlinked) plain positioned write. Fixed-buffer, linked, read, sync, openat,
 // and close ops are never coalesced.
 func (o *Op) coalescibleWrite() bool {
-	return o.kind() == OpWrite && !o.isFixed() && o.linked == nil && o.sqeFlags&sqeLink == 0
+	return o.kind() == OpWrite && !o.isFixed() && !o.isLinked()
 }
 
 // sameWriteTarget reports whether two writes address the same file: the same
@@ -27,84 +24,54 @@ func sameWriteTarget(a, b *Op) bool {
 	return a.f == b.f
 }
 
-// targetOrd is a stable value used only to cluster same-target writes adjacently
-// before the linear run scan; identity is always decided by sameWriteTarget, not
-// this. The sort separates regular from virtual first, so the two uintptr spaces
-// never mix.
-func targetOrd(o *Op) uintptr {
-	if o.isVirtual() {
-		return uintptr(o.vfd)
-	}
-	return uintptr(unsafe.Pointer(o.f))
-}
-
-// groupCoalescibleWrites reorders cands by target then offset and merges maximal
-// contiguous same-file runs (offset[i] == offset[i-1] + len(buf[i-1])). Each
-// merged run's lowest-offset ticket becomes the leader: its op is rewritten to a
-// writev over the run's buffers and the other tickets are attached as
-// leader.group. It returns the tickets to place — leaders and un-merged
-// singletons; merged followers are not returned, since the leader's completion
-// fans out to them. cands is scratch; the returned slice aliases its backing.
-func groupCoalescibleWrites(cands []*Ticket) []*Ticket {
-	slices.SortFunc(cands, func(a, b *Ticket) int {
-		oa, ob := &a.Op, &b.Op
-		if av, bv := oa.isVirtual(), ob.isVirtual(); av != bv {
-			if av {
-				return 1 // regular before virtual
+// coalesceWrites merges runs of contiguous same-file plain writes in the batch
+// into single writev leaders, in place, and returns the compacted prefix. It is
+// one forward pass: a write extends the current run when it targets the same file
+// at the run's next offset (offset == prior end), otherwise it starts a new run;
+// any non-coalescible op ends the run. A merged follower leaves the batch — its
+// bytes fold into the leader, whose one completion fans out to the whole group
+// (see completeCoalescedGroup) — while leaders and singletons stay in submission
+// order.
+//
+// It deliberately does no sorting or same-file lookahead: two writes to one file
+// separated in the batch by another op simply don't coalesce. Missing a merge
+// only costs an extra SQE, never correctness, and the caller submitting writes it
+// wants merged in contiguous order is the common case.
+func coalesceWrites(batch []*Ticket) []*Ticket {
+	w := 0                    // compaction write cursor
+	var leader, tail *Ticket  // current run; leader == nil means no open run
+	var runEnd int64          // file offset just past the run's last byte
+	for _, t := range batch {
+		op := &t.Op
+		if leader != nil && op.coalescibleWrite() &&
+			sameWriteTarget(&leader.Op, op) && op.offset == runEnd {
+			// Fold t into the run. On the first follower, promote the leader from a
+			// plain write to a writev; its iovecs are built at placement from the
+			// leader's own buf plus each follower's (see slotIovecs), and the leader
+			// keeps its Op.buf so its own byte count stays len(Op.buf).
+			if leader.group == nil {
+				leader.Op.opcode = OpWritev | (leader.Op.opcode & opVirtual)
+				leader.group = t
+			} else {
+				tail.next = t
 			}
-			return -1
+			t.next = nil
+			tail = t
+			leader.Op.opFlags |= op.opFlags & opDurable // run is durable if any member is
+			runEnd += int64(len(op.buf))
+			continue
 		}
-		if c := cmp.Compare(targetOrd(oa), targetOrd(ob)); c != 0 {
-			return c
-		}
-		return cmp.Compare(oa.offset, ob.offset)
-	})
-
-	out := cands[:0]
-	for i := 0; i < len(cands); {
-		hi := cands[i].Op.offset + int64(len(cands[i].Op.buf))
-		j := i + 1
-		for j < len(cands) &&
-			sameWriteTarget(&cands[i].Op, &cands[j].Op) &&
-			cands[j].Op.offset == hi {
-			hi += int64(len(cands[j].Op.buf))
-			j++
-		}
-		if j-i >= 2 {
-			coalesceRun(cands[i:j])
-		}
-		out = append(out, cands[i]) // leader (or lone singleton)
-		i = j
-	}
-	return out
-}
-
-// coalesceRun rewrites run[0] into a writev over every member's buffer and chains
-// run[1:] onto it as its group. run is in ascending, contiguous offset order, so
-// run[0] carries the run's base offset. The leader keeps its original Op.buf, so
-// its own byte count is still len(Op.buf) at completion.
-func coalesceRun(run []*Ticket) {
-	leader := run[0]
-	for _, m := range run {
-		// A run is durable if any member is: the merged writev gets one sync,
-		// covering every member (an extra sync on a non-durable member is harmless).
-		leader.Op.opFlags |= m.Op.opFlags & opDurable
-	}
-	// The leader becomes a writev; its iovecs are built at placement from the
-	// leader's own buf plus each follower's (walking the group). The leader keeps
-	// its own Op.buf, so its byte count at completion is still len(Op.buf).
-	leader.Op.opcode = OpWritev | (leader.Op.opcode & opVirtual)
-
-	var tail *Ticket
-	for _, f := range run[1:] {
-		f.next = nil
-		if tail == nil {
-			leader.group = f
+		// t is not folded: it starts a new run if it's a coalescible write, else it
+		// breaks the run. Either way it stays in the batch.
+		if op.coalescibleWrite() {
+			leader, tail, runEnd = t, nil, op.offset+int64(len(op.buf))
 		} else {
-			tail.next = f
+			leader = nil
 		}
-		tail = f
+		batch[w] = t
+		w++
 	}
+	return batch[:w]
 }
 
 // completeCoalescedGroup fans a finished coalesced leader's result out to its

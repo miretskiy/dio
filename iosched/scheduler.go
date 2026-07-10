@@ -31,17 +31,22 @@ type Scheduler interface {
 	//   - A linked chain (Op.Link) executes in order — each op starts only after
 	//     the previous one completed — and a failure short-circuits the rest with
 	//     ECANCELED.
+	//   - use-before-close: a close does not run until its file's in-flight data
+	//     ops complete. The scheduler holds the close (both virtual slots and
+	//     regular descriptors) until the file quiesces, so a close submitted right
+	//     behind writes will not clear the file out from under them. You need not
+	//     await the writes before closing.
 	//
 	// NOT guaranteed:
 	//   - Any ordering between separate Submits. Independent ops — even to the
 	//     same file or offset — may execute and complete in any order and
 	//     concurrently. Submit order is not execution order.
-	//   - Any implicit sequencing of virtual-file lifecycle ops. An open does not
-	//     hold back later writes to its slot, a close does not wait for the slot's
-	//     other ops, and a reopen is not ordered after a prior close. The
-	//     scheduler places what it is given.
+	//   - Open-before-use, and reopen-after-close, are not yet sequenced by the
+	//     scheduler: an open does not hold back later writes to its slot, and a
+	//     reopen is not ordered after a prior close. Sequence those with Wait or
+	//     Op.Link (see below).
 	//
-	// If you need ordering, encode it — the scheduler will not reconstruct it:
+	// If you need ordering the scheduler does not give, encode it:
 	//   - Wait: submit the prerequisite, Ticket.Wait for it, then submit the
 	//     dependents. Simplest, and right when the prerequisite is rare (open a
 	//     file once, then stream many writes to it).
@@ -52,14 +57,11 @@ type Scheduler interface {
 	//     be "ordered before" one op without serializing them; use Wait (or a
 	//     caller-side join) for that.
 	//
-	// On virtual files specifically: a slot's ops must not race its open or close.
-	// The kernel resolves an async op's fixed file when it issues the op, not at
-	// submission, so a write must not be submitted before its open has completed,
-	// every write must have completed before the slot is closed, and a reopen must
-	// follow the prior close. A close concurrent with the slot's in-flight ops can
-	// clear the slot out from under them and fail them with EBADF. Order all of it
-	// with Wait — await the open, and await the writes' completion before closing;
-	// the scheduler does not.
+	// On virtual files specifically: the kernel resolves an async op's fixed file
+	// when it issues the op, not at submission, so a write must not be submitted
+	// before its open has completed, and a reopen must follow the prior close.
+	// (Closing is handled for you by use-before-close above.) Order the open and
+	// reopen with Wait or Op.Link.
 	//
 	// Submit implements no backpressure: it is a non-blocking handoff onto a
 	// lock-free staging queue. Callers that need admission control wrap the

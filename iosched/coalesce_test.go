@@ -17,24 +17,35 @@ func groupLen(leader *Ticket) int {
 	return n
 }
 
-func TestGroupCoalescibleWrites(t *testing.T) {
+func TestCoalesceWrites(t *testing.T) {
 	fa := os.NewFile(100, "a")
 	fb := os.NewFile(101, "b")
 	w := func(f *os.File, off int64, n int) *Ticket { return &Ticket{Op: WriteOp(f, make([]byte, n), off)} }
 	vw := func(vfd uint32, off int64, n int) *Ticket { return &Ticket{Op: VWriteOp(vfd, make([]byte, n), off)} }
+	rd := func(f *os.File, off int64, n int) *Ticket { return &Ticket{Op: ReadOp(f, make([]byte, n), off)} }
 
-	t.Run("contiguous merges into one writev leader", func(t *testing.T) {
-		// Deliberately unordered input; grouping sorts by offset.
-		out := groupCoalescibleWrites([]*Ticket{w(fa, 10, 2), w(fa, 0, 4), w(fa, 4, 6)})
+	t.Run("contiguous in submission order merges into one writev leader", func(t *testing.T) {
+		out := coalesceWrites([]*Ticket{w(fa, 0, 4), w(fa, 4, 6), w(fa, 10, 2)})
 		require.Len(t, out, 1)
 		leader := out[0]
 		require.Equal(t, OpWritev, leader.Op.kind())
-		require.Equal(t, int64(0), leader.Op.offset) // lowest offset is the leader
+		require.Equal(t, int64(0), leader.Op.offset) // first write is the leader
 		require.Equal(t, 3, groupLen(leader))
 	})
 
-	t.Run("gap splits into two runs", func(t *testing.T) {
-		out := groupCoalescibleWrites([]*Ticket{w(fa, 0, 4), w(fa, 100, 4)})
+	t.Run("out-of-order input coalesces only adjacent-contiguous (no sort)", func(t *testing.T) {
+		// w(10,2) can't extend nothing; w(0,4) starts a run; w(4,6) extends it. So we
+		// get a singleton plus a 2-member run, not one big writev — the merge we
+		// deliberately skip by not sorting.
+		out := coalesceWrites([]*Ticket{w(fa, 10, 2), w(fa, 0, 4), w(fa, 4, 6)})
+		require.Len(t, out, 2)
+		require.Equal(t, OpWrite, out[0].Op.kind()) // w(10,2) singleton
+		require.Equal(t, OpWritev, out[1].Op.kind())
+		require.Equal(t, 2, groupLen(out[1]))
+	})
+
+	t.Run("gap splits into two singletons", func(t *testing.T) {
+		out := coalesceWrites([]*Ticket{w(fa, 0, 4), w(fa, 100, 4)})
 		require.Len(t, out, 2)
 		for _, l := range out {
 			require.Equal(t, OpWrite, l.Op.kind()) // untouched singletons
@@ -43,33 +54,36 @@ func TestGroupCoalescibleWrites(t *testing.T) {
 	})
 
 	t.Run("overlap does not merge", func(t *testing.T) {
-		out := groupCoalescibleWrites([]*Ticket{w(fa, 0, 4), w(fa, 0, 4)})
+		out := coalesceWrites([]*Ticket{w(fa, 0, 4), w(fa, 0, 4)})
 		require.Len(t, out, 2)
 	})
 
-	t.Run("different files stay separate", func(t *testing.T) {
-		out := groupCoalescibleWrites([]*Ticket{w(fa, 0, 4), w(fb, 0, 4), w(fa, 4, 4)})
-		require.Len(t, out, 2) // fa[0,4] merged; fb[0] singleton
-		var merged, single int
+	t.Run("same file separated by another target does not coalesce", func(t *testing.T) {
+		// fa[0,4] and fa[4,4] are contiguous but the fb write between them breaks the
+		// run; without a sort we accept the missed merge. All three pass through.
+		out := coalesceWrites([]*Ticket{w(fa, 0, 4), w(fb, 0, 4), w(fa, 4, 4)})
+		require.Len(t, out, 3)
 		for _, l := range out {
-			if l.Op.kind() == OpWritev {
-				merged++
-				require.Equal(t, 2, groupLen(l))
-			} else {
-				single++
-			}
+			require.Equal(t, OpWrite, l.Op.kind())
+			require.Nil(t, l.group)
 		}
-		require.Equal(t, 1, merged)
-		require.Equal(t, 1, single)
+	})
+
+	t.Run("non-coalescible op breaks the run", func(t *testing.T) {
+		out := coalesceWrites([]*Ticket{w(fa, 0, 4), rd(fa, 4, 4), w(fa, 4, 4)})
+		require.Len(t, out, 3) // write, read, write — the read splits the two writes
+		require.Equal(t, OpWrite, out[0].Op.kind())
+		require.Equal(t, OpRead, out[1].Op.kind())
+		require.Equal(t, OpWrite, out[2].Op.kind())
 	})
 
 	t.Run("regular and virtual never merge", func(t *testing.T) {
-		out := groupCoalescibleWrites([]*Ticket{vw(0, 0, 4), w(fa, 0, 4)})
+		out := coalesceWrites([]*Ticket{vw(0, 0, 4), w(fa, 0, 4)})
 		require.Len(t, out, 2)
 	})
 
 	t.Run("virtual contiguous merges", func(t *testing.T) {
-		out := groupCoalescibleWrites([]*Ticket{vw(1, 0, 4), vw(1, 4, 4)})
+		out := coalesceWrites([]*Ticket{vw(1, 0, 4), vw(1, 4, 4)})
 		require.Len(t, out, 1)
 		require.Equal(t, OpWritev, out[0].Op.kind())
 		require.True(t, out[0].Op.isVirtual()) // virtual bit preserved
