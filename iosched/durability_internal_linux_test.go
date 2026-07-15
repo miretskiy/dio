@@ -3,6 +3,7 @@
 package iosched
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,45 +12,33 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestLinkDurableSyncs checks the link is set up from each write's durability
-// flag: a Durable write gets one linked fdatasync with pending grown by one; a
-// plain write is untouched; a coalesced writev leader carrying the durable flag
-// gets a single sync, not one per follower. It covers both virtual and regular
-// targets — durability is uniform.
-func TestLinkDurableSyncs(t *testing.T) {
-	mk := func(op Op) *Ticket {
-		tk := &Ticket{Op: op}
-		tk.pending.Store(1)
-		return tk
+func TestDurableWrite(t *testing.T) {
+	regular := os.NewFile(100, "regular")
+	durable := func(ops ...Op) bool {
+		c := newTestCoordinator(8, 1, &fakeRingQueue{})
+		_, handles := acceptOps(&c, ops...)
+		got := c.durableWrite(handles)
+		c.stopping = true
+		c.failAllWork(errors.New("test cleanup"))
+		return got
 	}
-	vdata := mk(VWriteOp(0, make([]byte, 8), 0).Durable())
-	vplain := mk(VWriteOp(2, make([]byte, 8), 0))
-	regData := mk(WriteOp(os.NewFile(100, "r"), make([]byte, 8), 0).Durable())
-	// A coalesced writev leader carrying the durable flag, with one follower.
-	leader := mk(VWriteOp(0, make([]byte, 8), 0).Durable())
-	leader.Op.opcode = OpWritev | opVirtual
-	leader.group = mk(VWriteOp(0, make([]byte, 8), 8))
+	require.True(t, durable(VWriteOp(0, make([]byte, 8), 0).Durable()))
+	require.False(t, durable(VWriteOp(0, make([]byte, 8), 0)))
+	require.True(t, durable(WriteOp(regular, make([]byte, 8), 0).Durable()))
+	require.True(t, durable(
+		VWriteOp(0, make([]byte, 8), 0),
+		VWriteOp(0, make([]byte, 8), 8).Durable(),
+	))
+	require.False(t, durable(VReadOp(0, make([]byte, 8), 0)))
 
-	linkDurableSyncs([]*Ticket{vdata, vplain, regData, leader})
+	virtual := VWriteOp(3, nil, 0).syncOp()
+	require.Equal(t, OpFdatasync, virtual.kind())
+	require.True(t, virtual.isVirtual())
+	require.Equal(t, uint32(3), virtual.vfd)
 
-	require.NotNil(t, vdata.Op.linked)
-	require.Equal(t, OpFdatasync, vdata.Op.linked.kind())
-	require.True(t, vdata.Op.isLinked())
-	require.Equal(t, int32(2), vdata.pending.Load())
-
-	require.Nil(t, vplain.Op.linked)
-	require.Equal(t, int32(1), vplain.pending.Load())
-
-	// Regular files get durability too now (uniform, per-op — not vfile-only).
-	require.NotNil(t, regData.Op.linked)
-	require.Equal(t, OpFdatasync, regData.Op.linked.kind())
-	require.Equal(t, int32(2), regData.pending.Load())
-
-	// Amortization: the whole coalesced run gets one sync, not one per member.
-	require.NotNil(t, leader.Op.linked)
-	require.Equal(t, OpFdatasync, leader.Op.linked.kind())
-	require.Equal(t, int32(2), leader.pending.Load())
-	require.Nil(t, leader.group.Op.linked)
+	regSync := WriteOp(regular, nil, 0).syncOp()
+	require.Equal(t, OpFdatasync, regSync.kind())
+	require.Same(t, regular, regSync.f)
 }
 
 func newDurabilitySched(t *testing.T) *URingScheduler {
@@ -65,11 +54,7 @@ func newDurabilitySched(t *testing.T) *URingScheduler {
 	return s
 }
 
-// TestURingDurableSyncOrder observes the completion order end-to-end: a Durable
-// write succeeds, and the linked fdatasync's CQE is reaped after the write's
-// (write.seq < fdatasync.seq). That ordering only holds if the sync is chained
-// behind the write, which is exactly the durability guarantee.
-func TestURingDurableSyncOrder(t *testing.T) {
+func TestURingDurableWriteUsesLinkedSync(t *testing.T) {
 	s := newDurabilitySched(t)
 	path := filepath.Join(t.TempDir(), "durable.dat")
 
@@ -77,22 +62,31 @@ func TestURingDurableSyncOrder(t *testing.T) {
 	require.NoError(t, err)
 	open.Wait()
 	require.NoError(t, open.Error())
-	open.Release()
 
+	before := s.Stats().OpsPlaced
 	w, err := s.Submit(VWriteOp(0, []byte("durable payload"), 0).Durable())
 	require.NoError(t, err)
 	w.Wait()
 	require.NoError(t, w.Error())
-
-	require.NotNil(t, w.Op.linked)
-	require.Equal(t, OpFdatasync, w.Op.linked.kind())
-	require.NotZero(t, w.Op.result.seq)
-	require.NotZero(t, w.Op.linked.result.seq)
-	require.Less(t, w.Op.result.seq, w.Op.linked.result.seq, "write must complete before its linked fdatasync")
-	w.Release()
+	require.Equal(t, uint64(2), s.Stats().OpsPlaced-before, "write plus linked fdatasync")
 
 	cl, err := s.Submit(VCloseOp(0))
 	require.NoError(t, err)
 	cl.Wait()
-	cl.Release()
+}
+
+func TestURingLinkedOpenChain(t *testing.T) {
+	s := newDurabilitySched(t)
+	path := filepath.Join(t.TempDir(), "linked-open.dat")
+	op := VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, 1).
+		Link(VFallocateOp(1, 4096), VWriteOp(1, []byte("payload"), 0))
+	ticket, err := s.Submit(op)
+	require.NoError(t, err)
+	ticket.Wait()
+	require.NoErrorf(t, ticket.Error(), "root count %d", ticket.N())
+
+	closeTicket, err := s.Submit(VCloseOp(1))
+	require.NoError(t, err)
+	closeTicket.Wait()
+	require.NoError(t, closeTicket.Error())
 }

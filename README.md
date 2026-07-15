@@ -250,7 +250,6 @@ ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
 if err != nil {
     return err
 }
-defer ticket.Release()
 ticket.Wait()
 if err := ticket.Error(); err != nil {
     return err
@@ -292,12 +291,11 @@ ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
 if err != nil {
     return err
 }
-defer ticket.Release()
 ticket.Wait()
 if err := ticket.Error(); err != nil {
     return err
 }
-n := ticket.Op.Result.N
+n := ticket.N()
 ```
 
 `Submit` does not implement application-level backpressure. It is a

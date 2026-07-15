@@ -29,7 +29,7 @@ func openRWFile(t *testing.T, path string) *os.File {
 	return f
 }
 
-func submitAndWait(t *testing.T, s iosched.Scheduler, op iosched.Op) *iosched.Ticket {
+func submitAndWait(t *testing.T, s iosched.Scheduler, op iosched.Op) iosched.Ticket {
 	t.Helper()
 	ticket, err := s.Submit(op)
 	require.NoError(t, err)
@@ -56,21 +56,18 @@ func TestPOSIXScheduler(t *testing.T) {
 	require.NoError(t, err)
 
 	ticket := submitAndWait(t, s, iosched.WriteOp(f, payload, 0))
-	require.NoError(t, ticket.Result().Err)
-	require.Equal(t, len(payload), ticket.Result().N)
-	ticket.Release()
+	require.NoError(t, ticket.Error())
+	require.Equal(t, len(payload), ticket.N())
 
 	got := make([]byte, len(payload))
 	ticket = submitAndWait(t, s, iosched.ReadOp(f, got, 0))
-	require.NoError(t, ticket.Result().Err)
-	require.Equal(t, len(got), ticket.Result().N)
-	ticket.Release()
+	require.NoError(t, ticket.Error())
+	require.Equal(t, len(got), ticket.N())
 	require.Equal(t, payload, got)
 
 	ticket = submitAndWait(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
 	require.NoError(t, ticket.Error())
-	require.Equal(t, len(payload), ticket.Result().N)
-	ticket.Release()
+	require.Equal(t, len(payload), ticket.N())
 }
 
 func TestPOSIXSchedulerErrors(t *testing.T) {

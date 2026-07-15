@@ -30,7 +30,7 @@ func TestURing_WriteCoalescing(t *testing.T) {
 	const n = 128
 	const chunk = 64
 	want := make([]byte, n*chunk)
-	tickets := make([]*iosched.Ticket, n)
+	tickets := make([]iosched.Ticket, n)
 	for i := range n {
 		buf := bytes.Repeat([]byte{byte(i)}, chunk)
 		copy(want[i*chunk:], buf)
@@ -41,14 +41,13 @@ func TestURing_WriteCoalescing(t *testing.T) {
 	for _, tk := range tickets {
 		tk.Wait()
 		require.NoError(t, tk.Error())
-		tk.Release()
 	}
 
 	placed := int(s.Stats().OpsPlaced) // writes only; the verify read runs after
 	require.Less(t, placed, n, "expected write coalescing to place fewer SQEs than writes")
 
 	got := make([]byte, len(want))
-	require.Equal(t, len(want), runOp(t, s, iosched.ReadOp(f, got, 0)).N)
+	require.Equal(t, len(want), runOp(t, s, iosched.ReadOp(f, got, 0)))
 	require.Equal(t, want, got)
 }
 
@@ -100,19 +99,15 @@ func TestURing_CoalescedShortWrite(t *testing.T) {
 		tb.Wait()
 
 		if s.Stats().OpsPlaced-before != 1 { // not one writev; didn't coalesce, retry
-			ta.Release()
-			tb.Release()
 			continue
 		}
 
 		// The coalesced writev filled exactly one page: the first buffer fully,
 		// the second only up to the seal (96 of 200 bytes).
 		require.NoError(t, ta.Error())
-		require.Equal(t, firstLen, ta.Result().N)
+		require.Equal(t, firstLen, ta.N())
 		require.ErrorIs(t, tb.Error(), io.ErrShortWrite)
-		require.Equal(t, 96, tb.Result().N)
-		ta.Release()
-		tb.Release()
+		require.Equal(t, 96, tb.N())
 		return
 	}
 }
@@ -155,7 +150,7 @@ func benchWriteCoalescing(b *testing.B, disable bool) {
 		}
 		defer f.Close()
 		buf := make([]byte, chunk)
-		tickets := make([]*iosched.Ticket, batch)
+		tickets := make([]iosched.Ticket, batch)
 		for pb.Next() {
 			for i := range batch {
 				tk, err := s.Submit(iosched.WriteOp(f, buf, int64(i*chunk)))
@@ -170,7 +165,6 @@ func benchWriteCoalescing(b *testing.B, disable bool) {
 				if err := tk.Error(); err != nil {
 					b.Error(err)
 				}
-				tk.Release()
 			}
 		}
 	})

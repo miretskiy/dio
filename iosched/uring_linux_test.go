@@ -71,19 +71,12 @@ func openRW(t *testing.T, path string) *os.File {
 	return f
 }
 
-func submitOne(t *testing.T, s *iosched.URingScheduler, op iosched.Op) *iosched.Ticket {
+func submitOne(t *testing.T, s *iosched.URingScheduler, op iosched.Op) iosched.Ticket {
 	t.Helper()
 	ticket, err := s.Submit(op)
 	require.NoError(t, err)
 	ticket.Wait()
 	return ticket
-}
-
-func submitResult(t *testing.T, s *iosched.URingScheduler, op iosched.Op) iosched.Result {
-	t.Helper()
-	ticket := submitOne(t, s, op)
-	defer ticket.Release()
-	return ticket.Result()
 }
 
 func linkAll(ops ...iosched.Op) iosched.Op {
@@ -103,9 +96,9 @@ func TestURing_Submit_Read(t *testing.T) {
 	f := openRW(t, path)
 
 	buf := make([]byte, 4096)
-	res := submitResult(t, s, iosched.ReadOp(f, buf, 0))
-	require.NoError(t, res.Err)
-	require.Equal(t, 4096, res.N)
+	ticket := submitOne(t, s, iosched.ReadOp(f, buf, 0))
+	require.NoError(t, ticket.Error())
+	require.Equal(t, 4096, ticket.N())
 	require.Equal(t, data, buf)
 }
 
@@ -118,13 +111,13 @@ func TestURing_Submit_Write(t *testing.T) {
 	payload := make([]byte, 4096)
 	_, _ = rand.Read(payload)
 
-	res := submitResult(t, s, iosched.WriteOp(f, payload, 0))
-	require.NoError(t, res.Err)
-	require.Equal(t, 4096, res.N)
+	ticket := submitOne(t, s, iosched.WriteOp(f, payload, 0))
+	require.NoError(t, ticket.Error())
+	require.Equal(t, 4096, ticket.N())
 
 	got := make([]byte, 4096)
-	res = submitResult(t, s, iosched.ReadOp(f, got, 0))
-	require.NoError(t, res.Err)
+	ticket = submitOne(t, s, iosched.ReadOp(f, got, 0))
+	require.NoError(t, ticket.Error())
 	require.Equal(t, payload, got)
 }
 
@@ -137,7 +130,7 @@ func TestURing_GroupCommit(t *testing.T) {
 	f := openRW(t, path)
 
 	payloads := make([][]byte, chunks)
-	tickets := make([]*iosched.Ticket, chunks)
+	tickets := make([]iosched.Ticket, chunks)
 	for i := range chunks {
 		payloads[i] = make([]byte, 4096)
 		_, _ = rand.Read(payloads[i])
@@ -148,16 +141,14 @@ func TestURing_GroupCommit(t *testing.T) {
 
 	for i, ticket := range tickets {
 		ticket.Wait()
-		res := ticket.Result()
-		require.NoError(t, res.Err, "chunk %d", i)
-		require.Equal(t, 4096, res.N, "chunk %d", i)
-		ticket.Release()
+		require.NoError(t, ticket.Error(), "chunk %d", i)
+		require.Equal(t, 4096, ticket.N(), "chunk %d", i)
 	}
 
 	for i := range chunks {
 		buf := make([]byte, 4096)
-		res := submitResult(t, s, iosched.ReadOp(f, buf, int64(i*4096)))
-		require.NoError(t, res.Err)
+		ticket := submitOne(t, s, iosched.ReadOp(f, buf, int64(i*4096)))
+		require.NoError(t, ticket.Error())
 		require.Equal(t, payloads[i], buf, "mismatch at chunk %d", i)
 	}
 }
@@ -172,9 +163,8 @@ func TestURing_LinkedOps_WriteFdatasync(t *testing.T) {
 	_, _ = rand.Read(payload)
 
 	ticket := submitOne(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
-	defer ticket.Release()
 	require.NoError(t, ticket.Error())
-	require.Equal(t, 4096, ticket.Result().N)
+	require.Equal(t, 4096, ticket.N())
 }
 
 func TestURing_Concurrent(t *testing.T) {
@@ -205,14 +195,12 @@ func TestURing_Concurrent(t *testing.T) {
 					return
 				}
 				ticket.Wait()
-				res := ticket.Result()
-				ticket.Release()
-				if res.Err != nil {
-					errs <- fmt.Errorf("read at %d: %w", offset, res.Err)
+				if err := ticket.Error(); err != nil {
+					errs <- fmt.Errorf("read at %d: %w", offset, err)
 					return
 				}
-				if res.N != readSize {
-					errs <- fmt.Errorf("short read at %d: %d", offset, res.N)
+				if ticket.N() != readSize {
+					errs <- fmt.Errorf("short read at %d: %d", offset, ticket.N())
 					return
 				}
 				for j := range buf {
@@ -232,22 +220,26 @@ func TestURing_Concurrent(t *testing.T) {
 	}
 }
 
-func TestURing_LinkedChainTooLargeFailsTicket(t *testing.T) {
-	const ringDepth = 32
+func TestURing_LinkedChainTooLargeIsRejected(t *testing.T) {
+	const ringDepth = 1
 	s := newURingSched(t, iosched.URingConfig{RingDepth: ringDepth})
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
 	buf := make([]byte, 4096)
-	ops := make([]iosched.Op, ringDepth+1)
-	for i := range ops {
-		ops[i] = iosched.ReadOp(f, buf, 0)
-	}
-	ticket, err := s.Submit(linkAll(ops...))
-	require.NoError(t, err)
-	ticket.Wait()
-	defer ticket.Release()
-	require.ErrorContains(t, ticket.Error(), "exceeds ring depth")
+	ticket, err := s.Submit(iosched.ReadOp(f, buf, 0).Link(iosched.ReadOp(f, buf, 0)))
+	require.Equal(t, iosched.Ticket{}, ticket)
+	require.ErrorContains(t, err, "exceeds ring depth")
+}
+
+func TestURing_DurableWriteTooLargeIsRejected(t *testing.T) {
+	s := newURingSched(t, iosched.URingConfig{RingDepth: 1})
+	path, _ := writeUringFile(t, 4096)
+	f := openRW(t, path)
+
+	ticket, err := s.Submit(iosched.WriteOp(f, make([]byte, 4096), 0).Durable())
+	require.Equal(t, iosched.Ticket{}, ticket)
+	require.ErrorContains(t, err, "requires 2 ring slots")
 }
 
 func TestURing_CloseThenSubmit(t *testing.T) {
@@ -278,8 +270,7 @@ func TestURing_SQPOLL(t *testing.T) {
 
 	buf := make([]byte, 4096)
 	ticket := submitOne(t, s, iosched.ReadOp(f, buf, 0))
-	defer ticket.Release()
-	require.NoError(t, ticket.Result().Err)
+	require.NoError(t, ticket.Error())
 	require.Equal(t, data, buf)
 }
 
@@ -297,16 +288,16 @@ func TestURing_ReusedSQEWriteAfterFdatasync(t *testing.T) {
 		payload[i] = byte(i)
 	}
 
-	res := submitResult(t, s, iosched.WriteOp(f, payload, 0))
-	require.NoError(t, res.Err)
-	require.Equal(t, len(payload), res.N)
+	ticket := submitOne(t, s, iosched.WriteOp(f, payload, 0))
+	require.NoError(t, ticket.Error())
+	require.Equal(t, len(payload), ticket.N())
 
-	res = submitResult(t, s, iosched.FdatasyncOp(f))
-	require.NoError(t, res.Err)
+	ticket = submitOne(t, s, iosched.FdatasyncOp(f))
+	require.NoError(t, ticket.Error())
 
-	res = submitResult(t, s, iosched.WriteOp(f, payload, int64(len(payload))))
-	require.NoError(t, res.Err)
-	require.Equal(t, len(payload), res.N)
+	ticket = submitOne(t, s, iosched.WriteOp(f, payload, int64(len(payload))))
+	require.NoError(t, ticket.Error())
+	require.Equal(t, len(payload), ticket.N())
 }
 
 func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
@@ -350,23 +341,14 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 				}
 				ticket.Wait()
 
-				r0 := ticket.Result()
-				if r0.Err != nil {
-					ticket.Release()
-					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, r0.N, r0.Err)
-					return
-				}
-				if r0.N != len(payload) {
-					ticket.Release()
-					errs <- fmt.Errorf("worker %d round %d write count: got %d want %d", worker, round, r0.N, len(payload))
-					return
-				}
 				if err := ticket.Error(); err != nil {
-					ticket.Release()
-					errs <- fmt.Errorf("worker %d round %d linked chain: %w", worker, round, err)
+					errs <- fmt.Errorf("worker %d round %d write: n=%d err=%w", worker, round, ticket.N(), err)
 					return
 				}
-				ticket.Release()
+				if ticket.N() != len(payload) {
+					errs <- fmt.Errorf("worker %d round %d write count: got %d want %d", worker, round, ticket.N(), len(payload))
+					return
+				}
 			}
 		}()
 	}
@@ -394,30 +376,25 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 		0o600,
 		vfd,
 	))
-	defer openTicket.Release()
 	require.NoError(t, openTicket.Error())
 
-	// The slot is live only once the open has completed; the caller orders the
-	// write after it (here by waiting the open), since the scheduler does not.
+	// This basic path waits each result before the next operation. The no-wait
+	// open-barrier path is covered in uring_virtual_linux_test.go.
 	writeTicket := submitOne(t, s, iosched.VWriteOp(vfd, payload, 0))
-	defer writeTicket.Release()
 	require.NoError(t, writeTicket.Error())
-	require.Equal(t, len(payload), writeTicket.Result().N)
+	require.Equal(t, len(payload), writeTicket.N())
 
 	readBuf := make([]byte, len(payload))
 	readTicket := submitOne(t, s, iosched.VReadOp(vfd, readBuf, 0))
-	defer readTicket.Release()
 	require.NoError(t, readTicket.Error())
 	require.Equal(t, payload, readBuf)
 
 	closeTicket := submitOne(t, s, iosched.VCloseOp(vfd))
-	defer closeTicket.Release()
 	require.NoError(t, closeTicket.Error())
 
 	closedSlotTicket, err := s.Submit(iosched.VWriteOp(vfd, payload, 0))
 	require.NoError(t, err)
 	closedSlotTicket.Wait()
-	defer closedSlotTicket.Release()
 	require.Error(t, closedSlotTicket.Error())
 }
 
@@ -446,17 +423,17 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 	require.NoError(t, err)
 	copy(wslot.Data, payload)
 
-	res := submitResult(t, s, iosched.WriteFixedOp(f, wslot.Data, 0))
-	require.NoError(t, res.Err)
-	require.Equal(t, align.BlockSize, res.N)
+	ticket := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Data, 0))
+	require.NoError(t, ticket.Error())
+	require.Equal(t, align.BlockSize, ticket.N())
 	wslot.Release()
 
 	rslot, err := pool.Acquire()
 	require.NoError(t, err)
 
-	res = submitResult(t, s, iosched.ReadFixedOp(f, rslot.Data, 0))
-	require.NoError(t, res.Err)
-	require.Equal(t, align.BlockSize, res.N)
+	ticket = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Data, 0))
+	require.NoError(t, ticket.Error())
+	require.Equal(t, align.BlockSize, ticket.N())
 	require.Equal(t, payload, rslot.Data)
 	rslot.Release()
 }
@@ -472,7 +449,7 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 
 	payloads := make([][]byte, chunks)
 	slots := make([]mempool.Slot, chunks)
-	tickets := make([]*iosched.Ticket, chunks)
+	tickets := make([]iosched.Ticket, chunks)
 
 	for i := range chunks {
 		payloads[i] = make([]byte, align.BlockSize)
@@ -488,15 +465,14 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 
 	for i, ticket := range tickets {
 		ticket.Wait()
-		require.NoError(t, ticket.Result().Err, "chunk %d write failed", i)
+		require.NoError(t, ticket.Error(), "chunk %d write failed", i)
 		slots[i].Release()
-		ticket.Release()
 	}
 
 	for i := range chunks {
 		buf := make([]byte, align.BlockSize)
-		res := submitResult(t, s, iosched.ReadOp(f, buf, int64(i*align.BlockSize)))
-		require.NoError(t, res.Err)
+		ticket := submitOne(t, s, iosched.ReadOp(f, buf, int64(i*align.BlockSize)))
+		require.NoError(t, ticket.Error())
 		require.Equal(t, payloads[i], buf, "mismatch at chunk %d", i)
 	}
 }
@@ -516,9 +492,9 @@ func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	require.NoError(t, err)
 	defer slot.Release()
 
-	res := submitResult(t, s, iosched.WriteFixedOp(f, slot.Data, 0))
-	require.Error(t, res.Err)
-	t.Logf("kernel error for unregistered fixed op: %v", res.Err)
+	ticket := submitOne(t, s, iosched.WriteFixedOp(f, slot.Data, 0))
+	require.Error(t, ticket.Error())
+	t.Logf("kernel error for unregistered fixed op: %v", ticket.Error())
 }
 
 func TestNewDefaultScheduler_UsesURing(t *testing.T) {
@@ -531,7 +507,7 @@ func TestNewDefaultScheduler_UsesURing(t *testing.T) {
 	require.True(t, ok)
 }
 
-func TestURing_Ticket_DeferReleaseAndDoubleRelease(t *testing.T) {
+func TestURing_TicketWait(t *testing.T) {
 	s := newURingSched(t)
 	path, data := writeUringFile(t, 4096)
 	f := openRW(t, path)
@@ -539,10 +515,8 @@ func TestURing_Ticket_DeferReleaseAndDoubleRelease(t *testing.T) {
 	buf := make([]byte, 4096)
 	ticket, err := s.Submit(iosched.ReadOp(f, buf, 0))
 	require.NoError(t, err)
-	defer ticket.Release()
 
 	ticket.Wait()
-	require.NoError(t, ticket.Result().Err)
+	require.NoError(t, ticket.Error())
 	require.Equal(t, data, buf)
-	ticket.Release()
 }

@@ -129,16 +129,13 @@ func BenchmarkRegularIO(b *testing.B) {
 				return
 			}
 			ticket.Wait()
-			if res := ticket.Result(); res.Err != nil {
-				ticket.Release()
-				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, res.Err))
+			if err := ticket.Error(); err != nil {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, err))
 				return
-			} else if res.N != readBenchBlockSize {
-				ticket.Release()
-				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, res.N))
+			} else if ticket.N() != readBenchBlockSize {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, ticket.N()))
 				return
 			}
-			ticket.Release()
 		}
 	})
 	b.StopTimer()
@@ -164,7 +161,6 @@ func BenchmarkDirectIO(b *testing.B) {
 	b.Cleanup(func() {
 		if ticket, err := sched.Submit(iosched.VCloseOp(0)); err == nil {
 			ticket.Wait()
-			ticket.Release()
 		}
 		sched.Close()
 	})
@@ -175,10 +171,8 @@ func BenchmarkDirectIO(b *testing.B) {
 	}
 	openTicket.Wait()
 	if err := openTicket.Error(); err != nil {
-		openTicket.Release()
 		b.Fatalf("vopen: %v", err)
 	}
-	openTicket.Release()
 
 	var seq atomic.Uint64
 	var errOnce sync.Once
@@ -198,16 +192,13 @@ func BenchmarkDirectIO(b *testing.B) {
 				return
 			}
 			ticket.Wait()
-			if res := ticket.Result(); res.Err != nil {
-				ticket.Release()
-				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, res.Err))
+			if err := ticket.Error(); err != nil {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, err))
 				return
-			} else if res.N != readBenchBlockSize {
-				ticket.Release()
-				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, res.N))
+			} else if ticket.N() != readBenchBlockSize {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, ticket.N()))
 				return
 			}
-			ticket.Release()
 		}
 	})
 	b.StopTimer()
@@ -243,11 +234,9 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 			b.Fatalf("submit: %v", err)
 		}
 		ticket.Wait()
-		if res := ticket.Result(); res.Err != nil {
-			ticket.Release()
-			b.Fatalf("read: %v", res.Err)
+		if err := ticket.Error(); err != nil {
+			b.Fatalf("read: %v", err)
 		}
-		ticket.Release()
 	}
 	b.StopTimer()
 	reportSchedStats(b, sched)
@@ -282,11 +271,9 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 				b.Fatalf("submit: %v", err)
 			}
 			ticket.Wait()
-			if res := ticket.Result(); res.Err != nil {
-				ticket.Release()
-				b.Fatalf("read: %v", res.Err)
+			if err := ticket.Error(); err != nil {
+				b.Fatalf("read: %v", err)
 			}
-			ticket.Release()
 		}
 	})
 	b.StopTimer()
@@ -333,12 +320,10 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 							return
 						}
 						ticket.Wait()
-						if res := ticket.Result(); res.Err != nil {
-							ticket.Release()
-							b.Errorf("read: %v", res.Err)
+						if err := ticket.Error(); err != nil {
+							b.Errorf("read: %v", err)
 							return
 						}
-						ticket.Release()
 					}
 				}()
 			}
@@ -366,7 +351,7 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 			defer sched.Close()
 
 			bufs := make([][]byte, batch)
-			tickets := make([]*iosched.Ticket, batch)
+			tickets := make([]iosched.Ticket, batch)
 			for i := range bufs {
 				bufs[i] = make([]byte, blockSize)
 			}
@@ -386,11 +371,9 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 				}
 				for j, ticket := range tickets {
 					ticket.Wait()
-					if res := ticket.Result(); res.Err != nil {
-						ticket.Release()
-						b.Fatalf("read %d: %v", j, res.Err)
+					if err := ticket.Error(); err != nil {
+						b.Fatalf("read %d: %v", j, err)
 					}
-					ticket.Release()
 				}
 			}
 			b.StopTimer()

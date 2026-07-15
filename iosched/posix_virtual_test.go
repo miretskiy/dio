@@ -28,11 +28,9 @@ func TestPOSIXVirtualOpenFallocateWriteChain(t *testing.T) {
 	// One submission: open the slab into vfd, preallocate it, write the first
 	// record. This is the create-and-first-write fusion the slab write path uses.
 	chain := iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd).
-		Link(iosched.VFallocateOp(vfd, size)).
-		Link(iosched.VWriteOp(vfd, payload, 0))
+		Link(iosched.VFallocateOp(vfd, size), iosched.VWriteOp(vfd, payload, 0))
 	tkt := submitAndWait(t, s, chain)
 	require.NoError(t, tkt.Error())
-	tkt.Release()
 
 	// Fallocate grew the file to at least size; the write landed at offset 0.
 	info, err := os.Stat(path)
@@ -42,24 +40,20 @@ func TestPOSIXVirtualOpenFallocateWriteChain(t *testing.T) {
 	got := make([]byte, len(payload))
 	rd := submitAndWait(t, s, iosched.VReadOp(vfd, got, 0))
 	require.NoError(t, rd.Error())
-	require.Equal(t, len(payload), rd.Result().N)
+	require.Equal(t, len(payload), rd.N())
 	require.Equal(t, payload, got)
-	rd.Release()
 
 	// Close the slot; ops on it then fail (the table entry is gone).
 	cl := submitAndWait(t, s, iosched.VCloseOp(vfd))
 	require.NoError(t, cl.Error())
-	cl.Release()
 
 	after := submitAndWait(t, s, iosched.VWriteOp(vfd, payload, 0))
 	require.Error(t, after.Error())
-	after.Release()
 }
 
 // TestPOSIXVirtualSlotRecycle documents that on the POSIX backend a slot can be
-// closed and immediately reopened (synchronous execution), so slot recycling has
-// no backend-specific hazard here. On either backend the caller sequences close
-// before reopen; the scheduler does not (see Scheduler.Submit).
+// closed and immediately reopened because Submit completes synchronously. On the
+// io_uring backend callers wait for the close ticket before reusing the slot.
 func TestPOSIXVirtualSlotRecycle(t *testing.T) {
 	s := iosched.NewPOSIXScheduler()
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
@@ -73,15 +67,12 @@ func TestPOSIXVirtualSlotRecycle(t *testing.T) {
 
 		op := submitAndWait(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd))
 		require.NoError(t, op.Error())
-		op.Release()
 
 		w := submitAndWait(t, s, iosched.VWriteOp(vfd, want, 0))
 		require.NoError(t, w.Error())
-		w.Release()
 
 		c := submitAndWait(t, s, iosched.VCloseOp(vfd))
 		require.NoError(t, c.Error())
-		c.Release()
 	}
 }
 
@@ -97,7 +88,6 @@ func TestFallocateOpGrowsFile(t *testing.T) {
 	const size = int64(1 << 20)
 	tkt := submitAndWait(t, s, iosched.FallocateOp(f, size))
 	require.NoError(t, tkt.Error())
-	tkt.Release()
 
 	info, err := f.Stat()
 	require.NoError(t, err)

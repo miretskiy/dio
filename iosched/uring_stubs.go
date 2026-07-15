@@ -19,8 +19,8 @@ func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
 	return nil, errors.New("iosched: io_uring requires Linux")
 }
 
-func (s *URingScheduler) Submit(_ Op) (*Ticket, error) {
-	return nil, errors.New("iosched: io_uring requires Linux")
+func (s *URingScheduler) Submit(_ Op) (Ticket, error) {
+	return Ticket{}, errors.New("iosched: io_uring requires Linux")
 }
 
 func (s *URingScheduler) Close() error { return nil }

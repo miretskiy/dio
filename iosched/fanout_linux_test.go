@@ -189,7 +189,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	writeTickets := make([]*iosched.Ticket, fanoutNumSinks)
+	writeTickets := make([]iosched.Ticket, fanoutNumSinks)
 
 	b.SetBytes(fanoutChunk * (1 + fanoutNumSinks))
 	b.ResetTimer()
@@ -209,12 +209,10 @@ func BenchmarkFanout_URing(b *testing.B) {
 			b.Fatalf("submit read: %v", err)
 		}
 		readTicket.Wait()
-		if rerr := readTicket.Result().Err; rerr != nil {
-			readTicket.Release()
+		if rerr := readTicket.Error(); rerr != nil {
 			slot.Release()
 			b.Fatalf("read at %d: %v", offset, rerr)
 		}
-		readTicket.Release()
 
 		// Fan-out: submit all sinks before waiting, allowing the coordinator
 		// to place them in the same ring wave.
@@ -228,12 +226,10 @@ func BenchmarkFanout_URing(b *testing.B) {
 		}
 		for si := range fanoutNumSinks {
 			writeTickets[si].Wait()
-			if werr := writeTickets[si].Result().Err; werr != nil {
-				writeTickets[si].Release()
+			if werr := writeTickets[si].Error(); werr != nil {
 				slot.Release()
 				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}
-			writeTickets[si].Release()
 		}
 
 		slot.Release()

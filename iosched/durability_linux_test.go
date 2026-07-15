@@ -25,7 +25,6 @@ func TestURing_DurableVWrite_IssuesLinkedSync(t *testing.T) {
 		tk := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, filepath.Join(dir, name),
 			unix.O_CREAT|unix.O_RDWR, 0o600, vfd))
 		require.NoError(t, tk.Error())
-		tk.Release()
 	}
 	openSlot(0, "durable.dat")
 	openSlot(1, "plain.dat")
@@ -35,8 +34,7 @@ func TestURing_DurableVWrite_IssuesLinkedSync(t *testing.T) {
 		before := s.Stats().OpsPlaced
 		tk := submitOne(t, s, op)
 		require.NoError(t, tk.Error())
-		require.Equal(t, len(payload), tk.Result().N)
-		tk.Release()
+		require.Equal(t, len(payload), tk.N())
 		return s.Stats().OpsPlaced - before
 	}
 	require.Equal(t, uint64(2), placed(iosched.VWriteOp(0, payload, 0).Durable())) // write + fdatasync
@@ -45,12 +43,10 @@ func TestURing_DurableVWrite_IssuesLinkedSync(t *testing.T) {
 	got := make([]byte, len(payload))
 	rd := submitOne(t, s, iosched.VReadOp(0, got, 0))
 	require.NoError(t, rd.Error())
-	rd.Release()
 	require.Equal(t, payload, got)
 
 	for _, vfd := range []uint32{0, 1} {
 		cl := submitOne(t, s, iosched.VCloseOp(vfd))
 		require.NoError(t, cl.Error())
-		cl.Release()
 	}
 }

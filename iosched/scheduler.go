@@ -14,59 +14,41 @@ import (
 
 var errSchedulerClosed = errors.New("iosched: scheduler closed")
 
-// Scheduler is the async I/O submission interface.
+// Scheduler is the common I/O submission interface.
 type Scheduler interface {
-	// Submit hands op to the scheduler for execution, possibly asynchronously,
-	// and returns a Ticket to await it. The scheduler is a lean pipe: it moves
-	// bytes between the caller and the kernel and reports completions. It does not
-	// model files, order your operations, or manage their lifecycle — those are
-	// the caller's.
+	// Submit schedules op and returns its completion Ticket. URingScheduler is a
+	// non-blocking handoff; POSIXScheduler executes the operation before returning.
+	// Neither provides application-level backpressure.
 	//
-	// Guaranteed:
-	//   - Every op eventually completes exactly once. The Ticket becomes ready
-	//     after Ticket.Wait; then Ticket.Result, Ticket.N, and Ticket.Error hold
-	//     the outcome. A linked chain completes as one unit.
-	//   - EINTR is absorbed internally, so Result.Err is never EINTR (see the
-	//     package doc); callers handle only terminal errors and short transfers.
-	//   - A linked chain (Op.Link) executes in order — each op starts only after
-	//     the previous one completed — and a failure short-circuits the rest with
-	//     ECANCELED.
-	//   - use-before-close: a close does not run until its file's in-flight data
-	//     ops complete. The scheduler holds the close (both virtual slots and
-	//     regular descriptors) until the file quiesces, so a close submitted right
-	//     behind writes will not clear the file out from under them. You need not
-	//     await the writes before closing.
+	// After an accepted submission, call Ticket.Wait before Error or N.
+	// Waiting is optional when the caller does not need the result. A Submit error
+	// means the operation was not accepted and the returned Ticket is invalid;
+	// execution and asynchronous admission errors are reported by a valid Ticket.
+	// Reads and writes absorb EINTR but may complete with a short count.
 	//
-	// NOT guaranteed:
-	//   - Any ordering between separate Submits. Independent ops — even to the
-	//     same file or offset — may execute and complete in any order and
-	//     concurrently. Submit order is not execution order.
-	//   - Open-before-use, and reopen-after-close, are not yet sequenced by the
-	//     scheduler: an open does not hold back later writes to its slot, and a
-	//     reopen is not ordered after a prior close. Sequence those with Wait or
-	//     Op.Link (see below).
+	// Operations in a Link or HardLink chain execute in order. Link cancels the
+	// remaining chain after a failure; HardLink continues it. URingScheduler
+	// rejects a chain longer than its configured ring depth. Durable applies only
+	// to standalone writes; put an explicit FdatasyncOp in a linked chain.
 	//
-	// If you need ordering the scheduler does not give, encode it:
-	//   - Wait: submit the prerequisite, Ticket.Wait for it, then submit the
-	//     dependents. Simplest, and right when the prerequisite is rare (open a
-	//     file once, then stream many writes to it).
-	//   - Link: chain dependents after the prerequisite with Op.Link so the
-	//     kernel orders them with no round-trip. Right for a linear dependency
-	//     (write→fdatasync, or close→reopen of a recycled slot). A link is
-	//     strictly linear — no fan-out or fan-in — so N independent writes cannot
-	//     be "ordered before" one op without serializing them; use Wait (or a
-	//     caller-side join) for that.
+	// Separate submissions are unordered except for file lifecycle:
+	//   - A submission containing VOpenatOp holds subsequently accepted operations
+	//     on the same virtual slot until its entire linked chain completes. This is
+	//     an ordering barrier, not error propagation; use Link when followers must
+	//     be canceled if open fails.
+	//   - CloseOp and VCloseOp wait for previously accepted operations on their
+	//     file to complete. Earlier operations in the same linked chain are ordered
+	//     before close by the chain and are not part of that drain. A standalone
+	//     Durable write remains active through its synthesized fdatasync, so a
+	//     following close waits for the flush too.
+	//   - Operations later in the same linked chain are ordered after its close.
+	//     Separate work submitted for a file after its close has been accepted but
+	//     before that close completes is unsupported. Wait for the close-containing
+	//     Ticket before submitting more work for that virtual slot.
 	//
-	// On virtual files specifically: the kernel resolves an async op's fixed file
-	// when it issues the op, not at submission, so a write must not be submitted
-	// before its open has completed, and a reopen must follow the prior close.
-	// (Closing is handled for you by use-before-close above.) Order the open and
-	// reopen with Wait or Op.Link.
-	//
-	// Submit implements no backpressure: it is a non-blocking handoff onto a
-	// lock-free staging queue. Callers that need admission control wrap the
-	// scheduler with their own semaphore, token bucket, or queue.
-	Submit(op Op) (*Ticket, error)
+	// These rules use the coordinator's acceptance order. Submit calls racing from
+	// different goroutines do not establish an application-visible order.
+	Submit(op Op) (Ticket, error)
 
 	// Close shuts down the scheduler. Callers must stop submitting before
 	// Close; racing Close with Submit is not supported.

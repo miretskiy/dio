@@ -52,18 +52,18 @@ func testWritevRegularRead(t *testing.T, s iosched.Scheduler) {
 	want := bytesConcat(a, b, c)
 	const base = int64(8)
 
-	require.Equal(t, len(want), runOp(t, s, iosched.WritevOp(f, [][]byte{a, b, c}, base)).N)
+	require.Equal(t, len(want), runOp(t, s, iosched.WritevOp(f, [][]byte{a, b, c}, base)))
 
 	// One contiguous regular read over the whole region.
 	whole := make([]byte, len(want))
-	require.Equal(t, len(want), runOp(t, s, iosched.ReadOp(f, whole, base)).N)
+	require.Equal(t, len(want), runOp(t, s, iosched.ReadOp(f, whole, base)))
 	require.Equal(t, want, whole)
 
 	// One regular read per chunk, at its computed offset.
 	off := base
 	for _, chunk := range [][]byte{a, b, c} {
 		got := make([]byte, len(chunk))
-		require.Equal(t, len(chunk), runOp(t, s, iosched.ReadOp(f, got, off)).N)
+		require.Equal(t, len(chunk), runOp(t, s, iosched.ReadOp(f, got, off)))
 		require.Equal(t, chunk, got)
 		off += int64(len(chunk))
 	}
@@ -81,25 +81,25 @@ func testRegularWriteReadv(t *testing.T, s iosched.Scheduler) {
 
 	off := base
 	for _, chunk := range [][]byte{a, b, c} {
-		require.Equal(t, len(chunk), runOp(t, s, iosched.WriteOp(f, chunk, off)).N)
+		require.Equal(t, len(chunk), runOp(t, s, iosched.WriteOp(f, chunk, off)))
 		off += int64(len(chunk))
 	}
 
 	// readv into 2 buffers (5+7).
 	p1, p2 := make([]byte, 5), make([]byte, 7)
-	require.Equal(t, len(want), runOp(t, s, iosched.ReadvOp(f, [][]byte{p1, p2}, base)).N)
+	require.Equal(t, len(want), runOp(t, s, iosched.ReadvOp(f, [][]byte{p1, p2}, base)))
 	require.Equal(t, want, bytesConcat(p1, p2))
 
 	// readv into 4 equal buffers (3+3+3+3).
 	q := [][]byte{make([]byte, 3), make([]byte, 3), make([]byte, 3), make([]byte, 3)}
-	require.Equal(t, len(want), runOp(t, s, iosched.ReadvOp(f, q, base)).N)
+	require.Equal(t, len(want), runOp(t, s, iosched.ReadvOp(f, q, base)))
 	require.Equal(t, want, bytesConcat(q...))
 }
 
 func testVectoredShortRead(t *testing.T, s iosched.Scheduler) {
 	f := newFileWith(t, []byte("0123456789"))  // 10 bytes
 	p1, p2 := make([]byte, 6), make([]byte, 8) // request 14, only 10 available
-	require.Equal(t, 10, runOp(t, s, iosched.ReadvOp(f, [][]byte{p1, p2}, 0)).N)
+	require.Equal(t, 10, runOp(t, s, iosched.ReadvOp(f, [][]byte{p1, p2}, 0)))
 	require.Equal(t, []byte("012345"), p1)
 	require.Equal(t, []byte("6789"), p2[:4])
 }
@@ -107,10 +107,10 @@ func testVectoredShortRead(t *testing.T, s iosched.Scheduler) {
 func testVectoredOffsetAndEmpty(t *testing.T, s iosched.Scheduler) {
 	f := newFileWith(t, make([]byte, 16))
 	head, empty, tail := []byte("XY"), []byte(nil), []byte("Z")
-	require.Equal(t, 3, runOp(t, s, iosched.WritevOp(f, [][]byte{head, empty, tail}, 4)).N)
+	require.Equal(t, 3, runOp(t, s, iosched.WritevOp(f, [][]byte{head, empty, tail}, 4)))
 
 	got := make([]byte, 3)
-	require.Equal(t, 3, runOp(t, s, iosched.ReadOp(f, got, 4)).N)
+	require.Equal(t, 3, runOp(t, s, iosched.ReadOp(f, got, 4)))
 	require.Equal(t, []byte("XYZ"), got)
 }
 
@@ -123,10 +123,10 @@ func testVectoredVirtual(t *testing.T, s iosched.Scheduler) {
 	runOp(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd))
 
 	a, b := []byte("hello "), []byte("world")
-	require.Equal(t, len(a)+len(b), runOp(t, s, iosched.VWritevOp(vfd, [][]byte{a, b}, 0)).N)
+	require.Equal(t, len(a)+len(b), runOp(t, s, iosched.VWritevOp(vfd, [][]byte{a, b}, 0)))
 
 	p := [][]byte{make([]byte, 4), make([]byte, 4), make([]byte, 3)} // 11 bytes, 3 chunks
-	require.Equal(t, 11, runOp(t, s, iosched.VReadvOp(vfd, p, 0)).N)
+	require.Equal(t, 11, runOp(t, s, iosched.VReadvOp(vfd, p, 0)))
 	require.Equal(t, []byte("hello world"), bytesConcat(p...))
 
 	runOp(t, s, iosched.VCloseOp(vfd))

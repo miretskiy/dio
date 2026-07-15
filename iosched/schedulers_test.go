@@ -1,10 +1,13 @@
 package iosched_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/iosched"
 )
@@ -33,18 +36,39 @@ func newPOSIX(t *testing.T) iosched.Scheduler {
 	return s
 }
 
-// runOp submits op, waits for it, and returns a copy of its Result. Release is
-// deferred immediately after Submit — before any require — so a failed assertion
-// still cleans up, and it is nil-safe if Submit itself errored. This is the
-// standard submit/await/check lifecycle for any op, not just vectored ones.
-func runOp(t *testing.T, s iosched.Scheduler, op iosched.Op) iosched.Result {
+// runOp submits op, waits for it, and returns its count.
+func runOp(t *testing.T, s iosched.Scheduler, op iosched.Op) int {
 	t.Helper()
 	ticket, err := s.Submit(op)
-	defer ticket.Release()
 	require.NoError(t, err)
 	ticket.Wait()
 	require.NoError(t, ticket.Error())
-	return ticket.Result()
+	return ticket.N()
+}
+
+func TestVirtualOpenReplacesIdleSlot(t *testing.T) {
+	forEachScheduler(t, func(t *testing.T, s iosched.Scheduler) {
+		dir := t.TempDir()
+		firstPath := filepath.Join(dir, "first.dat")
+		secondPath := filepath.Join(dir, "second.dat")
+		const vfd = uint32(0)
+
+		runOp(t, s, iosched.VOpenatOp(unix.AT_FDCWD, firstPath,
+			unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC, 0o600, vfd))
+		runOp(t, s, iosched.VWriteOp(vfd, []byte("first"), 0))
+
+		runOp(t, s, iosched.VOpenatOp(unix.AT_FDCWD, secondPath,
+			unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC, 0o600, vfd))
+		runOp(t, s, iosched.VWriteOp(vfd, []byte("second"), 0))
+		runOp(t, s, iosched.VCloseOp(vfd))
+
+		first, err := os.ReadFile(firstPath)
+		require.NoError(t, err)
+		require.Equal(t, []byte("first"), first)
+		second, err := os.ReadFile(secondPath)
+		require.NoError(t, err)
+		require.Equal(t, []byte("second"), second)
+	})
 }
 
 // TestSchedulerCloseCompletesPending is the shutdown contract: no ticket is left
@@ -56,7 +80,7 @@ func TestSchedulerCloseCompletesPending(t *testing.T) {
 		f := newEmptyFile(t)
 		const n = 64
 		buf := make([]byte, 512)
-		tickets := make([]*iosched.Ticket, n)
+		tickets := make([]iosched.Ticket, n)
 		for i := range n {
 			tk, err := s.Submit(iosched.WriteOp(f, buf, int64(i*len(buf))))
 			require.NoError(t, err)
@@ -82,7 +106,6 @@ func TestSchedulerCloseCompletesPending(t *testing.T) {
 			if err := tk.Error(); err != nil {
 				require.ErrorContains(t, err, "closed") // completed, or the close error
 			}
-			tk.Release()
 		}
 	})
 }
