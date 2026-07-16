@@ -320,12 +320,12 @@ func (o *Op) prepareSubmission() Ticket {
 	return Ticket{o.completion}
 }
 
-// Wait blocks until all ops in the Ticket's linked chain have completed.
+// Wait blocks until the Ticket completes.
 func (t Ticket) Wait() {
 	t.done.Wait()
 }
 
-// Error returns an operation error from the chain, valid after Wait.
+// Error returns an operation or scheduler error, valid after Wait.
 func (t Ticket) Error() error { return t.err }
 
 // N returns the root operation's byte count or opened file descriptor, valid
@@ -362,8 +362,4 @@ func recordResult(root, op *Op, n int, err error) {
 	if err != nil && root.err == nil {
 		root.err = err
 	}
-}
-
-func completeSubmission(root *Op) {
-	root.done.Done()
 }

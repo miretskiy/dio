@@ -1,5 +1,7 @@
 package intrusive
 
+import "iter"
+
 // Handle identifies a value until it is removed. Its zero value is invalid.
 type Handle uint64
 
@@ -122,6 +124,20 @@ func (l *List[T]) Next(handle Handle) (Handle, bool) {
 func (l *List[T]) Prev(handle Handle) (Handle, bool) {
 	_, n := l.node(handle)
 	return l.handle(n.prev), n.prev != 0
+}
+
+// All yields entries in list order. The current entry may be removed during
+// iteration; other mutations are unsupported.
+func (l *List[T]) All() iter.Seq2[Handle, *T] {
+	return func(yield func(Handle, *T) bool) {
+		for handle, ok := l.Front(); ok; {
+			next, hasNext := l.Next(handle)
+			if !yield(handle, l.Value(handle)) {
+				return
+			}
+			handle, ok = next, hasNext
+		}
+	}
 }
 
 // Len returns the number of values in l.

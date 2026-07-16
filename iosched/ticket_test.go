@@ -16,7 +16,7 @@ func TestTicketErrorReportsLinkedError(t *testing.T) {
 	if got := ticket.Error(); got != err {
 		t.Fatalf("ticket error: got %v want %v", got, err)
 	}
-	completeSubmission(&root)
+	root.done.Done()
 }
 
 func TestOpLinkBuildsFlatChain(t *testing.T) {
@@ -92,7 +92,7 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 	if root.linked == nil || string(root.linked.buf) != "linked" {
 		t.Fatal("submission did not retain the immutable linked chain")
 	}
-	completeSubmission(&root)
+	root.done.Done()
 	ticket.Wait()
 }
 
@@ -128,7 +128,7 @@ func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 	default:
 	}
 
-	completeSubmission(&root)
+	root.done.Done()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -139,7 +139,7 @@ func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 func BenchmarkTicketCompletion(b *testing.B) {
 	root := Op{}
 	ticket := root.prepareSubmission()
-	completeSubmission(&root)
+	root.done.Done()
 	ticket.Wait()
 
 	b.ReportAllocs()
@@ -147,7 +147,7 @@ func BenchmarkTicketCompletion(b *testing.B) {
 	for range b.N {
 		root := Op{}
 		ticket := root.prepareSubmission()
-		completeSubmission(&root)
+		root.done.Done()
 		ticket.Wait()
 	}
 }
@@ -161,7 +161,7 @@ func BenchmarkSubmissionState(b *testing.B) {
 		root := Op{}
 		ticket := root.prepareSubmission()
 		benchmarkSubmission = &root
-		completeSubmission(&root)
+		root.done.Done()
 		benchmarkTicket = ticket
 	}
 }

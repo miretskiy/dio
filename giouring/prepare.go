@@ -523,7 +523,7 @@ func (entry *SubmissionQueueEntry) PrepareTee(fdIn, fdOut int, nbytes, spliceFla
 
 // liburing: io_uring_prep_timeout - https://manpages.debian.org/unstable/liburing-dev/io_uring_prep_timeout.3.en.html
 func (entry *SubmissionQueueEntry) PrepareTimeout(spec *syscall.Timespec, count, flags uint32) {
-	entry.prepareRW(OpTimeout, -1, uintptr(unsafe.Pointer(&spec)), 1, uint64(count))
+	entry.prepareRW(OpTimeout, -1, uintptr(unsafe.Pointer(spec)), 1, uint64(count))
 	entry.OpcodeFlags = flags
 }
 

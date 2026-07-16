@@ -84,6 +84,11 @@ type Ring struct {
 	_           uint32   // kernel ABI padding
 }
 
+// HasFeature reports whether the kernel advertised feature at ring setup.
+func (ring *Ring) HasFeature(feature uint32) bool {
+	return ring.features&feature != 0
+}
+
 // liburing: io_uring_cqe_shift
 func (ring *Ring) cqeShift() uint32 {
 	if ring.flags&SetupCQE32 != 0 {
@@ -98,8 +103,10 @@ func (ring *Ring) cqeIndex(ptr, mask uint32) uintptr {
 	return uintptr((ptr & mask) << ring.cqeShift())
 }
 
+// ForEachCQE calls callback for each available CQE and returns the number seen.
 // liburing: io_uring_for_each_cqe - https://manpages.debian.org/unstable/liburing-dev/io_uring_for_each_cqe.3.en.html
-func (ring *Ring) ForEachCQE(callback func(cqe *CompletionQueueEvent)) {
+func (ring *Ring) ForEachCQE(callback func(cqe *CompletionQueueEvent)) uint32 {
+	var count uint32
 	var cqe *CompletionQueueEvent
 	for head := atomic.LoadUint32(ring.cqRing.head); ; head++ {
 		if head != atomic.LoadUint32(ring.cqRing.tail) {
@@ -108,8 +115,9 @@ func (ring *Ring) ForEachCQE(callback func(cqe *CompletionQueueEvent)) {
 				unsafe.Add(unsafe.Pointer(ring.cqRing.cqes), cqeIndex*unsafe.Sizeof(CompletionQueueEvent{})),
 			)
 			callback(cqe)
+			count++
 		} else {
-			break
+			return count
 		}
 	}
 }

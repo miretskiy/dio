@@ -86,7 +86,7 @@ func isFileOperation(op *Op) bool {
 // file operations wait for work containing an unfinished open, and close waits
 // for older file operations to complete.
 func (f *fileTable) admit(c *coordinator, handle intrusive.Handle) error {
-	work := c.works.Value(handle)
+	work := c.pending.Value(handle)
 
 	// Work submitted after close, and an open while prior slot work remains,
 	// have no useful ordering contract. Reject them before changing file state.

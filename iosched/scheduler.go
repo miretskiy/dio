@@ -50,8 +50,10 @@ type Scheduler interface {
 	// different goroutines do not establish an application-visible order.
 	Submit(op Op) (Ticket, error)
 
-	// Close shuts down the scheduler. Callers must stop submitting before
-	// Close; racing Close with Submit is not supported.
+	// Close shuts down the scheduler and waits for accepted tickets to finish.
+	// Work that has not completed may finish with a scheduler-closed error.
+	// Close must be called exactly once. Callers must stop submitting first;
+	// racing Close with Submit is not supported.
 	io.Closer
 }
 

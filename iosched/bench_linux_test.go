@@ -72,14 +72,6 @@ func benchFile(b *testing.B, size int64) *os.File {
 	return f
 }
 
-func reportSchedStats(b *testing.B, sched *iosched.URingScheduler) {
-	st := sched.Stats()
-	if st.Syscalls == 0 {
-		return
-	}
-	b.ReportMetric(float64(st.OpsPlaced)/float64(st.Syscalls), "ops/syscall")
-}
-
 const (
 	readBenchFileSize  = 1 << 30 // 1 GiB
 	readBenchBlockSize = 4096
@@ -142,7 +134,6 @@ func BenchmarkRegularIO(b *testing.B) {
 	if benchErr != nil {
 		b.Fatal(benchErr)
 	}
-	reportSchedStats(b, sched)
 }
 
 func BenchmarkDirectIO(b *testing.B) {
@@ -205,7 +196,6 @@ func BenchmarkDirectIO(b *testing.B) {
 	if benchErr != nil {
 		b.Fatal(benchErr)
 	}
-	reportSchedStats(b, sched)
 }
 
 func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
@@ -239,7 +229,6 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 		}
 	}
 	b.StopTimer()
-	reportSchedStats(b, sched)
 }
 
 func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
@@ -277,7 +266,6 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 		}
 	})
 	b.StopTimer()
-	reportSchedStats(b, sched)
 }
 
 func BenchmarkSubmission_Concurrency(b *testing.B) {
@@ -329,7 +317,6 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 			}
 			wg.Wait()
 			b.StopTimer()
-			reportSchedStats(b, sched)
 		})
 	}
 }
@@ -377,7 +364,6 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 				}
 			}
 			b.StopTimer()
-			reportSchedStats(b, sched)
 		})
 	}
 }

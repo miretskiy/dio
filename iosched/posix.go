@@ -67,7 +67,7 @@ func (s *POSIXScheduler) Submit(op Op) (Ticket, error) {
 			break
 		}
 	}
-	completeSubmission(root)
+	root.done.Done()
 	return ticket, nil
 }
 

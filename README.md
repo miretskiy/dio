@@ -272,6 +272,8 @@ defer sched.Close()
 Asynchronous io_uring scheduler. A single coordinator goroutine owns the ring.
 Submitters publish `Op` values through an intrusive lock-free MPSC stack and a
 buffered doorbell; the coordinator fills free SQ slots and reaps CQEs.
+The kernel must provide `IORING_FEAT_NODROP` so completion events cannot be
+silently lost.
 
 ```go
 if !iosched.IOUringAvailable {
@@ -318,16 +320,6 @@ for _, req := range requests {
 }
 wg.Wait()
 // URingScheduler coalesces ready submissions into fewer io_uring_enter syscalls.
-```
-
-### Stats
-
-```go
-stats := sched.Stats()
-if stats.Syscalls != 0 {
-    fmt.Printf("ops/syscall=%.1f\n",
-        float64(stats.OpsPlaced)/float64(stats.Syscalls))
-}
 ```
 
 ---

@@ -386,6 +386,8 @@ func (ring *Ring) Submit() (uint, error) {
 	return ring.internalSubmitAndWait(0)
 }
 
+// SubmitAndWait submits queued SQEs, waits for waitNr completions, and returns
+// the number of SQEs submitted. The return value is not a completion count.
 // liburing: io_uring_submit_and_wait - https://manpages.debian.org/unstable/liburing-dev/io_uring_submit_and_wait.3.en.html
 func (ring *Ring) SubmitAndWait(waitNr uint32) (uint, error) {
 	return ring.internalSubmitAndWait(waitNr)

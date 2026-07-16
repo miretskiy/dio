@@ -235,5 +235,4 @@ func BenchmarkFanout_URing(b *testing.B) {
 		slot.Release()
 	}
 	b.StopTimer()
-	reportSchedStats(b, sched)
 }

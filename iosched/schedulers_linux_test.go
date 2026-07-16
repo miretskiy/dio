@@ -5,6 +5,8 @@ package iosched_test
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/miretskiy/dio/iosched"
 )
 
@@ -17,4 +19,13 @@ func availableSchedulers() []schedulerFactory {
 			return newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 2})
 		}},
 	}
+}
+
+func TestURingCloseCompletesPending(t *testing.T) {
+	if !iosched.IOUringAvailable {
+		t.Skip("io_uring not available on this kernel")
+	}
+	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 16})
+	require.NoError(t, err)
+	testSchedulerCloseCompletesPending(t, s)
 }

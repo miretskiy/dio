@@ -41,14 +41,27 @@ func TestListTraversal(t *testing.T) {
 	}
 
 	var values []string
-	for handle, ok := list.Front(); ok; handle, ok = list.Next(handle) {
-		values = append(values, *list.Value(handle))
+	for _, value := range list.All() {
+		values = append(values, *value)
 	}
 	want := []string{"first", "second", "third"}
 	for i := range want {
 		if values[i] != want[i] {
 			t.Fatalf("values[%d]: got %q want %q", i, values[i], want[i])
 		}
+	}
+}
+
+func TestListAllMayRemoveCurrentEntry(t *testing.T) {
+	var list List[int]
+	for i := range 3 {
+		list.PushBack(i)
+	}
+	for handle := range list.All() {
+		list.Remove(handle)
+	}
+	if list.Len() != 0 {
+		t.Fatalf("entries after iteration: %d", list.Len())
 	}
 }
 

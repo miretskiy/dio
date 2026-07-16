@@ -115,9 +115,10 @@ func TestRingForEachCQE(t *testing.T) {
 
 	// Verify that all events were completed
 	count := 0
-	ring.ForEachCQE(func(cqe *CompletionQueueEvent) {
+	visited := ring.ForEachCQE(func(cqe *CompletionQueueEvent) {
 		count++
 		GreaterOrEqual(t, int(cqe.UserData), 1000)
 	})
 	Equal(t, entries, count)
+	Equal(t, entries, int(visited))
 }

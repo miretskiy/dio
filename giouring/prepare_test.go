@@ -280,7 +280,7 @@ func TestPrepareTimeout(t *testing.T) {
 	Equal(t, uint16(0), entry.IoPrio)
 	Equal(t, int32(-1), entry.Fd)
 	Equal(t, uint64(10), entry.Off)
-	NotZero(t, entry.Addr)
+	Equal(t, uint64(uintptr(unsafe.Pointer(&spec))), entry.Addr)
 	Equal(t, uint32(1), entry.Len)
 	Equal(t, uint32(15), entry.OpcodeFlags)
 	Equal(t, uint64(0), entry.UserData)

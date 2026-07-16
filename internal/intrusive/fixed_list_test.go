@@ -34,8 +34,8 @@ func TestFixedListTraversal(t *testing.T) {
 	}
 
 	var sum int
-	for handle, ok := list.Front(); ok; handle, ok = list.Next(handle) {
-		sum += *list.Value(handle)
+	for _, value := range list.All() {
+		sum += *value
 	}
 	if sum != 6 {
 		t.Fatalf("range sum: got %d want 6", sum)
@@ -47,10 +47,8 @@ func TestFixedListTraversalMayRemoveCurrentSlot(t *testing.T) {
 	for range 3 {
 		list.PushBack()
 	}
-	for handle, ok := list.Front(); ok; {
-		next, hasNext := list.Next(handle)
+	for handle := range list.All() {
 		list.Remove(handle)
-		handle, ok = next, hasNext
 	}
 	if list.Len() != 0 {
 		t.Fatalf("occupied slots after traversal: %d", list.Len())

@@ -4,9 +4,11 @@ package iosched
 
 import (
 	"errors"
+	"io"
 	"os"
 	"testing"
 
+	"github.com/miretskiy/dio/giouring"
 	"github.com/miretskiy/dio/internal/intrusive"
 	"github.com/stretchr/testify/require"
 )
@@ -46,8 +48,7 @@ func TestCoalescedRun(t *testing.T) {
 			run := c.coalescedRun(front, []intrusive.Handle{handles[0]})
 			require.Len(t, run, tc.want)
 
-			c.stopping = true
-			c.failAllWork(errors.New("test cleanup"))
+			c.failRemaining(nil, errors.New("test cleanup"))
 		})
 	}
 }
@@ -72,6 +73,51 @@ func TestCoalescibleWrite(t *testing.T) {
 			require.Equal(t, tc.want, tc.op.coalescibleWrite())
 		})
 	}
+}
+
+func TestPlaceReadyCoalescesWrites(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(8, 0, ring)
+	f := os.NewFile(100, "a")
+	tickets, _ := acceptOps(&c,
+		WriteOp(f, make([]byte, 4), 0),
+		WriteOp(f, make([]byte, 6), 4),
+		WriteOp(f, make([]byte, 2), 10),
+	)
+
+	c.placeReady(true)
+	require.Len(t, ring.sqes, 1)
+	require.Equal(t, uint8(giouring.OpWritev), ring.sqes[0].OpCode)
+	slot := c.slots.Value(intrusive.Handle(ring.sqes[0].UserData))
+	require.Len(t, slot.iovecs, 3)
+
+	c.failRemaining(nil, errors.New("test cleanup"))
+	c.releaseAllSlots()
+	for _, ticket := range tickets {
+		ticket.Wait()
+	}
+}
+
+func TestCoalescedShortWriteCompletion(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(8, 0, ring)
+	f := os.NewFile(100, "a")
+	tickets, _ := acceptOps(&c,
+		WriteOp(f, make([]byte, 4), 0),
+		WriteOp(f, make([]byte, 4), 4),
+	)
+	c.placeReady(true)
+	require.Len(t, ring.sqes, 1)
+
+	ring.complete(ring.sqes[0].UserData, 6)
+	c.reap()
+	for _, ticket := range tickets {
+		ticket.Wait()
+	}
+	require.NoError(t, tickets[0].Error())
+	require.Equal(t, 4, tickets[0].N())
+	require.ErrorIs(t, tickets[1].Error(), io.ErrShortWrite)
+	require.Equal(t, 2, tickets[1].N())
 }
 
 func TestOpBytes(t *testing.T) {

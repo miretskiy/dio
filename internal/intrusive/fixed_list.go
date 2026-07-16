@@ -1,5 +1,7 @@
 package intrusive
 
+import "iter"
+
 // FixedList is a fixed-capacity List whose values remain in stable storage.
 // Removed values are retained for reuse; callers must clear live references
 // before Remove.
@@ -64,6 +66,12 @@ func (l *FixedList[T]) Next(handle Handle) (Handle, bool) {
 // Prev returns the handle before handle.
 func (l *FixedList[T]) Prev(handle Handle) (Handle, bool) {
 	return l.list.Prev(handle)
+}
+
+// All yields occupied slots in list order. The current slot may be removed
+// during iteration; other mutations are unsupported.
+func (l *FixedList[T]) All() iter.Seq2[Handle, *T] {
+	return l.list.All()
 }
 
 // Len returns the number of occupied slots in l.

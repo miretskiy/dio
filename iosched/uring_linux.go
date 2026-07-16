@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/miretskiy/dio/giouring"
@@ -17,7 +18,8 @@ import (
 	"github.com/miretskiy/dio/mempool"
 )
 
-// IOUringAvailable reports whether io_uring is supported on the running kernel.
+// IOUringAvailable reports whether the running kernel provides the io_uring
+// features required by URingScheduler.
 var IOUringAvailable = probeIOUring()
 
 func probeIOUring() bool {
@@ -25,8 +27,8 @@ func probeIOUring() bool {
 	if err := ring.QueueInit(1, 0); err != nil {
 		return false
 	}
-	ring.QueueExit()
-	return true
+	defer ring.QueueExit()
+	return ring.HasFeature(giouring.FeatNoDrop)
 }
 
 const defaultRingDepth uint32 = 256
@@ -65,17 +67,14 @@ type ringSlot struct {
 	iovecs []syscall.Iovec
 }
 
-type shutdownState struct {
-	err error
-}
-
 var stagingClosed Op
 
 // URingScheduler is an asynchronous Scheduler backed by io_uring.
 //
-// A single coordinator goroutine owns the ring. Submitters publish Ops to
+// A single coordinator goroutine owns the SQ and CQ. Submitters publish Ops to
 // an intrusive lock-free MPSC stack and wake the coordinator with a buffered(1)
-// doorbell.
+// doorbell. Close owns the ring lifetime and may issue synchronous cancellation
+// through its fd before tearing it down.
 type URingScheduler struct {
 	URingConfig
 
@@ -83,28 +82,9 @@ type URingScheduler struct {
 	stagingHead atomic.Pointer[Op]
 	wakeup      chan struct{}
 
-	shutdown atomic.Pointer[shutdownState]
+	stop atomic.Pointer[error]
 
 	wg sync.WaitGroup
-
-	stats struct {
-		syscalls  atomic.Uint64
-		opsPlaced atomic.Uint64
-	}
-}
-
-// Stats is a point-in-time snapshot of coordinator counters.
-type Stats struct {
-	Syscalls  uint64
-	OpsPlaced uint64
-}
-
-// Stats returns a snapshot of coordinator counters.
-func (s *URingScheduler) Stats() Stats {
-	return Stats{
-		Syscalls:  s.stats.syscalls.Load(),
-		OpsPlaced: s.stats.opsPlaced.Load(),
-	}
 }
 
 func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
@@ -116,7 +96,8 @@ func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
 	return nil
 }
 
-// NewURingScheduler creates an io_uring-backed scheduler.
+// NewURingScheduler creates an io_uring-backed scheduler. The kernel must
+// provide IORING_FEAT_NODROP.
 func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 	if !IOUringAvailable {
 		return nil, errors.New("iosched: io_uring not available on this kernel")
@@ -156,7 +137,7 @@ func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
 
 // Submit enqueues op for asynchronous execution.
 func (s *URingScheduler) Submit(op Op) (Ticket, error) {
-	if err := s.fatalError(); err != nil {
+	if err := s.stopCause(); err != nil {
 		return Ticket{}, err
 	}
 
@@ -173,7 +154,7 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 
 	ticket := op.prepareSubmission()
 	if !s.tryPush(&op) {
-		return Ticket{}, s.fatalError()
+		return Ticket{}, s.stopCause()
 	}
 	select {
 	case s.wakeup <- struct{}{}:
@@ -218,39 +199,48 @@ func (s *URingScheduler) closeStaging() *Op {
 	return head
 }
 
-// Close shuts down the coordinator goroutine and releases ring resources.
-// Callers must stop submitting before Close; racing Close with Submit is not
-// supported.
+// Close stops the coordinator and releases ring resources. Work that has not
+// completed is failed with the scheduler-closed error. Close waits for the
+// coordinator goroutine, which may be blocked waiting for in-flight file I/O.
+// Close must be called exactly once. Callers must stop submitting first;
+// racing Close with Submit is not supported.
 func (s *URingScheduler) Close() error {
-	s.stop(nil)
-	s.wg.Wait()
-	return nil
-}
+	alreadyClosing := !s.signalShutdown(errSchedulerClosed)
+	if !alreadyClosing {
+		// ANY ignores the match key; ALL cancels every request. Bound the
+		// synchronous cancellation call; Close still waits for the coordinator.
+		_, _ = s.ring.RegisterSyncCancel(&giouring.SyncCancelReg{
+			Flags:   giouring.AsyncCancelAny | giouring.AsyncCancelAll,
+			Timeout: syscall.Timespec{Sec: 1},
+		})
 
-func (s *URingScheduler) stop(err error) {
-	if err == nil {
-		err = errSchedulerClosed
-	}
-	if s.shutdown.CompareAndSwap(nil, &shutdownState{err: err}) {
+		// The coordinator may instead be idle on the userspace doorbell.
 		select {
 		case s.wakeup <- struct{}{}:
 		default:
 		}
 	}
+	s.wg.Wait()
+	s.ring.QueueExit()
+	return nil
 }
 
-func (s *URingScheduler) fatalError() error {
-	state := s.shutdown.Load()
+func (s *URingScheduler) signalShutdown(err error) bool {
+	return s.stop.CompareAndSwap(nil, &err)
+}
+
+func (s *URingScheduler) stopCause() error {
+	state := s.stop.Load()
 	if state == nil {
 		return nil
 	}
-	return state.err
+	return *state
 }
 
 type ringQueue interface {
 	GetSQE() *giouring.SubmissionQueueEntry
-	SubmitAndWait(uint32) (uint, error)
-	ForEachCQE(func(*giouring.CompletionQueueEvent))
+	SubmitAndWait(waitFor uint32) (submitted uint, err error)
+	ForEachCQE(func(*giouring.CompletionQueueEvent)) uint32
 	CQAdvance(uint32)
 }
 
@@ -258,22 +248,23 @@ type coordinator struct {
 	sched *URingScheduler
 	ring  ringQueue
 
+	// slots contains one entry per SQE until its CQE is reaped.
 	slots intrusive.FixedList[ringSlot]
 
-	works        intrusive.List[workItem]
-	ready        intrusive.List[intrusive.Handle]
+	pending intrusive.List[workItem]
+	// ready contains pending handles eligible for placement. Work waiting for
+	// a barrier remains in pending until the operation it depends on completes.
+	ready intrusive.List[intrusive.Handle]
+	// coalesced contains every pending handle selected for the next placement,
+	// in ready order. Contiguous writes extend it beyond the first item.
+	coalesced []intrusive.Handle
+
 	files        fileTable
 	nextSequence uint64
-	coalesced    []intrusive.Handle
-	stopping     bool
-
-	reapFn    func(*giouring.CompletionQueueEvent) // cached bound method; rebuilding it in reap allocates
-	reapCount uint32
 }
 
 func (s *URingScheduler) loop() {
 	defer s.wg.Done()
-	defer s.ring.QueueExit()
 
 	c := coordinator{
 		sched: s,
@@ -281,80 +272,40 @@ func (s *URingScheduler) loop() {
 		slots: intrusive.MakeFixedList[ringSlot](int(s.RingDepth)),
 	}
 	c.files = newFileTable(s.VFiles)
-	c.reapFn = c.reapOne
 
-	// Close is handled only after the steady-state loop returns.
-	err := c.serve(!s.DisableCoalescing)
-	c.shutdownPending(err)
+	cause := c.run()
+	s.signalShutdown(cause)
+	staged := reverseOps(s.closeStaging())
+	c.reap()
+	c.failRemaining(staged, cause)
+	c.releaseAllSlots()
 }
 
-// serve is the steady-state submit/reap loop. It runs until a close is signaled
-// (nil error) or the ring fails fatally (the error).
-func (c *coordinator) serve(coalesce bool) error {
-	s := c.sched
+func (c *coordinator) run() error {
 	for {
-		if c.works.Len() == 0 {
-			<-s.wakeup
-			if s.fatalError() != nil {
-				return nil
-			}
+		if stop := c.sched.stopCause(); stop != nil {
+			return stop
 		}
+		if c.pending.Len() == 0 {
+			<-c.sched.wakeup
+		}
+		// Else: we still grab newly submitted ops even if we have previously
+		// un-started work to keep pipeline full.
 
-		c.accept(reverseOps(s.stagingHead.Swap(nil)))
+		c.accept(reverseOps(c.sched.stagingHead.Swap(nil)))
+		c.placeReady(!c.sched.DisableCoalescing)
 
-		before := c.slots.Len()
-		c.placeReady(coalesce)
-		if placed := c.slots.Len() - before; placed > 0 {
-			s.stats.opsPlaced.Add(uint64(placed))
+		// After placement, pending work requires at least one occupied ring slot.
+		if err := buildutil.Assert(c.slots.Len() > 0 || c.pending.Len() == 0); err != nil {
+			return fmt.Errorf("iosched: pending work has no runnable or in-flight operation: %w", err)
 		}
 
 		if c.slots.Len() > 0 {
-			if err := c.submit(); err != nil {
+			if err := c.submitAndWait(); err != nil {
 				return fmt.Errorf("iosched: ring error: %w", err)
 			}
 			c.reap()
-		} else if c.works.Len() > 0 {
-			return errors.New("iosched: queued work is waiting with nothing in flight")
 		}
-	}
-}
-
-// shutdownPending completes every submission the coordinator still owns once serve
-// returns, so no caller waits forever. Three kinds can remain:
-//
-//  1. staged — an add that raced the close, or slipped in as the ring failed;
-//  2. accepted but not yet placed;
-//  3. in flight — already handed to the kernel.
-//
-// (1) and (2) never started, so fail them. (3) the kernel owns: on a clean close
-// reap it to completion; on a ring error it can't complete, so fail it too.
-func (c *coordinator) shutdownPending(err error) {
-	s := c.sched
-	if err != nil {
-		s.stop(err) // record the ring error for the tickets failed below
-	}
-	c.stopping = true
-	c.failSubmissionList(reverseOps(s.closeStaging()), s.fatalError())
-	if err != nil {
-		c.failAllWork(err)
-		c.failAllInflight(err)
-	} else {
-		c.failWaiting(s.fatalError())
-		c.drainInflight()
-	}
-}
-
-// drainInflight reaps the SQEs still in flight after a graceful close so the
-// kernel is done with their buffers before the ring exits.
-func (c *coordinator) drainInflight() {
-	for c.slots.Len() > 0 {
-		if err := c.submit(); err != nil {
-			failure := fmt.Errorf("iosched: ring error draining on close: %w", err)
-			c.failAllWork(failure)
-			c.failAllInflight(failure)
-			return
-		}
-		c.reap()
 	}
 }
 
@@ -388,7 +339,7 @@ func (c *coordinator) accept(head *Op) {
 			}
 		}
 		if err != nil {
-			c.failSubmission(root, err)
+			completeFailed(root, err)
 			continue
 		}
 
@@ -398,23 +349,20 @@ func (c *coordinator) accept(head *Op) {
 			sequence:  c.nextSequence,
 		}
 		c.nextSequence++
-		handle := c.works.PushBack(work)
+		handle := c.pending.PushBack(work)
 		if err := c.files.admit(c, handle); err != nil {
-			c.works.Remove(handle)
-			c.failSubmission(root, err)
+			c.pending.Remove(handle)
+			completeFailed(root, err)
 			continue
 		}
-		if c.works.Value(handle).waitCount == 0 {
+		if c.pending.Value(handle).waitCount == 0 {
 			c.enqueue(handle)
 		}
 	}
 }
 
 func (c *coordinator) releaseWait(handle intrusive.Handle) {
-	if c.stopping {
-		return
-	}
-	work := c.works.Value(handle)
+	work := c.pending.Value(handle)
 	work.waitCount--
 	if err := buildutil.Assert(work.waitCount >= 0); err != nil {
 		panic(err)
@@ -425,20 +373,11 @@ func (c *coordinator) releaseWait(handle intrusive.Handle) {
 }
 
 func (c *coordinator) enqueue(handle intrusive.Handle) {
-	work := c.works.Value(handle)
+	work := c.pending.Value(handle)
 	if work.ready != 0 || work.inflight {
 		return
 	}
 	work.ready = c.ready.PushBack(handle)
-}
-
-func (c *coordinator) failSubmissionList(op *Op, err error) {
-	for op != nil {
-		next := op.staged
-		op.staged = nil
-		c.failSubmission(op, err)
-		op = next
-	}
 }
 
 func (c *coordinator) placeReady(coalesce bool) {
@@ -456,7 +395,7 @@ func (c *coordinator) placeReady(coalesce bool) {
 
 		durable := c.durableWrite(c.coalesced)
 		writeGroup := len(c.coalesced) > 1 || durable
-		need := int(c.works.Value(handle).remaining)
+		need := int(c.pending.Value(handle).remaining)
 		if writeGroup {
 			need = 1
 			if durable {
@@ -468,7 +407,7 @@ func (c *coordinator) placeReady(coalesce bool) {
 		}
 
 		for _, ready := range c.coalesced {
-			work := c.works.Value(ready)
+			work := c.pending.Value(ready)
 			c.ready.Remove(work.ready)
 			work.ready = 0
 			work.inflight = true
@@ -482,7 +421,7 @@ func (c *coordinator) placeReady(coalesce bool) {
 }
 
 func (c *coordinator) coalescedRun(ready intrusive.Handle, run []intrusive.Handle) []intrusive.Handle {
-	first := c.works.Value(run[0])
+	first := c.pending.Value(run[0])
 	firstOp := first.root
 	if firstOp.linked != nil || !firstOp.coalescibleWrite() {
 		return run
@@ -496,7 +435,7 @@ func (c *coordinator) coalescedRun(ready intrusive.Handle, run []intrusive.Handl
 		}
 		ready = next
 		handle := *c.ready.Value(ready)
-		work := c.works.Value(handle)
+		work := c.pending.Value(handle)
 		op := work.root
 		sequence++
 		if work.sequence != sequence || op.linked != nil || !op.coalescibleWrite() ||
@@ -512,7 +451,7 @@ func (c *coordinator) coalescedRun(ready intrusive.Handle, run []intrusive.Handl
 func (c *coordinator) durableWrite(handles []intrusive.Handle) bool {
 	durable := false
 	for _, handle := range handles {
-		op := c.works.Value(handle).root
+		op := c.pending.Value(handle).root
 		if op.linked != nil || (op.kind() != OpWrite && op.kind() != OpWritev) {
 			return false
 		}
@@ -522,7 +461,7 @@ func (c *coordinator) durableWrite(handles []intrusive.Handle) bool {
 }
 
 func (c *coordinator) placeChain(handle intrusive.Handle) {
-	work := c.works.Value(handle)
+	work := c.pending.Value(handle)
 	for op := work.root; op != nil; op = op.linked {
 		slot := c.allocSlot()
 		c.initSlot(slot, handle, op, completeNormal)
@@ -532,11 +471,11 @@ func (c *coordinator) placeChain(handle intrusive.Handle) {
 
 func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) {
 	leader := handles[0]
-	first := c.works.Value(leader)
+	first := c.pending.Value(leader)
 	firstOp := first.root
 	completion := &writeCompletion{targets: make([]writeTarget, 0, len(handles))}
 	for _, handle := range handles {
-		op := c.works.Value(handle).root
+		op := c.pending.Value(handle).root
 		completion.targets = append(completion.targets, writeTarget{
 			work:  handle,
 			bytes: opBytes(op),
@@ -559,7 +498,7 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 	if len(handles) > 1 {
 		rs := c.slots.Value(writeSlot)
 		for _, handle := range handles {
-			rs.iovecs = appendIovec(rs.iovecs, c.works.Value(handle).root.buf)
+			rs.iovecs = appendIovec(rs.iovecs, c.pending.Value(handle).root.buf)
 		}
 	}
 
@@ -724,38 +663,35 @@ func iovecsPtr(iovs []syscall.Iovec) uintptr {
 	return uintptr(unsafe.Pointer(&iovs[0]))
 }
 
-func (c *coordinator) submit() error {
-	c.sched.stats.syscalls.Add(1) // one ring-enter per submit; EINTR re-entry is the same one
-	for {
-		_, err := c.ring.SubmitAndWait(1)
-		if err == nil {
-			return nil
+// submitAndWait submits queued SQEs and asks io_uring to wait for at least one
+// completion. Operation results arrive through CQEs, not as enter errors.
+func (c *coordinator) submitAndWait() error {
+	_, err := c.ring.SubmitAndWait(1)
+	switch {
+	case err == nil, errors.Is(err, syscall.EINTR):
+		return nil
+	case errors.Is(err, syscall.EAGAIN), errors.Is(err, syscall.EBUSY):
+		// io_uring_enter documents both errors as temporary resource
+		// conditions: reap available completions and retry. If none are ready,
+		// pause before returning to run so repeated failures do not busy-loop.
+		if c.reap() == 0 {
+			time.Sleep(time.Microsecond)
 		}
-		// io_uring_enter is io_uring's one interruptible point: a signal (e.g.
-		// Go's SIGURG async preemption) can interrupt the wait-for-completion.
-		// Re-enter to resume. The submitted read/write ops run asynchronously in
-		// kernel context and never complete with -EINTR, so this is the only
-		// EINTR handling io_uring needs. See the package doc.
-		if errors.Is(err, syscall.EINTR) {
-			continue
-		}
+		return nil
+	default:
 		return err
 	}
 }
 
-func (c *coordinator) reap() {
-	if c.reapFn == nil {
-		c.reapFn = c.reapOne
+func (c *coordinator) reap() uint32 {
+	count := c.ring.ForEachCQE(c.reapOne)
+	if count > 0 {
+		c.ring.CQAdvance(count)
 	}
-	c.reapCount = 0
-	c.ring.ForEachCQE(c.reapFn)
-	if c.reapCount > 0 {
-		c.ring.CQAdvance(c.reapCount)
-	}
+	return count
 }
 
 func (c *coordinator) reapOne(cqe *giouring.CompletionQueueEvent) {
-	c.reapCount++
 	handle := intrusive.Handle(cqe.GetData64())
 	rs := c.slots.Value(handle)
 
@@ -763,6 +699,9 @@ func (c *coordinator) reapOne(cqe *giouring.CompletionQueueEvent) {
 	var err error
 	if cqe.Res < 0 {
 		err = syscall.Errno(-cqe.Res)
+		if err == syscall.ECANCELED && c.sched.stopCause() == errSchedulerClosed {
+			err = errSchedulerClosed
+		}
 	} else {
 		n = int(cqe.Res)
 	}
@@ -780,19 +719,19 @@ func completeWrite(c *coordinator, slot *ringSlot, n int, err error) {
 }
 
 func recordDurableWrite(c *coordinator, slot *ringSlot, n int, err error) {
-	completion := c.works.Value(slot.work).write
+	completion := c.pending.Value(slot.work).write
 	completion.n = n
 	completion.err = err
 	distributeWrite(c, completion, n, err, nil, recordWriteResult)
 }
 
 func completeDurableWrite(c *coordinator, slot *ringSlot, _ int, syncErr error) {
-	completion := c.works.Value(slot.work).write
+	completion := c.pending.Value(slot.work).write
 	c.finishWrite(slot.work, completion.n, completion.err, syncErr)
 }
 
 func (c *coordinator) finishWrite(handle intrusive.Handle, n int, writeErr, syncErr error) {
-	completion := c.works.Value(handle).write
+	completion := c.pending.Value(handle).write
 	distributeWrite(c, completion, n, writeErr, syncErr, finishWriteTarget)
 }
 
@@ -817,17 +756,17 @@ func distributeWrite(
 }
 
 func recordWriteResult(c *coordinator, handle intrusive.Handle, n int, err error) {
-	root := c.works.Value(handle).root
+	root := c.pending.Value(handle).root
 	recordResult(root, root, n, err)
 }
 
 func finishWriteTarget(c *coordinator, handle intrusive.Handle, n int, err error) {
-	root := c.works.Value(handle).root
+	root := c.pending.Value(handle).root
 	c.finishOperation(handle, root, n, err)
 }
 
 func (c *coordinator) finishOperation(handle intrusive.Handle, op *Op, n int, err error) {
-	work := c.works.Value(handle)
+	work := c.pending.Value(handle)
 	root := work.root
 	recordResult(root, op, n, err)
 	c.files.completedOperation(c, handle, op)
@@ -835,8 +774,8 @@ func (c *coordinator) finishOperation(handle intrusive.Handle, op *Op, n int, er
 	last := work.remaining == 0
 	if last {
 		c.files.completedWork(c, handle, root)
-		c.works.Remove(handle)
-		completeSubmission(root)
+		c.pending.Remove(handle)
+		root.done.Done()
 	}
 }
 
@@ -852,53 +791,32 @@ func (c *coordinator) releaseSlot(handle intrusive.Handle) {
 	c.slots.Remove(handle)
 }
 
-func (c *coordinator) failAllInflight(_ error) {
-	for handle, ok := c.slots.Front(); ok; {
-		next, hasNext := c.slots.Next(handle)
-		rs := c.slots.Value(handle)
-		if rs.complete == nil {
-			handle, ok = next, hasNext
-			continue
-		}
+func (c *coordinator) releaseAllSlots() {
+	for handle := range c.slots.All() {
 		c.releaseSlot(handle)
-		handle, ok = next, hasNext
 	}
 }
 
-func (c *coordinator) failWaiting(err error) {
-	for handle, ok := c.works.Front(); ok; {
-		next, hasNext := c.works.Next(handle)
-		if !c.works.Value(handle).inflight {
-			c.failWork(handle, err)
+func (c *coordinator) failRemaining(staged *Op, err error) {
+	for handle, work := range c.pending.All() {
+		if work.ready != 0 {
+			c.ready.Remove(work.ready)
 		}
-		handle, ok = next, hasNext
+		root := work.root
+		c.pending.Remove(handle)
+		completeFailed(root, err)
+	}
+	for staged != nil {
+		next := staged.staged
+		staged.staged = nil
+		completeFailed(staged, err)
+		staged = next
 	}
 }
 
-func (c *coordinator) failAllWork(err error) {
-	for handle, ok := c.works.Front(); ok; {
-		next, hasNext := c.works.Next(handle)
-		c.failWork(handle, err)
-		handle, ok = next, hasNext
-	}
-}
-
-func (c *coordinator) failWork(handle intrusive.Handle, err error) {
-	work := c.works.Value(handle)
-	root := work.root
-	if work.ready != 0 {
-		c.ready.Remove(work.ready)
-	}
-	c.works.Remove(handle)
+func completeFailed(root *Op, err error) {
 	if root.err == nil {
 		root.err = err
 	}
-	completeSubmission(root)
-}
-
-func (c *coordinator) failSubmission(root *Op, err error) {
-	if root.err == nil {
-		root.err = err
-	}
-	completeSubmission(root)
+	root.done.Done()
 }

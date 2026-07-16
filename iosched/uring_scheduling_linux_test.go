@@ -14,9 +14,11 @@ import (
 )
 
 type fakeRingQueue struct {
-	sqes      []giouring.SubmissionQueueEntry
-	cqes      []giouring.CompletionQueueEvent
-	submitErr error
+	sqes            []giouring.SubmissionQueueEntry
+	cqes            []giouring.CompletionQueueEvent
+	submitErrs      []error
+	submitCalls     int
+	submitAndWaitFn func(*fakeRingQueue)
 }
 
 func (f *fakeRingQueue) GetSQE() *giouring.SubmissionQueueEntry {
@@ -25,13 +27,26 @@ func (f *fakeRingQueue) GetSQE() *giouring.SubmissionQueueEntry {
 }
 
 func (f *fakeRingQueue) SubmitAndWait(uint32) (uint, error) {
-	return uint(len(f.sqes)), f.submitErr
+	f.submitCalls++
+	if f.submitAndWaitFn != nil {
+		f.submitAndWaitFn(f)
+	}
+	var err error
+	if len(f.submitErrs) > 0 {
+		err = f.submitErrs[0]
+		f.submitErrs = f.submitErrs[1:]
+	}
+	if err != nil {
+		return 0, err
+	}
+	return uint(len(f.sqes)), nil
 }
 
-func (f *fakeRingQueue) ForEachCQE(fn func(*giouring.CompletionQueueEvent)) {
+func (f *fakeRingQueue) ForEachCQE(fn func(*giouring.CompletionQueueEvent)) uint32 {
 	for i := range f.cqes {
 		fn(&f.cqes[i])
 	}
+	return uint32(len(f.cqes))
 }
 
 func (f *fakeRingQueue) CQAdvance(count uint32) {
@@ -67,7 +82,7 @@ func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
 	}
 	c.accept(head)
 	handles := make([]intrusive.Handle, 0, len(ops))
-	for handle, ok := c.works.Front(); ok; handle, ok = c.works.Next(handle) {
+	for handle, ok := c.pending.Front(); ok; handle, ok = c.pending.Next(handle) {
 		handles = append(handles, handle)
 	}
 	return tickets, handles
@@ -92,7 +107,7 @@ func TestStagingClosePartitionsConcurrentPushes(t *testing.T) {
 		}()
 	}
 	close(start)
-	s.stop(stopErr)
+	s.signalShutdown(stopErr)
 	batch := s.closeStaging()
 	wg.Wait()
 
@@ -111,13 +126,130 @@ func TestStagingClosePartitionsConcurrentPushes(t *testing.T) {
 	if s.tryPush(new(Op)) {
 		t.Fatal("push succeeded after staging closed")
 	}
-	if !errors.Is(s.fatalError(), stopErr) {
-		t.Fatalf("fatal error: got %v want %v", s.fatalError(), stopErr)
+	if !errors.Is(s.stopCause(), stopErr) {
+		t.Fatalf("stop cause: got %v want %v", s.stopCause(), stopErr)
+	}
+}
+
+func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(1, 1, ring)
+	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	c.placeReady(false)
+	c.sched.signalShutdown(errSchedulerClosed)
+	ring.complete(ring.sqes[0].UserData, -int32(syscall.ECANCELED))
+	c.reap()
+
+	tickets[0].Wait()
+	if !errors.Is(tickets[0].Error(), errSchedulerClosed) {
+		t.Fatalf("ticket error: got %v want %v", tickets[0].Error(), errSchedulerClosed)
+	}
+}
+
+func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
+	ring := &fakeRingQueue{}
+	s := &URingScheduler{
+		URingConfig: URingConfig{RingDepth: 1, VFiles: 1},
+		wakeup:      make(chan struct{}, 1),
+	}
+	op := VReadOp(0, make([]byte, 1), 0)
+	ticket := op.prepareSubmission()
+	if !s.tryPush(&op) {
+		t.Fatal("submission was rejected before close")
+	}
+	s.signalShutdown(errSchedulerClosed)
+
+	c := coordinator{
+		sched: s,
+		ring:  ring,
+		slots: intrusive.MakeFixedList[ringSlot](1),
+		files: newFileTable(1),
+	}
+	cause := c.run()
+	if !errors.Is(cause, errSchedulerClosed) {
+		t.Fatalf("run error: got %v want %v", cause, errSchedulerClosed)
+	}
+	staged := reverseOps(s.closeStaging())
+	c.reap()
+	c.failRemaining(staged, cause)
+	c.releaseAllSlots()
+
+	ticket.Wait()
+	if !errors.Is(ticket.Error(), errSchedulerClosed) {
+		t.Fatalf("ticket error: got %v want %v", ticket.Error(), errSchedulerClosed)
+	}
+	if len(ring.sqes) != 0 || ring.submitCalls != 0 {
+		t.Fatalf("shutdown placed work: sqes=%d submit calls=%d", len(ring.sqes), ring.submitCalls)
+	}
+	if s.tryPush(new(Op)) {
+		t.Fatal("submission succeeded after close")
+	}
+}
+
+func TestResourceErrorReapsAvailableCompletion(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(1, 1, ring)
+	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	c.placeReady(false)
+	ring.submitErrs = []error{syscall.EAGAIN}
+	ring.complete(ring.sqes[0].UserData, 1)
+
+	if err := c.submitAndWait(); err != nil {
+		t.Fatal(err)
+	}
+	tickets[0].Wait()
+}
+
+func TestEINTRReturnsToCoordinator(t *testing.T) {
+	ring := &fakeRingQueue{submitErrs: []error{syscall.EINTR, nil}}
+	c := newTestCoordinator(1, 1, ring)
+	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	c.placeReady(false)
+	ring.submitAndWaitFn = func(f *fakeRingQueue) {
+		if f.submitCalls == 2 {
+			f.complete(f.sqes[0].UserData, 1)
+		}
+	}
+	if err := c.submitAndWait(); err != nil {
+		t.Fatal(err)
+	}
+	if ring.submitCalls != 1 {
+		t.Fatalf("submit calls before returning: got %d want 1", ring.submitCalls)
+	}
+	if err := c.submitAndWait(); err != nil {
+		t.Fatal(err)
+	}
+	c.reap()
+	tickets[0].Wait()
+
+	if ring.submitCalls != 2 {
+		t.Fatalf("submit calls: got %d want 2", ring.submitCalls)
+	}
+}
+
+func TestResourceErrorsReturnToCoordinator(t *testing.T) {
+	for _, enterErr := range []error{syscall.EAGAIN, syscall.EBUSY} {
+		t.Run(enterErr.Error(), func(t *testing.T) {
+			ring := &fakeRingQueue{submitErrs: []error{enterErr}}
+			c := newTestCoordinator(1, 1, ring)
+			acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+			c.placeReady(false)
+
+			if err := c.submitAndWait(); err != nil {
+				t.Fatal(err)
+			}
+			if ring.submitCalls != 1 {
+				t.Fatalf("submit calls: got %d want 1", ring.submitCalls)
+			}
+
+			c.failRemaining(nil, errors.New("test cleanup"))
+			c.releaseAllSlots()
+		})
 	}
 }
 
 func completeForTest(c *coordinator, handle intrusive.Handle, index uint32, n int, err error) {
-	work := c.works.Value(handle)
+	work := c.pending.Value(handle)
 	if work.ready != 0 {
 		c.ready.Remove(work.ready)
 		work.ready = 0
@@ -130,15 +262,14 @@ func completeForTest(c *coordinator, handle intrusive.Handle, index uint32, n in
 	c.finishOperation(handle, op, n, err)
 }
 
-func TestCoordinatorFailAllWorkPreservesCompletedRoot(t *testing.T) {
+func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 	err := errors.New("ring failed")
 	c := newTestCoordinator(2, 1, &fakeRingQueue{})
 	tickets, handles := acceptOps(&c, VReadOp(0, nil, 0).Link(VReadOp(0, nil, 0)))
 	ticket := tickets[0]
 
 	completeForTest(&c, handles[0], 0, 1, nil)
-	c.stopping = true
-	c.failAllWork(err)
+	c.failRemaining(nil, err)
 	ticket.Wait()
 
 	if ticket.N() != 1 {
@@ -149,22 +280,32 @@ func TestCoordinatorFailAllWorkPreservesCompletedRoot(t *testing.T) {
 	}
 }
 
-func TestDrainFailureCompletesInflightTicket(t *testing.T) {
-	err := errors.New("ring failed")
-	ring := &fakeRingQueue{submitErr: err}
-	c := newTestCoordinator(1, 1, ring)
-	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
-	ticket := tickets[0]
+func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
+	ringErr := errors.New("ring failed")
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(2, 2, ring)
+	tickets, _ := acceptOps(&c,
+		VReadOp(0, make([]byte, 1), 0),
+		VReadOp(1, make([]byte, 1), 0),
+	)
 	c.placeReady(false)
-	c.stopping = true
-	c.drainInflight()
+	ring.complete(ring.sqes[0].UserData, 1)
 
-	ticket.Wait()
-	if !errors.Is(ticket.Error(), err) {
-		t.Fatalf("ticket error: got %v want %v", ticket.Error(), err)
+	c.reap()
+	c.failRemaining(nil, ringErr)
+	c.releaseAllSlots()
+
+	for _, ticket := range tickets {
+		ticket.Wait()
 	}
-	if c.works.Len() != 0 || c.slots.Len() != 0 {
-		t.Fatalf("coordinator retained failed work: works=%d inflight=%d", c.works.Len(), c.slots.Len())
+	if tickets[0].N() != 1 || tickets[0].Error() != nil {
+		t.Fatalf("consumed request: N=%d error=%v", tickets[0].N(), tickets[0].Error())
+	}
+	if !errors.Is(tickets[1].Error(), ringErr) {
+		t.Fatalf("remaining request error: got %v want %v", tickets[1].Error(), ringErr)
+	}
+	if c.pending.Len() != 0 || c.slots.Len() != 0 {
+		t.Fatalf("coordinator retained failed work: pending=%d slots=%d", c.pending.Len(), c.slots.Len())
 	}
 }
 
@@ -175,11 +316,11 @@ func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
 		VReadOp(1, make([]byte, 1), 0),
 	)
 
-	if c.works.Value(handles[1]).waitCount != 1 || c.works.Value(handles[1]).ready != 0 {
+	if c.pending.Value(handles[1]).waitCount != 1 || c.pending.Value(handles[1]).ready != 0 {
 		t.Fatal("read did not wait for open")
 	}
 	completeForTest(&c, handles[0], 0, 0, nil)
-	if c.works.Value(handles[1]).ready == 0 {
+	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("read did not become ready at open completion")
 	}
 	completeForTest(&c, handles[1], 0, 1, nil)
@@ -192,11 +333,11 @@ func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
 		VCloseOp(1),
 	)
 
-	if c.works.Value(handles[1]).waitCount != 1 {
+	if c.pending.Value(handles[1]).waitCount != 1 {
 		t.Fatal("close did not wait for older read")
 	}
 	completeForTest(&c, handles[0], 0, 1, nil)
-	if c.works.Value(handles[1]).ready == 0 {
+	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("close did not become ready after read")
 	}
 	completeForTest(&c, handles[1], 0, 0, nil)
@@ -212,7 +353,7 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 		),
 	)
 
-	chain := c.works.Value(handles[1])
+	chain := c.pending.Value(handles[1])
 	if chain.waitCount != 1 || chain.ready != 0 {
 		t.Fatal("close chain did not wait exactly for older work")
 	}
@@ -229,7 +370,7 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	}
 
 	completeForTest(&c, handles[0], 0, 1, nil)
-	if c.works.Value(handles[1]).ready == 0 {
+	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("close chain did not become ready after older work completed")
 	}
 	completeForTest(&c, handles[1], 0, 1, nil)
@@ -262,15 +403,15 @@ func TestDeferredMultiFileWorkIsKnownAtAdmission(t *testing.T) {
 		VCloseOp(1),
 	)
 
-	if c.works.Value(handles[1]).waitCount != 1 {
+	if c.pending.Value(handles[1]).waitCount != 1 {
 		t.Fatal("linked work did not wait for open")
 	}
-	if c.works.Value(handles[2]).waitCount != 1 {
+	if c.pending.Value(handles[2]).waitCount != 1 {
 		t.Fatal("close overtook older blocked write")
 	}
 	completeForTest(&c, handles[0], 0, 0, nil)
 	completeForTest(&c, handles[1], 0, 1, nil)
-	if c.works.Value(handles[2]).ready != 0 {
+	if c.pending.Value(handles[2]).ready != 0 {
 		t.Fatal("close became ready before the linked write completed")
 	}
 	completeForTest(&c, handles[1], 1, 1, nil)
@@ -288,15 +429,15 @@ func TestOpenBarrierWaitsForWholeLinkedChain(t *testing.T) {
 	)
 
 	completeForTest(&c, handles[0], 0, 0, nil)
-	if c.works.Value(handles[1]).ready != 0 {
+	if c.pending.Value(handles[1]).ready != 0 {
 		t.Fatal("open dependent escaped after only the open completed")
 	}
 	completeForTest(&c, handles[0], 1, 0, nil)
-	if c.works.Value(handles[1]).ready != 0 {
+	if c.pending.Value(handles[1]).ready != 0 {
 		t.Fatal("open dependent escaped before the whole linked chain completed")
 	}
 	completeForTest(&c, handles[0], 2, 1, nil)
-	if c.works.Value(handles[1]).ready == 0 {
+	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("open dependent did not become ready with the linked chain")
 	}
 	completeForTest(&c, handles[1], 0, 1, nil)
@@ -310,7 +451,7 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	)
 
 	completeForTest(&c, handles[0], 0, 0, syscall.ENOENT)
-	if c.works.Value(handles[1]).ready == 0 {
+	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("failed open did not release waiting write")
 	}
 
@@ -326,10 +467,10 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	finalRoot := VOpenatOp(0, "b", 0, 0, 0)
 	final := finalRoot.prepareSubmission()
 	c.accept(&finalRoot)
-	if c.works.Len() != 1 {
+	if c.pending.Len() != 1 {
 		t.Fatal("retry open was not accepted after prior slot work completed")
 	}
-	handle, _ := c.works.Front()
+	handle, _ := c.pending.Front()
 	completeForTest(&c, handle, 0, 0, nil)
 	final.Wait()
 	if final.Error() != nil {
@@ -345,12 +486,12 @@ func TestWriteGroupPreservesCountsOnSyncError(t *testing.T) {
 		VWriteOp(0, make([]byte, 4), 4),
 	)
 	for _, handle := range handles {
-		work := c.works.Value(handle)
+		work := c.pending.Value(handle)
 		c.ready.Remove(work.ready)
 		work.ready = 0
 		work.inflight = true
 	}
-	c.works.Value(handles[0]).write = &writeCompletion{targets: []writeTarget{
+	c.pending.Value(handles[0]).write = &writeCompletion{targets: []writeTarget{
 		{work: handles[0], bytes: 4},
 		{work: handles[1], bytes: 4},
 	}}
@@ -376,9 +517,8 @@ func TestDurableWritePreservesCountsOnRingFailureAfterWrite(t *testing.T) {
 	writeSlot := ring.sqes[0].UserData
 	ring.complete(writeSlot, 4)
 	c.reap()
-	c.stopping = true
-	c.failAllWork(ringErr)
-	c.failAllInflight(ringErr)
+	c.failRemaining(nil, ringErr)
+	c.releaseAllSlots()
 
 	ticket := tickets[0]
 	ticket.Wait()
@@ -498,9 +638,8 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 		t.Fatalf("last SQE = {opcode:%d fd:%d}, want same-slot read", last.OpCode, last.Fd)
 	}
 
-	c.stopping = true
-	c.failAllWork(errors.New("test cleanup"))
-	c.failAllInflight(errors.New("test cleanup"))
+	c.failRemaining(nil, errors.New("test cleanup"))
+	c.releaseAllSlots()
 	for _, ticket := range tickets {
 		ticket.Wait()
 	}
@@ -549,9 +688,8 @@ func TestCoordinatorCloseDrainWithAdversarialCompletions(t *testing.T) {
 		t.Fatalf("close was not placed after the same-slot read: %+v", ring.sqes)
 	}
 
-	c.stopping = true
-	c.failAllWork(errors.New("test cleanup"))
-	c.failAllInflight(errors.New("test cleanup"))
+	c.failRemaining(nil, errors.New("test cleanup"))
+	c.releaseAllSlots()
 	for _, ticket := range tickets {
 		ticket.Wait()
 	}

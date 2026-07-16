@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/miretskiy/dio/giouring"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -18,8 +19,7 @@ func TestDurableWrite(t *testing.T) {
 		c := newTestCoordinator(8, 1, &fakeRingQueue{})
 		_, handles := acceptOps(&c, ops...)
 		got := c.durableWrite(handles)
-		c.stopping = true
-		c.failAllWork(errors.New("test cleanup"))
+		c.failRemaining(nil, errors.New("test cleanup"))
 		return got
 	}
 	require.True(t, durable(VWriteOp(0, make([]byte, 8), 0).Durable()))
@@ -41,6 +41,38 @@ func TestDurableWrite(t *testing.T) {
 	require.Same(t, regular, regSync.f)
 }
 
+func TestPlaceDurableWriteWithLinkedSync(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(2, 1, ring)
+	tickets, _ := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0).Durable())
+
+	c.placeReady(true)
+	require.Len(t, ring.sqes, 2)
+	require.Equal(t, uint8(giouring.OpWrite), ring.sqes[0].OpCode)
+	require.NotZero(t, ring.sqes[0].Flags&giouring.SqeIOLink)
+	require.Equal(t, uint8(giouring.OpFsync), ring.sqes[1].OpCode)
+	require.Equal(t, giouring.FsyncDatasync, ring.sqes[1].OpcodeFlags)
+
+	c.failRemaining(nil, errors.New("test cleanup"))
+	c.releaseAllSlots()
+	tickets[0].Wait()
+}
+
+func TestPlacePlainWriteWithoutSync(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(2, 1, ring)
+	tickets, _ := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0))
+
+	c.placeReady(true)
+	require.Len(t, ring.sqes, 1)
+	require.Equal(t, uint8(giouring.OpWrite), ring.sqes[0].OpCode)
+	require.Zero(t, ring.sqes[0].Flags&giouring.SqeIOLink)
+
+	c.failRemaining(nil, errors.New("test cleanup"))
+	c.releaseAllSlots()
+	tickets[0].Wait()
+}
+
 func newDurabilitySched(t *testing.T) *URingScheduler {
 	t.Helper()
 	if !IOUringAvailable {
@@ -54,7 +86,7 @@ func newDurabilitySched(t *testing.T) *URingScheduler {
 	return s
 }
 
-func TestURingDurableWriteUsesLinkedSync(t *testing.T) {
+func TestURingDurableWrite(t *testing.T) {
 	s := newDurabilitySched(t)
 	path := filepath.Join(t.TempDir(), "durable.dat")
 
@@ -63,12 +95,10 @@ func TestURingDurableWriteUsesLinkedSync(t *testing.T) {
 	open.Wait()
 	require.NoError(t, open.Error())
 
-	before := s.Stats().OpsPlaced
 	w, err := s.Submit(VWriteOp(0, []byte("durable payload"), 0).Durable())
 	require.NoError(t, err)
 	w.Wait()
 	require.NoError(t, w.Error())
-	require.Equal(t, uint64(2), s.Stats().OpsPlaced-before, "write plus linked fdatasync")
 
 	cl, err := s.Submit(VCloseOp(0))
 	require.NoError(t, err)
