@@ -41,11 +41,11 @@ func (o *RecvmsgOut) CmsgNexthdr(msgh *syscall.Msghdr, cmsg *syscall.Cmsghdr) *s
 		return nil
 	}
 	end := (*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(o.CmsgFirsthdr(msgh))) + uintptr(o.ControlLen)))
-	cmsg = (*syscall.Cmsghdr)(unsafe.Pointer(uintptr(unsafe.Pointer(cmsg)) + uintptr(cmsgAlign(cmsg.Len))))
+	cmsg = (*syscall.Cmsghdr)(unsafe.Pointer(uintptr(unsafe.Pointer(cmsg)) + uintptr(cmsgAlign(uint64(cmsg.Len)))))
 	if uintptr(unsafe.Pointer(cmsg))+unsafe.Sizeof(*cmsg) > uintptr(unsafe.Pointer(end)) {
 		return nil
 	}
-	if uintptr(unsafe.Pointer(cmsg))+uintptr(cmsgAlign(cmsg.Len)) > uintptr(unsafe.Pointer(end)) {
+	if uintptr(unsafe.Pointer(cmsg))+uintptr(cmsgAlign(uint64(cmsg.Len))) > uintptr(unsafe.Pointer(end)) {
 		return nil
 	}
 

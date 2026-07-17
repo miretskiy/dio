@@ -51,7 +51,6 @@ type Op struct {
 	linked   *Op
 
 	*completion
-	staged *Op
 }
 
 // SQE linking flag bits stored in Op.sqeFlags, marking how a linked follower is
@@ -332,22 +331,29 @@ func (t Ticket) Error() error { return t.err }
 // after Wait.
 func (t Ticket) N() int { return t.n }
 
-func countAndValidateOps(op *Op) (int32, error) {
+func countAndValidateOps(op *Op, uring *URingConfig) (int32, error) {
 	var count int32
 	linked := op.linked != nil
 	for p := op; p != nil; p = p.linked {
-		switch {
-		case linked && p.durable() && (p.kind() == OpWrite || p.kind() == OpWritev):
+		kind := p.kind()
+		if linked && p.durable() && (kind == OpWrite || kind == OpWritev) {
 			return 0, fmt.Errorf("iosched: Durable cannot be used in a linked chain; add FdatasyncOp explicitly")
-		case p.kind() == OpOpenat:
-			// openat carries a path and no *os.File in either addressing mode.
+		}
+		if kind == OpOpenat {
 			if len(p.path) <= 1 {
 				return 0, fmt.Errorf("iosched: op %d has empty open path", count)
 			}
-		case p.isVirtual():
-			// virtual read/write/fsync/close name a registered slot; the index is
-			// range-checked against the table at submission time.
-		case p.f == nil:
+		}
+		if p.isVirtual() {
+			if uring != nil {
+				if uring.VFiles == 0 {
+					return 0, fmt.Errorf("iosched: virtual file ops require URingConfig.VFiles")
+				}
+				if p.vfd >= uring.VFiles {
+					return 0, fmt.Errorf("iosched: virtual file index %d outside configured table", p.vfd)
+				}
+			}
+		} else if kind != OpOpenat && p.f == nil {
 			return 0, fmt.Errorf("iosched: op %d has nil file", count)
 		}
 		count++

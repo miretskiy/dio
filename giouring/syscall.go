@@ -62,6 +62,7 @@ func (ring *Ring) Enter2(
 		uintptr(sig),
 		uintptr(size),
 	)
+	runtime.KeepAlive(sig)
 
 	if errno > 0 {
 		return 0, errno
@@ -74,8 +75,11 @@ func (ring *Ring) Enter2(
 func Setup(entries uint32, p *Params) (uint, error) {
 	fd, _, errno := syscall.Syscall(sysSetup, uintptr(entries), uintptr(unsafe.Pointer(p)), 0)
 	runtime.KeepAlive(p)
+	if errno != 0 {
+		return 0, errno
+	}
 
-	return uint(fd), errno
+	return uint(fd), nil
 }
 
 func syscallRegister(fd int, opcode uint32, arg unsafe.Pointer, nrArgs uint32) (uint, syscall.Errno) {
@@ -88,6 +92,7 @@ func syscallRegister(fd int, opcode uint32, arg unsafe.Pointer, nrArgs uint32) (
 		0,
 		0,
 	)
+	runtime.KeepAlive(arg)
 
 	return uint(returnFirst), errno
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -38,22 +39,27 @@ type writeTarget struct {
 	bytes int
 }
 
-type writeCompletion struct {
-	targets []writeTarget
-	n       int
-	err     error
+// writeGroupCompletion is stored in the group's leader workItem. Its
+// distribute method snapshots this value before callbacks can remove that
+// leader.
+type writeGroupCompletion struct {
+	inline   [4]writeTarget // first targets in writev order
+	overflow []writeTarget  // targets beyond inline capacity
+	count    int            // total valid targets
+	n        int            // write result retained until fdatasync
+	err      error          // write error retained until fdatasync
 }
 
 type writeResultFn func(*coordinator, intrusive.Handle, int, error)
 
 type workItem struct {
-	root      *Op
-	waitCount int32
-	remaining int32
-	sequence  uint64
-	ready     intrusive.Handle
-	inflight  bool
-	write     *writeCompletion
+	root       *Op
+	waitCount  int32
+	remaining  int32
+	sequence   uint64
+	ready      intrusive.Handle
+	inflight   bool
+	writeGroup writeGroupCompletion
 }
 
 type completionFn func(*coordinator, *ringSlot, int, error)
@@ -67,7 +73,15 @@ type ringSlot struct {
 	iovecs []syscall.Iovec
 }
 
-var stagingClosed Op
+// submission is the scheduler-owned envelope for one validated Submit call.
+type submission struct {
+	root       Op          // scheduler-owned copy of the submitted operation chain
+	completion completion  // result state shared with the returned Ticket
+	count      int32       // validated number of operations in root's chain
+	staged     *submission // next item in the lock-free staging stack
+}
+
+var stagingClosed submission
 
 // URingScheduler is an asynchronous Scheduler backed by io_uring.
 //
@@ -78,9 +92,12 @@ var stagingClosed Op
 type URingScheduler struct {
 	URingConfig
 
-	ring        *giouring.Ring
-	stagingHead atomic.Pointer[Op]
-	wakeup      chan struct{}
+	ring *giouring.Ring
+	// registeredPool keeps fixed-buffer backing memory reachable until the
+	// ring is closed. The caller still owns and closes the pool.
+	registeredPool *mempool.SlabPool
+	stagingHead    atomic.Pointer[submission]
+	wakeup         chan struct{}
 
 	stop atomic.Pointer[error]
 
@@ -88,11 +105,20 @@ type URingScheduler struct {
 }
 
 func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
+	if pool == nil {
+		return errors.New("iosched: cannot register a nil DMA slab")
+	}
+	if s.registeredPool != nil {
+		return errors.New("iosched: a DMA slab is already registered")
+	}
+
 	data := pool.RawData()
-	iovs := []syscall.Iovec{{Base: &data[0], Len: uint64(len(data))}}
+	iovs := []syscall.Iovec{{Base: &data[0]}}
+	iovs[0].SetLen(len(data))
 	if _, err := s.ring.RegisterBuffers(iovs); err != nil {
 		return fmt.Errorf("iosched: io_uring_register_buffers: %w", err)
 	}
+	s.registeredPool = pool
 	return nil
 }
 
@@ -141,7 +167,7 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 		return Ticket{}, err
 	}
 
-	n, err := countAndValidateOps(&op)
+	n, err := countAndValidateOps(&op, &s.URingConfig)
 	if err != nil {
 		return Ticket{}, err
 	}
@@ -152,8 +178,8 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 		return Ticket{}, fmt.Errorf("iosched: operation requires %d ring slots, exceeds ring depth %d", need, s.RingDepth)
 	}
 
-	ticket := op.prepareSubmission()
-	if !s.tryPush(&op) {
+	request, ticket := newSubmission(op, n)
+	if !s.tryPush(request) {
 		return Ticket{}, s.stopCause()
 	}
 	select {
@@ -178,20 +204,27 @@ func transformedSlotCount(op *Op, count int32) int32 {
 	}
 }
 
-func (s *URingScheduler) tryPush(op *Op) bool {
+func newSubmission(op Op, count int32) (*submission, Ticket) {
+	request := &submission{root: op, count: count}
+	request.root.completion = &request.completion
+	request.completion.done.Add(1)
+	return request, Ticket{&request.completion}
+}
+
+func (s *URingScheduler) tryPush(request *submission) bool {
 	for {
 		head := s.stagingHead.Load()
 		if head == &stagingClosed {
 			return false
 		}
-		op.staged = head
-		if s.stagingHead.CompareAndSwap(head, op) {
+		request.staged = head
+		if s.stagingHead.CompareAndSwap(head, request) {
 			return true
 		}
 	}
 }
 
-func (s *URingScheduler) closeStaging() *Op {
+func (s *URingScheduler) closeStaging() *submission {
 	head := s.stagingHead.Swap(&stagingClosed)
 	if head == &stagingClosed {
 		return nil
@@ -221,7 +254,10 @@ func (s *URingScheduler) Close() error {
 		}
 	}
 	s.wg.Wait()
+	pool := s.registeredPool
 	s.ring.QueueExit()
+	runtime.KeepAlive(pool)
+	s.registeredPool = nil
 	return nil
 }
 
@@ -275,7 +311,7 @@ func (s *URingScheduler) loop() {
 
 	cause := c.run()
 	s.signalShutdown(cause)
-	staged := reverseOps(s.closeStaging())
+	staged := reverseSubmissions(s.closeStaging())
 	c.reap()
 	c.failRemaining(staged, cause)
 	c.releaseAllSlots()
@@ -292,7 +328,7 @@ func (c *coordinator) run() error {
 		// Else: we still grab newly submitted ops even if we have previously
 		// un-started work to keep pipeline full.
 
-		c.accept(reverseOps(c.sched.stagingHead.Swap(nil)))
+		c.accept(reverseSubmissions(c.sched.stagingHead.Swap(nil)))
 		c.placeReady(!c.sched.DisableCoalescing)
 
 		// After placement, pending work requires at least one occupied ring slot.
@@ -309,8 +345,8 @@ func (c *coordinator) run() error {
 	}
 }
 
-func reverseOps(head *Op) *Op {
-	var out *Op
+func reverseSubmissions(head *submission) *submission {
+	var out *submission
 	for head != nil {
 		next := head.staged
 		head.staged = out
@@ -320,32 +356,16 @@ func reverseOps(head *Op) *Op {
 	return out
 }
 
-func (c *coordinator) accept(head *Op) {
+func (c *coordinator) accept(head *submission) {
 	for head != nil {
-		root := head
+		request := head
 		head = head.staged
-		root.staged = nil
-		need := root.opCount()
-
-		var err error
-		for op := root; op != nil; op = op.linked {
-			if op.isVirtual() {
-				switch {
-				case c.sched.VFiles == 0:
-					err = fmt.Errorf("iosched: virtual file ops require URingConfig.VFiles")
-				case op.vfd >= c.sched.VFiles:
-					err = fmt.Errorf("iosched: virtual file index %d outside configured table", op.vfd)
-				}
-			}
-		}
-		if err != nil {
-			completeFailed(root, err)
-			continue
-		}
+		request.staged = nil
+		root := &request.root
 
 		work := workItem{
 			root:      root,
-			remaining: int32(need),
+			remaining: request.count,
 			sequence:  c.nextSequence,
 		}
 		c.nextSequence++
@@ -428,6 +448,10 @@ func (c *coordinator) coalescedRun(ready intrusive.Handle, run []intrusive.Handl
 	}
 	sequence := first.sequence
 	runEnd := firstOp.offset + int64(len(firstOp.buf))
+	// Only adjacent submissions are coalesced. Searching past unrelated work
+	// would require proving that every skipped operation is independent of this
+	// file; sorting by offset would invent ordering that separate Submit calls do
+	// not provide. Keep the placement rule local and predictable instead.
 	for len(run) < maxCoalescedWrites {
 		next, ok := c.ready.Next(ready)
 		if !ok {
@@ -473,15 +497,20 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 	leader := handles[0]
 	first := c.pending.Value(leader)
 	firstOp := first.root
-	completion := &writeCompletion{targets: make([]writeTarget, 0, len(handles))}
-	for _, handle := range handles {
-		op := c.pending.Value(handle).root
-		completion.targets = append(completion.targets, writeTarget{
-			work:  handle,
-			bytes: opBytes(op),
-		})
+	completion := &first.writeGroup
+	completion.count = len(handles)
+	if extra := len(handles) - len(completion.inline); extra > 0 {
+		completion.overflow = make([]writeTarget, extra)
 	}
-	first.write = completion
+	for i, handle := range handles {
+		op := c.pending.Value(handle).root
+		target := writeTarget{work: handle, bytes: opBytes(op)}
+		if i < len(completion.inline) {
+			completion.inline[i] = target
+		} else {
+			completion.overflow[i-len(completion.inline)] = target
+		}
+	}
 
 	writeSlot := c.allocSlot()
 	prepared := *firstOp
@@ -584,7 +613,7 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iov
 		}
 	}
 
-	buf := bufferPtr(op.buf)
+	buf := slicePtr(op.buf)
 	switch op.kind() {
 	case OpRead:
 		if op.isFixed() {
@@ -599,9 +628,9 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iov
 			sqe.PrepareWrite(fd, buf, uint32(len(op.buf)), uint64(op.offset))
 		}
 	case OpReadv:
-		sqe.PrepareReadv(fd, iovecsPtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
+		sqe.PrepareReadv(fd, slicePtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
 	case OpWritev:
-		sqe.PrepareWritev(fd, iovecsPtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
+		sqe.PrepareWritev(fd, slicePtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
 	case OpFsync:
 		sqe.PrepareFsync(fd, 0)
 	case OpFdatasync:
@@ -641,7 +670,7 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iov
 	}
 }
 
-func bufferPtr(buf []byte) uintptr {
+func slicePtr[T any](buf []T) uintptr {
 	if len(buf) == 0 {
 		return 0
 	}
@@ -653,14 +682,9 @@ func appendIovec(iv []syscall.Iovec, b []byte) []syscall.Iovec {
 	if len(b) == 0 {
 		return iv
 	}
-	return append(iv, syscall.Iovec{Base: &b[0], Len: uint64(len(b))})
-}
-
-func iovecsPtr(iovs []syscall.Iovec) uintptr {
-	if len(iovs) == 0 {
-		return 0
-	}
-	return uintptr(unsafe.Pointer(&iovs[0]))
+	iovec := syscall.Iovec{Base: &b[0]}
+	iovec.SetLen(len(b))
+	return append(iv, iovec)
 }
 
 // submitAndWait submits queued SQEs and asks io_uring to wait for at least one
@@ -719,27 +743,31 @@ func completeWrite(c *coordinator, slot *ringSlot, n int, err error) {
 }
 
 func recordDurableWrite(c *coordinator, slot *ringSlot, n int, err error) {
-	completion := c.pending.Value(slot.work).write
+	completion := &c.pending.Value(slot.work).writeGroup
 	completion.n = n
 	completion.err = err
-	distributeWrite(c, completion, n, err, nil, recordWriteResult)
+	completion.distribute(c, n, err, nil, recordWriteResult)
 }
 
 func completeDurableWrite(c *coordinator, slot *ringSlot, _ int, syncErr error) {
-	completion := c.pending.Value(slot.work).write
+	completion := &c.pending.Value(slot.work).writeGroup
 	c.finishWrite(slot.work, completion.n, completion.err, syncErr)
 }
 
 func (c *coordinator) finishWrite(handle intrusive.Handle, n int, writeErr, syncErr error) {
-	completion := c.pending.Value(handle).write
-	distributeWrite(c, completion, n, writeErr, syncErr, finishWriteTarget)
+	completion := &c.pending.Value(handle).writeGroup
+	completion.distribute(c, n, writeErr, syncErr, finishWriteTarget)
 }
 
-func distributeWrite(
-	c *coordinator, completion *writeCompletion, n int, writeErr, syncErr error, apply writeResultFn,
+// distribute has a value receiver intentionally. Applying the leader's result
+// can remove and zero the pending workItem that owns the original completion;
+// the value copy keeps the inline targets and overflow slice header stable for
+// the rest of the group.
+func (completion writeGroupCompletion) distribute(
+	c *coordinator, n int, writeErr, syncErr error, apply writeResultFn,
 ) {
 	remaining := n
-	for _, target := range completion.targets {
+	applyTarget := func(target writeTarget) {
 		n := 0
 		err := writeErr
 		if err == nil {
@@ -752,6 +780,15 @@ func distributeWrite(
 			}
 		}
 		apply(c, target.work, n, err)
+	}
+	for i := range completion.count {
+		var target writeTarget
+		if i < len(completion.inline) {
+			target = completion.inline[i]
+		} else {
+			target = completion.overflow[i-len(completion.inline)]
+		}
+		applyTarget(target)
 	}
 }
 
@@ -797,7 +834,7 @@ func (c *coordinator) releaseAllSlots() {
 	}
 }
 
-func (c *coordinator) failRemaining(staged *Op, err error) {
+func (c *coordinator) failRemaining(staged *submission, err error) {
 	for handle, work := range c.pending.All() {
 		if work.ready != 0 {
 			c.ready.Remove(work.ready)
@@ -809,7 +846,7 @@ func (c *coordinator) failRemaining(staged *Op, err error) {
 	for staged != nil {
 		next := staged.staged
 		staged.staged = nil
-		completeFailed(staged, err)
+		completeFailed(&staged.root, err)
 		staged = next
 	}
 }

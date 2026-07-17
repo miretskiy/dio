@@ -176,14 +176,19 @@ func BenchmarkFanout_URing(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer sched.Close()
 
 	// 1 GiB slab, 1 MiB slots.  Size is a 2 MiB multiple → MAP_HUGETLB attempted.
 	pool, err := mempool.NewSlabPool(1<<30, fanoutChunk)
 	if err != nil {
+		_ = sched.Close()
 		b.Fatal(err)
 	}
-	defer pool.Close()
+	defer func() {
+		if err := sched.Close(); err != nil {
+			b.Errorf("close io_uring scheduler: %v", err)
+		}
+		pool.Close()
+	}()
 
 	if err := iosched.RegisterDMASlab(sched, pool); err != nil {
 		b.Fatal(err)

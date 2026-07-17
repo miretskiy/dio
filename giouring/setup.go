@@ -28,8 +28,11 @@ package giouring
 import (
 	"math/bits"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -38,11 +41,7 @@ const (
 )
 
 func fls(x int) int {
-	if x == 0 {
-		return 0
-	}
-
-	return 8*int(unsafe.Sizeof(x)) - bits.LeadingZeros32(uint32(x))
+	return bits.Len32(uint32(x))
 }
 
 func roundupPow2(depth uint32) uint32 {
@@ -109,7 +108,9 @@ func SetupRingPointers(p *Params, sq *SubmissionQueue, cq *CompletionQueue) {
 	sq.ringEntries = (*uint32)(unsafe.Pointer(uintptr(sq.ringPtr) + uintptr(p.sqOff.ringEntries)))
 	sq.flags = (*uint32)(unsafe.Pointer(uintptr(sq.ringPtr) + uintptr(p.sqOff.flags)))
 	sq.dropped = (*uint32)(unsafe.Pointer(uintptr(sq.ringPtr) + uintptr(p.sqOff.dropped)))
-	sq.array = (*uint32)(unsafe.Pointer(uintptr(sq.ringPtr) + uintptr(p.sqOff.array)))
+	if p.flags&SetupNoSQArray == 0 {
+		sq.array = (*uint32)(unsafe.Pointer(uintptr(sq.ringPtr) + uintptr(p.sqOff.array)))
+	}
 
 	cq.head = (*uint32)(unsafe.Pointer(uintptr(cq.ringPtr) + uintptr(p.cqOff.head)))
 	cq.tail = (*uint32)(unsafe.Pointer(uintptr(cq.ringPtr) + uintptr(p.cqOff.tail)))
@@ -169,7 +170,8 @@ func Mmap(fd int, p *Params, sq *SubmissionQueue, cq *CompletionQueue) error {
 	if p.flags&SetupSQE128 != 0 {
 		size += 64
 	}
-	ringPtr, err = mmap(size*uintptr(p.sqEntries), syscall.PROT_READ|syscall.PROT_WRITE,
+	sq.sqesSize = uint(size * uintptr(p.sqEntries))
+	ringPtr, err = mmap(uintptr(sq.sqesSize), syscall.PROT_READ|syscall.PROT_WRITE,
 		syscall.MAP_SHARED|syscall.MAP_POPULATE, fd, int64(offSQEs))
 	if err != nil {
 		goto err
@@ -229,6 +231,10 @@ func (ring *Ring) RingDontFork() error {
 /* FIXME */
 const hugePageSize uint64 = 2 * 1024 * 1024
 
+// kringSize is the fixed kernel-ring header included by liburing when it
+// lays out an application-provided IORING_SETUP_NO_MMAP buffer.
+const kringSize uint64 = 64
+
 // liburing: io_uring_alloc_huge
 func allocHuge(
 	entries uint32, p *Params, sq *SubmissionQueue, cq *CompletionQueue, buf unsafe.Pointer, bufSize uint64,
@@ -244,13 +250,20 @@ func allocHuge(
 		return 0, errno
 	}
 
-	sqesMem = uint64(sqEntries) * uint64(unsafe.Sizeof(SubmissionQueue{}))
-	sqesMem = (sqesMem + pageSize - 1) &^ (pageSize - 1)
-	ringMem = uint64(cqEntries) * uint64(unsafe.Sizeof(CompletionQueue{}))
-	if p.flags&SetupCQE32 != 0 {
-		ringMem *= 2
+	sqeSize := uint64(unsafe.Sizeof(SubmissionQueueEntry{}))
+	if p.flags&SetupSQE128 != 0 {
+		sqeSize += 64
 	}
-	ringMem += uint64(sqEntries) * uint64(unsafe.Sizeof(uint32(0)))
+	sqesMem = uint64(sqEntries) * sqeSize
+	sqesMem = (sqesMem + pageSize - 1) &^ (pageSize - 1)
+	cqeSize := uint64(unsafe.Sizeof(CompletionQueueEvent{}))
+	if p.flags&SetupCQE32 != 0 {
+		cqeSize *= 2
+	}
+	ringMem = kringSize + uint64(cqEntries)*cqeSize
+	if p.flags&SetupNoSQArray == 0 {
+		ringMem += uint64(sqEntries) * uint64(unsafe.Sizeof(uint32(0)))
+	}
 	memUsed = sqesMem + ringMem
 	memUsed = (memUsed + pageSize - 1) &^ (pageSize - 1)
 
@@ -269,7 +282,7 @@ func allocHuge(
 			bufSize = pageSize
 		} else {
 			bufSize = hugePageSize
-			mapHugetlb = syscall.MAP_HUGETLB
+			mapHugetlb = unix.MAP_HUGETLB
 		}
 		var err error
 		ptr, err = sysMmap(
@@ -279,6 +292,7 @@ func allocHuge(
 		if err != nil {
 			return 0, err
 		}
+		sq.sqesSize = uint(bufSize)
 	}
 
 	sq.sqes = (*SubmissionQueueEntry)(ptr)
@@ -292,7 +306,7 @@ func allocHuge(
 			bufSize = pageSize
 		} else {
 			bufSize = hugePageSize
-			mapHugetlb = syscall.MAP_HUGETLB
+			mapHugetlb = unix.MAP_HUGETLB
 		}
 		var err error
 		ptr, err = sysMmap(
@@ -300,7 +314,9 @@ func allocHuge(
 			syscall.PROT_READ|syscall.PROT_WRITE,
 			syscall.MAP_SHARED|syscall.MAP_ANONYMOUS|mapHugetlb, -1, 0)
 		if err != nil {
-			_ = sysMunmap(unsafe.Pointer(sq.sqes), 1)
+			if sq.sqesSize != 0 {
+				_ = sysMunmap(unsafe.Pointer(sq.sqes), uintptr(sq.sqesSize))
+			}
 
 			return 0, err
 		}
@@ -337,9 +353,10 @@ func (ring *Ring) internalQueueInitParams(entries uint32, p *Params, buf unsafe.
 	}
 
 	fdPtr, _, errno := syscall.Syscall(sysSetup, uintptr(entries), uintptr(unsafe.Pointer(p)), 0)
+	runtime.KeepAlive(p)
 	if errno != 0 {
 		if p.flags&SetupNoMmap != 0 && ring.intFlags&IntFlagAppMem == 0 {
-			_ = sysMunmap(unsafe.Pointer(ring.sqRing.sqes), 1)
+			_ = sysMunmap(unsafe.Pointer(ring.sqRing.sqes), uintptr(ring.sqRing.sqesSize))
 			UnmapRings(ring.sqRing, ring.cqRing)
 		}
 
@@ -358,11 +375,13 @@ func (ring *Ring) internalQueueInitParams(entries uint32, p *Params, buf unsafe.
 		SetupRingPointers(p, ring.sqRing, ring.cqRing)
 	}
 
-	sqEntries = *ring.sqRing.ringEntries
-	for index = 0; index < sqEntries; index++ {
-		*(*uint32)(
-			unsafe.Add(unsafe.Pointer(ring.sqRing.array),
-				index*uint32(unsafe.Sizeof(uint32(0))))) = index
+	if p.flags&SetupNoSQArray == 0 {
+		sqEntries = *ring.sqRing.ringEntries
+		for index = 0; index < sqEntries; index++ {
+			*(*uint32)(
+				unsafe.Add(unsafe.Pointer(ring.sqRing.array),
+					index*uint32(unsafe.Sizeof(uint32(0))))) = index
+		}
 	}
 
 	ring.features = p.features
@@ -378,17 +397,24 @@ func (ring *Ring) internalQueueInitParams(entries uint32, p *Params, buf unsafe.
 	return nil
 }
 
+// QueueInitMem initializes ring using caller-provided memory. buf must remain
+// valid and must not be released or reused until QueueExit returns.
 // liburing: io_uring_queue_init_mem
 func (ring *Ring) QueueInitMem(entries uint32, p *Params, buf unsafe.Pointer, bufSize uint64) error {
 	// should already be set...
 	p.flags |= SetupNoMmap
 
-	return ring.internalQueueInitParams(entries, p, buf, bufSize)
+	err := ring.internalQueueInitParams(entries, p, buf, bufSize)
+	runtime.KeepAlive(p)
+	runtime.KeepAlive(buf)
+	return err
 }
 
 // liburing: io_uring_queue_init_params - https://manpages.debian.org/unstable/liburing-dev/io_uring_queue_init_params.3.en.html
 func (ring *Ring) QueueInitParams(entries uint32, p *Params) error {
-	return ring.internalQueueInitParams(entries, p, nil, 0)
+	err := ring.internalQueueInitParams(entries, p, nil, 0)
+	runtime.KeepAlive(p)
+	return err
 }
 
 // liburing: io_uring_queue_init - https://manpages.debian.org/unstable/liburing-dev/io_uring_queue_init.3.en.html
@@ -404,17 +430,11 @@ func (ring *Ring) QueueInit(entries uint32, flags uint32) error {
 func (ring *Ring) QueueExit() {
 	sq := ring.sqRing
 	cq := ring.cqRing
-	var sqeSize uintptr
 
-	if sq.ringSize == 0 {
-		sqeSize = unsafe.Sizeof(SubmissionQueueEntry{})
-		if ring.flags&SetupSQE128 != 0 {
-			sqeSize += 64
+	if ring.intFlags&IntFlagAppMem == 0 {
+		if sq.sqesSize != 0 {
+			_ = sysMunmap(unsafe.Pointer(sq.sqes), uintptr(sq.sqesSize))
 		}
-		_ = sysMunmap(unsafe.Pointer(sq.sqes), sqeSize*uintptr(*sq.ringEntries))
-		UnmapRings(sq, cq)
-	} else if ring.intFlags&IntFlagAppMem == 0 {
-		_ = sysMunmap(unsafe.Pointer(sq.sqes), uintptr(*sq.ringEntries)*unsafe.Sizeof(SubmissionQueueEntry{}))
 		UnmapRings(sq, cq)
 	}
 
@@ -472,7 +492,7 @@ func MlockSizeParams(entries uint32, p *Params) (uint64, error) {
 	var err error
 
 	err = ring.QueueInitParams(entries, lp)
-	if err != nil {
+	if err == nil {
 		ring.QueueExit()
 	}
 

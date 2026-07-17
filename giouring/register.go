@@ -48,6 +48,9 @@ func (ring *Ring) doRegisterErrno(opCode uint32, arg unsafe.Pointer, nrArgs uint
 	return ring.Register(fd, opCode, arg, nrArgs)
 }
 
+// syscallRegister retains arg itself through the syscall. Wrappers whose arg
+// contains integer-encoded addresses must additionally retain the referenced
+// Go objects until doRegister returns.
 func (ring *Ring) doRegister(opCode uint32, arg unsafe.Pointer, nrArgs uint32) (uint, error) {
 	ret, errno := ring.doRegisterErrno(opCode, arg, nrArgs)
 	if errno != 0 {
@@ -61,27 +64,32 @@ func (ring *Ring) doRegister(opCode uint32, arg unsafe.Pointer, nrArgs uint32) (
 func (ring *Ring) RegisterBuffersUpdateTag(off uint32, iovecs []syscall.Iovec, tags *uint64, nr uint32) (uint, error) {
 	rsrcUpdate := &RsrcUpdate2{
 		Offset: off,
-		Data:   uint64(uintptr(unsafe.Pointer(&iovecs[0]))),
-		Tags:   *tags,
+		Data:   uint64(slicePtr(iovecs)),
+		Tags:   uint64(uintptr(unsafe.Pointer(tags))),
 		Nr:     nr,
 	}
 
 	result, err := ring.doRegister(RegisterBuffersUpdate, unsafe.Pointer(rsrcUpdate), uint32(unsafe.Sizeof(*rsrcUpdate)))
-	runtime.KeepAlive(rsrcUpdate)
+	runtime.KeepAlive(iovecs)
+	runtime.KeepAlive(tags)
 
 	return result, err
 }
 
 // liburing: io_uring_register_buffers_tags - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_buffers_tags.3.en.html
 func (ring *Ring) RegisterBuffersTags(iovecs []syscall.Iovec, tags []uint64) (uint, error) {
+	if len(iovecs) != len(tags) {
+		return 0, syscall.EINVAL
+	}
 	reg := &RsrcRegister{
-		Nr:   uint32(len(tags)),
-		Data: uint64(uintptr(unsafe.Pointer(&iovecs[0]))),
-		Tags: uint64(uintptr(unsafe.Pointer(&tags[0]))),
+		Nr:   uint32(len(iovecs)),
+		Data: uint64(slicePtr(iovecs)),
+		Tags: uint64(slicePtr(tags)),
 	}
 
 	result, err := ring.doRegister(RegisterBuffers2, unsafe.Pointer(reg), uint32(unsafe.Sizeof(*reg)))
-	runtime.KeepAlive(reg)
+	runtime.KeepAlive(iovecs)
+	runtime.KeepAlive(tags)
 
 	return result, err
 }
@@ -99,9 +107,14 @@ func (ring *Ring) RegisterBuffersSparse(nr uint32) (uint, error) {
 	return result, err
 }
 
+// RegisterBuffers registers the memory described by iovecs. It retains the
+// iovec metadata through the registration syscall; the caller must retain the
+// described backing memory until UnregisterBuffers or QueueExit.
 // liburing: io_uring_register_buffers - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_buffers.3.en.html
 func (ring *Ring) RegisterBuffers(iovecs []syscall.Iovec) (uint, error) {
-	return ring.doRegister(RegisterBuffers, unsafe.Pointer(&iovecs[0]), uint32(len(iovecs)))
+	result, err := ring.doRegister(RegisterBuffers, unsafe.Pointer(unsafe.SliceData(iovecs)), uint32(len(iovecs)))
+	runtime.KeepAlive(iovecs)
+	return result, err
 }
 
 // liburing: io_uring_unregister_buffers - https://manpages.debian.org/unstable/liburing-dev/io_uring_unregister_buffers.3.en.html
@@ -110,29 +123,33 @@ func (ring *Ring) UnregisterBuffers() (uint, error) {
 }
 
 // liburing: io_uring_register_files_update_tag - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_files_update_tag.3.en.html
-func (ring *Ring) RegisterFilesUpdateTag(off uint, files []int, tags []uint64) (uint, error) {
+func (ring *Ring) RegisterFilesUpdateTag(off uint, files []int32, tags []uint64) (uint, error) {
+	if len(files) != len(tags) {
+		return 0, syscall.EINVAL
+	}
 	update := &RsrcUpdate2{
 		Offset: uint32(off),
-		Data:   uint64(uintptr(unsafe.Pointer(&files[0]))),
-		Tags:   uint64(uintptr(unsafe.Pointer(&tags[0]))),
+		Data:   uint64(slicePtr(files)),
+		Tags:   uint64(slicePtr(tags)),
 		Nr:     uint32(len(files)),
 	}
 
-	result, err := ring.doRegister(RegisterBuffers2, unsafe.Pointer(update), 1)
-	runtime.KeepAlive(update)
+	result, err := ring.doRegister(RegisterFilesUpdate2, unsafe.Pointer(update), uint32(unsafe.Sizeof(*update)))
+	runtime.KeepAlive(files)
+	runtime.KeepAlive(tags)
 
 	return result, err
 }
 
 // liburing: io_uring_register_files_update - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_files_update.3.en.html
-func (ring *Ring) RegisterFilesUpdate(off uint, files []int) (uint, error) {
+func (ring *Ring) RegisterFilesUpdate(off uint, files []int32) (uint, error) {
 	update := &FilesUpdate{
 		Offset: uint32(off),
-		Fds:    uint64(uintptr(unsafe.Pointer(&files[0]))),
+		Fds:    uint64(slicePtr(files)),
 	}
 
 	result, err := ring.doRegister(RegisterFilesUpdate, unsafe.Pointer(update), uint32(len(files)))
-	runtime.KeepAlive(update)
+	runtime.KeepAlive(files)
 
 	return result, err
 }
@@ -193,12 +210,15 @@ func (ring *Ring) RegisterFilesSparse(nr uint32) (uint, error) {
 }
 
 // liburing: io_uring_register_files_tags - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_files_tags.3.en.html
-func (ring *Ring) RegisterFilesTags(files []int, tags []uint64) (uint, error) {
+func (ring *Ring) RegisterFilesTags(files []int32, tags []uint64) (uint, error) {
+	if len(files) != len(tags) {
+		return 0, syscall.EINVAL
+	}
 	nr := len(files)
 	reg := &RsrcRegister{
 		Nr:   uint32(nr),
-		Data: uint64(uintptr(unsafe.Pointer(&files[0]))),
-		Tags: uint64(uintptr(unsafe.Pointer(&tags[0]))),
+		Data: uint64(slicePtr(files)),
+		Tags: uint64(slicePtr(tags)),
 	}
 
 	var (
@@ -210,8 +230,10 @@ func (ring *Ring) RegisterFilesTags(files []int, tags []uint64) (uint, error) {
 
 	for {
 		ret, errno = ring.doRegisterErrno(RegisterFiles2, unsafe.Pointer(reg), uint32(unsafe.Sizeof(*reg)))
-		if ret > 0 {
-			break
+		if errno == 0 {
+			runtime.KeepAlive(files)
+			runtime.KeepAlive(tags)
+			return ret, nil
 		}
 		if errno == syscall.EMFILE && !didIncrease {
 			didIncrease = true
@@ -223,14 +245,17 @@ func (ring *Ring) RegisterFilesTags(files []int, tags []uint64) (uint, error) {
 			continue
 		}
 
-		break
+		runtime.KeepAlive(files)
+		runtime.KeepAlive(tags)
+		return ret, os.NewSyscallError("io_uring_register", errno)
 	}
-
+	runtime.KeepAlive(files)
+	runtime.KeepAlive(tags)
 	return ret, err
 }
 
 // liburing: io_uring_register_files - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_files.3.en.html
-func (ring *Ring) RegisterFiles(files []int) (uint, error) {
+func (ring *Ring) RegisterFiles(files []int32) (uint, error) {
 	var (
 		ret         uint
 		err         error
@@ -239,9 +264,10 @@ func (ring *Ring) RegisterFiles(files []int) (uint, error) {
 	)
 
 	for {
-		ret, errno = ring.doRegisterErrno(RegisterFiles, unsafe.Pointer(&files[0]), uint32(len(files)))
-		if ret > 0 {
-			break
+		ret, errno = ring.doRegisterErrno(RegisterFiles, unsafe.Pointer(unsafe.SliceData(files)), uint32(len(files)))
+		if errno == 0 {
+			runtime.KeepAlive(files)
+			return ret, nil
 		}
 		if errno == syscall.EMFILE && !didIncrease {
 			didIncrease = true
@@ -253,9 +279,10 @@ func (ring *Ring) RegisterFiles(files []int) (uint, error) {
 			continue
 		}
 
-		break
+		runtime.KeepAlive(files)
+		return ret, os.NewSyscallError("io_uring_register", errno)
 	}
-
+	runtime.KeepAlive(files)
 	return ret, err
 }
 
@@ -270,8 +297,8 @@ func (ring *Ring) RegisterEventFd(fd int) (uint, error) {
 }
 
 // liburing: io_uring_unregister_eventfd - https://manpages.debian.org/unstable/liburing-dev/io_uring_unregister_eventfd.3.en.html
-func (ring *Ring) UnregisterEventFd(fd int) (uint, error) {
-	return ring.doRegister(UnregisterEventFD, unsafe.Pointer(&fd), 1)
+func (ring *Ring) UnregisterEventFd() (uint, error) {
+	return ring.doRegister(UnregisterEventFD, nil, 0)
 }
 
 // liburing: io_uring_register_eventfd_async - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_eventfd_async.3.en.html
@@ -293,13 +320,15 @@ func (ring *Ring) RegisterPersonality() (uint, error) {
 }
 
 // liburing: io_uring_unregister_personality
-func (ring *Ring) UnregisterPersonality() (uint, error) {
-	return ring.doRegister(UnregisterPersonality, unsafe.Pointer(nil), 0)
+func (ring *Ring) UnregisterPersonality(id int) (uint, error) {
+	return ring.doRegister(UnregisterPersonality, unsafe.Pointer(nil), uint32(id))
 }
 
 // liburing: io_uring_register_restrictions
 func (ring *Ring) RegisterRestrictions(res []Restriction) (uint, error) {
-	return ring.doRegister(RegisterRestrictions, unsafe.Pointer(&res[0]), uint32(len(res)))
+	result, err := ring.doRegister(RegisterRestrictions, unsafe.Pointer(unsafe.SliceData(res)), uint32(len(res)))
+	runtime.KeepAlive(res)
+	return result, err
 }
 
 // liburing: io_uring_enable_rings
@@ -327,8 +356,13 @@ func (ring *Ring) UnregisterIOWQAff() (uint, error) {
 const iowqMaxWorkersNrArgs = 2
 
 // liburing: io_uring_register_iowq_max_workers - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_iowq_max_workers.3.en.html
-func (ring *Ring) RegisterIOWQMaxWorkers(val []uint) (uint, error) {
-	return ring.doRegister(RegisterIOWQMaxWorkers, unsafe.Pointer(&val[0]), iowqMaxWorkersNrArgs)
+func (ring *Ring) RegisterIOWQMaxWorkers(val []uint32) (uint, error) {
+	if len(val) != iowqMaxWorkersNrArgs {
+		return 0, syscall.EINVAL
+	}
+	result, err := ring.doRegister(RegisterIOWQMaxWorkers, unsafe.Pointer(unsafe.SliceData(val)), iowqMaxWorkersNrArgs)
+	runtime.KeepAlive(val)
+	return result, err
 }
 
 // liburing: io_uring_register_ring_fd - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_ring_fd.3.en.html
@@ -367,7 +401,7 @@ func (ring *Ring) UnregisterRingFd() (uint, error) {
 		Offset: uint32(ring.enterRingFd),
 	}
 
-	if (ring.intFlags & IntFlagRegRing) != 0 {
+	if (ring.intFlags & IntFlagRegRing) == 0 {
 		return 0, syscall.EINVAL
 	}
 
@@ -404,8 +438,11 @@ func (ring *Ring) CloseRingFd() (uint, error) {
 	return 1, nil
 }
 
+// RegisterBufferRing retains reg through the registration syscall. The caller
+// must retain the described buffer ring until it is unregistered or QueueExit.
 // liburing: io_uring_register_buf_ring - https://manpages.debian.org/unstable/liburing-dev/io_uring_register_buf_ring.3.en.html
-func (ring *Ring) RegisterBufferRing(reg *BufReg, _ uint32) (uint, error) {
+func (ring *Ring) RegisterBufferRing(reg *BufReg, flags uint32) (uint, error) {
+	reg.Flags |= uint16(flags)
 	result, err := ring.doRegister(RegisterPbufRing, unsafe.Pointer(reg), 1)
 	runtime.KeepAlive(reg)
 

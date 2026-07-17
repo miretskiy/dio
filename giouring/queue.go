@@ -157,7 +157,7 @@ func (ring *Ring) internalGetCQE(submit uint32, waitNr uint32, sigmask *unix.Sig
 	}
 
 	cqe, err := ring.privateGetCQE(&data)
-	runtime.KeepAlive(data)
+	runtime.KeepAlive(sigmask)
 
 	return cqe, err
 }
@@ -190,10 +190,10 @@ again:
 	if ready != 0 {
 		head := *ring.cqRing.head
 		mask := *ring.cqRing.ringMask
-		last := head + count
 		if count > ready {
 			count = ready
 		}
+		last := head + count
 		for i := 0; head != last; head, i = head+1, i+1 {
 			cqes[i] = (*CompletionQueueEvent)(
 				unsafe.Add(
@@ -255,7 +255,9 @@ func (ring *Ring) WaitCQEsNew(
 	}
 
 	cqe, err := ring.privateGetCQE(data)
-	runtime.KeepAlive(data)
+	runtime.KeepAlive(arg)
+	runtime.KeepAlive(ts)
+	runtime.KeepAlive(sigmask)
 
 	return cqe, err
 }
@@ -289,18 +291,22 @@ func (ring *Ring) internalSubmitTimeout(waitNr uint32, ts *syscall.Timespec) (ui
 func (ring *Ring) WaitCQEs(waitNr uint32, ts *syscall.Timespec, sigmask *unix.Sigset_t) (*CompletionQueueEvent, error) {
 	var toSubmit uint32
 	var err error
+	var cqe *CompletionQueueEvent
 
-	if ts != nil {
-		if ring.features&FeatExtArg != 0 {
-			return ring.WaitCQEsNew(waitNr, ts, sigmask)
+	if ts != nil && ring.features&FeatExtArg != 0 {
+		cqe, err = ring.WaitCQEsNew(waitNr, ts, sigmask)
+	} else {
+		if ts != nil {
+			toSubmit, err = ring.internalSubmitTimeout(waitNr, ts)
 		}
-		toSubmit, err = ring.internalSubmitTimeout(waitNr, ts)
-		if err != nil {
-			return nil, err
+		if err == nil {
+			cqe, err = ring.internalGetCQE(toSubmit, waitNr, sigmask)
 		}
 	}
+	runtime.KeepAlive(ts)
+	runtime.KeepAlive(sigmask)
 
-	return ring.internalGetCQE(toSubmit, waitNr, sigmask)
+	return cqe, err
 }
 
 // liburing: io_uring_submit_and_wait_timeout - https://manpages.debian.org/unstable/liburing-dev/io_uring_submit_and_wait_timeout.3.en.html
@@ -328,19 +334,23 @@ func (ring *Ring) SubmitAndWaitTimeout(
 			}
 
 			cqe, err = ring.privateGetCQE(&data)
-			runtime.KeepAlive(data)
-
-			return cqe, err
-		}
-		toSubmit, err = ring.internalSubmitTimeout(waitNr, ts)
-		if err != nil {
-			return cqe, err
+			runtime.KeepAlive(&arg)
+		} else {
+			toSubmit, err = ring.internalSubmitTimeout(waitNr, ts)
 		}
 	} else {
 		toSubmit = ring.internalFlushSQ()
 	}
 
-	return ring.internalGetCQE(toSubmit, waitNr, sigmask)
+	if ring.features&FeatExtArg == 0 || ts == nil {
+		if err == nil {
+			cqe, err = ring.internalGetCQE(toSubmit, waitNr, sigmask)
+		}
+	}
+	runtime.KeepAlive(ts)
+	runtime.KeepAlive(sigmask)
+
+	return cqe, err
 }
 
 // liburing: io_uring_wait_cqe_timeout - https://manpages.debian.org/unstable/liburing-dev/io_uring_wait_cqe_timeout.3.en.html

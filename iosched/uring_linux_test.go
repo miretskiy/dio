@@ -398,19 +398,30 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 	require.Error(t, closedSlotTicket.Error())
 }
 
-func newRegisteredPool(t *testing.T, s *iosched.URingScheduler) *mempool.SlabPool {
+func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, *mempool.SlabPool) {
 	t.Helper()
-	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	if !iosched.IOUringAvailable {
+		t.Skip("io_uring not available on this kernel")
+	}
+	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 64})
 	require.NoError(t, err)
 
+	var pool *mempool.SlabPool
+	t.Cleanup(func() {
+		require.NoError(t, s.Close())
+		if pool != nil {
+			pool.Close()
+		}
+	})
+
+	pool, err = mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	require.NoError(t, err)
 	require.NoError(t, iosched.RegisterDMASlab(s, pool))
-	t.Cleanup(func() { pool.Close() })
-	return pool
+	return s, pool
 }
 
 func TestURing_FixedOp_WriteRead(t *testing.T) {
-	s := newURingSched(t)
-	pool := newRegisteredPool(t, s)
+	s, pool := newRegisteredURingSched(t)
 
 	path := filepath.Join(t.TempDir(), "fixed.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
@@ -440,8 +451,7 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 
 func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 	const chunks = 8
-	s := newURingSched(t)
-	pool := newRegisteredPool(t, s)
+	s, pool := newRegisteredURingSched(t)
 
 	path := filepath.Join(t.TempDir(), "fixed_multi.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, chunks*align.BlockSize), 0644))

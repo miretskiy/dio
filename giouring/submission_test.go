@@ -26,7 +26,6 @@
 package giouring
 
 import (
-	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -49,7 +48,6 @@ func TestSubmitAndWait(t *testing.T) {
 
 	timespec := syscall.NsecToTimespec((time.Millisecond * 100).Nanoseconds())
 	_, err = ring.SubmitAndWaitTimeout(10, &timespec, nil)
-	runtime.KeepAlive(timespec)
 
 	NoError(t, err)
 }

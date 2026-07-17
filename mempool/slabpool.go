@@ -67,7 +67,8 @@ func (s Slot) Release() {
 // fall back to standard 4 KiB pages if huge pages are unavailable.
 //
 // Create with [NewSlabPool]; close with [Close] after all Slots have been
-// returned and any io_uring ring that registered this pool has been closed.
+// returned and any io_uring ring or scheduler that registered this pool has
+// been closed. Registration retains the pool but does not transfer ownership.
 type SlabPool struct {
 	rawData      []byte
 	basePtr      uintptr

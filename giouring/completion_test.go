@@ -69,6 +69,22 @@ func TestPeekBatchCQE(t *testing.T) {
 	}
 }
 
+func TestPeekBatchCQELimitsOutputToReadyEntries(t *testing.T) {
+	ring, err := CreateRing(16)
+	NoError(t, err)
+	defer ring.QueueExit()
+
+	NoError(t, queueNOPs(t, ring, 2, 0))
+	cqes := make([]*CompletionQueueEvent, 4)
+
+	Equal(t, uint32(2), ring.PeekBatchCQE(cqes))
+	NotNil(t, cqes[0])
+	NotNil(t, cqes[1])
+	Nil(t, cqes[2])
+	Nil(t, cqes[3])
+	ring.CQAdvance(2)
+}
+
 func TestRingCqRingNeedsEnter(t *testing.T) {
 	ring := NewRing()
 	ring.sqRing = &SubmissionQueue{}

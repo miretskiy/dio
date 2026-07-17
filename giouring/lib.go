@@ -50,10 +50,11 @@ type SubmissionQueue struct {
 
 	ringSize uint
 	ringPtr  unsafe.Pointer
+	sqesSize uint
 
 	sqeHead uint32
 	sqeTail uint32
-	_       [2]uint32 // kernel ABI padding
+	_       uint32 // kernel ABI padding
 }
 
 // liburing: io_uring_cq

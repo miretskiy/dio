@@ -11,6 +11,7 @@ import (
 
 	"github.com/miretskiy/dio/giouring"
 	"github.com/miretskiy/dio/internal/intrusive"
+	"github.com/stretchr/testify/require"
 )
 
 type fakeRingQueue struct {
@@ -69,16 +70,16 @@ func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 
 func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
 	tickets := make([]Ticket, len(ops))
-	var head, tail *Op
+	var head, tail *submission
 	for i := range ops {
-		root := &ops[i]
-		tickets[i] = root.prepareSubmission()
+		request, ticket := newSubmission(ops[i], int32(ops[i].opCount()))
+		tickets[i] = ticket
 		if head == nil {
-			head = root
+			head = request
 		} else {
-			tail.staged = root
+			tail.staged = request
 		}
-		tail = root
+		tail = request
 	}
 	c.accept(head)
 	handles := make([]intrusive.Handle, 0, len(ops))
@@ -88,14 +89,26 @@ func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
 	return tickets, handles
 }
 
+var benchmarkURingRequest *submission
+
+func BenchmarkURingSubmissionState(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		request, ticket := newSubmission(Op{}, 1)
+		benchmarkURingRequest = request
+		request.root.done.Done()
+		benchmarkTicket = ticket
+	}
+}
+
 func TestStagingClosePartitionsConcurrentPushes(t *testing.T) {
 	const count = 256
 	stopErr := errors.New("stopped")
 	s := URingScheduler{wakeup: make(chan struct{}, 1)}
-	ops := make([]Op, count)
+	requests := make([]submission, count)
 	accepted := make([]bool, count)
 
-	accepted[0] = s.tryPush(&ops[0])
+	accepted[0] = s.tryPush(&requests[0])
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 1; i < count; i++ {
@@ -103,7 +116,7 @@ func TestStagingClosePartitionsConcurrentPushes(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			accepted[i] = s.tryPush(&ops[i])
+			accepted[i] = s.tryPush(&requests[i])
 		}()
 	}
 	close(start)
@@ -111,23 +124,55 @@ func TestStagingClosePartitionsConcurrentPushes(t *testing.T) {
 	batch := s.closeStaging()
 	wg.Wait()
 
-	seen := make(map[*Op]bool, count)
-	for op := batch; op != nil; op = op.staged {
-		if seen[op] {
+	seen := make(map[*submission]bool, count)
+	for request := batch; request != nil; request = request.staged {
+		if seen[request] {
 			t.Fatal("staged operation appeared more than once")
 		}
-		seen[op] = true
+		seen[request] = true
 	}
-	for i := range ops {
-		if accepted[i] != seen[&ops[i]] {
-			t.Fatalf("operation %d: accepted=%v staged=%v", i, accepted[i], seen[&ops[i]])
+	for i := range requests {
+		if accepted[i] != seen[&requests[i]] {
+			t.Fatalf("operation %d: accepted=%v staged=%v", i, accepted[i], seen[&requests[i]])
 		}
 	}
-	if s.tryPush(new(Op)) {
+	if s.tryPush(new(submission)) {
 		t.Fatal("push succeeded after staging closed")
 	}
 	if !errors.Is(s.stopCause(), stopErr) {
 		t.Fatalf("stop cause: got %v want %v", s.stopCause(), stopErr)
+	}
+}
+
+func TestSubmitRejectsInvalidVirtualFileBeforeStaging(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		vfiles uint32
+		vfd    uint32
+		op     func(uint32) Op
+	}{
+		{name: "read table disabled", vfiles: 0, vfd: 0, op: func(vfd uint32) Op {
+			return VReadOp(vfd, make([]byte, 1), 0)
+		}},
+		{name: "read index out of range", vfiles: 2, vfd: 2, op: func(vfd uint32) Op {
+			return VReadOp(vfd, make([]byte, 1), 0)
+		}},
+		{name: "open table disabled", vfiles: 0, vfd: 0, op: func(vfd uint32) Op {
+			return VOpenatOp(0, "file", 0, 0, vfd)
+		}},
+		{name: "open index out of range", vfiles: 2, vfd: 2, op: func(vfd uint32) Op {
+			return VOpenatOp(0, "file", 0, 0, vfd)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &URingScheduler{
+				URingConfig: URingConfig{RingDepth: 1, VFiles: tc.vfiles},
+				wakeup:      make(chan struct{}, 1),
+			}
+			_, err := s.Submit(tc.op(tc.vfd))
+			require.Error(t, err)
+			require.Nil(t, s.stagingHead.Load())
+		})
 	}
 }
 
@@ -153,8 +198,8 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 		wakeup:      make(chan struct{}, 1),
 	}
 	op := VReadOp(0, make([]byte, 1), 0)
-	ticket := op.prepareSubmission()
-	if !s.tryPush(&op) {
+	request, ticket := newSubmission(op, 1)
+	if !s.tryPush(request) {
 		t.Fatal("submission was rejected before close")
 	}
 	s.signalShutdown(errSchedulerClosed)
@@ -169,7 +214,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	if !errors.Is(cause, errSchedulerClosed) {
 		t.Fatalf("run error: got %v want %v", cause, errSchedulerClosed)
 	}
-	staged := reverseOps(s.closeStaging())
+	staged := reverseSubmissions(s.closeStaging())
 	c.reap()
 	c.failRemaining(staged, cause)
 	c.releaseAllSlots()
@@ -181,7 +226,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	if len(ring.sqes) != 0 || ring.submitCalls != 0 {
 		t.Fatalf("shutdown placed work: sqes=%d submit calls=%d", len(ring.sqes), ring.submitCalls)
 	}
-	if s.tryPush(new(Op)) {
+	if s.tryPush(new(submission)) {
 		t.Fatal("submission succeeded after close")
 	}
 }
@@ -319,7 +364,10 @@ func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
 	if c.pending.Value(handles[1]).waitCount != 1 || c.pending.Value(handles[1]).ready != 0 {
 		t.Fatal("read did not wait for open")
 	}
+	waiterCap := cap(c.files.virtual[1].openWaiters)
+	require.NotZero(t, waiterCap)
 	completeForTest(&c, handles[0], 0, 0, nil)
+	require.Equal(t, waiterCap, cap(c.files.virtual[1].openWaiters))
 	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("read did not become ready at open completion")
 	}
@@ -362,8 +410,8 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	}
 
 	lateRoot := VReadOp(0, make([]byte, 1), 3)
-	late := lateRoot.prepareSubmission()
-	c.accept(&lateRoot)
+	lateRequest, late := newSubmission(lateRoot, int32(lateRoot.opCount()))
+	c.accept(lateRequest)
 	late.Wait()
 	if late.Error() == nil {
 		t.Fatal("work submitted behind a close at the end of a chain was accepted")
@@ -456,8 +504,8 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	}
 
 	retryRoot := VOpenatOp(0, "b", 0, 0, 0)
-	retry := retryRoot.prepareSubmission()
-	c.accept(&retryRoot)
+	retryRequest, retry := newSubmission(retryRoot, int32(retryRoot.opCount()))
+	c.accept(retryRequest)
 	retry.Wait()
 	if retry.Error() == nil {
 		t.Fatal("retry open was accepted while prior slot work remained")
@@ -465,8 +513,8 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 
 	completeForTest(&c, handles[1], 0, 0, syscall.EBADF)
 	finalRoot := VOpenatOp(0, "b", 0, 0, 0)
-	final := finalRoot.prepareSubmission()
-	c.accept(&finalRoot)
+	finalRequest, final := newSubmission(finalRoot, int32(finalRoot.opCount()))
+	c.accept(finalRequest)
 	if c.pending.Len() != 1 {
 		t.Fatal("retry open was not accepted after prior slot work completed")
 	}
@@ -491,10 +539,10 @@ func TestWriteGroupPreservesCountsOnSyncError(t *testing.T) {
 		work.ready = 0
 		work.inflight = true
 	}
-	c.pending.Value(handles[0]).write = &writeCompletion{targets: []writeTarget{
-		{work: handles[0], bytes: 4},
-		{work: handles[1], bytes: 4},
-	}}
+	completion := writeGroupCompletion{count: 2}
+	completion.inline[0] = writeTarget{work: handles[0], bytes: 4}
+	completion.inline[1] = writeTarget{work: handles[1], bytes: 4}
+	c.pending.Value(handles[0]).writeGroup = completion
 	c.finishWrite(handles[0], 8, nil, syncErr)
 
 	for _, ticket := range tickets {

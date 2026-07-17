@@ -26,7 +26,7 @@
 package giouring
 
 import (
-	"runtime"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -61,8 +61,62 @@ func TestRegisterRingFd(t *testing.T) {
 		Nil(t, err)
 		NotNil(t, cqe)
 
-		runtime.KeepAlive(timespec)
-
 		ring.CQESeen(cqe)
 	}
+
+	_, err = ring.UnregisterRingFd()
+	NoError(t, err)
+}
+
+func TestRegisterFilesUsesKernelDescriptorWidth(t *testing.T) {
+	ring, err := CreateRing(8)
+	NoError(t, err)
+	defer ring.QueueExit()
+
+	_, err = ring.RegisterFiles([]int32{-1, -1})
+	NoError(t, err)
+	_, err = ring.RegisterFilesUpdate(1, []int32{-1})
+	NoError(t, err)
+	_, err = ring.UnregisterFiles()
+	NoError(t, err)
+}
+
+func TestRegisterFilesTagsAndUpdate(t *testing.T) {
+	ring, err := CreateRing(8)
+	NoError(t, err)
+	defer ring.QueueExit()
+
+	f, err := os.Open("/dev/null")
+	NoError(t, err)
+	defer f.Close()
+	files := []int32{int32(f.Fd())}
+
+	_, err = ring.RegisterFilesTags(files, []uint64{1})
+	NoError(t, err)
+	_, err = ring.RegisterFilesUpdateTag(0, files, []uint64{2})
+	NoError(t, err)
+	_, err = ring.UnregisterFiles()
+	NoError(t, err)
+}
+
+func TestRegisterPersonalityRoundTrip(t *testing.T) {
+	ring, err := CreateRing(8)
+	NoError(t, err)
+	defer ring.QueueExit()
+
+	id, err := ring.RegisterPersonality()
+	NoError(t, err)
+	_, err = ring.UnregisterPersonality(int(id))
+	NoError(t, err)
+}
+
+func TestRegisterIOWQMaxWorkersRequiresTwoValues(t *testing.T) {
+	ring := &Ring{}
+
+	_, err := ring.RegisterIOWQMaxWorkers(nil)
+	ErrorIs(t, err, syscall.EINVAL)
+	_, err = ring.RegisterIOWQMaxWorkers([]uint32{1})
+	ErrorIs(t, err, syscall.EINVAL)
+	_, err = ring.RegisterIOWQMaxWorkers([]uint32{1, 2, 3})
+	ErrorIs(t, err, syscall.EINVAL)
 }

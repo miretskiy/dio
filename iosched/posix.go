@@ -42,7 +42,7 @@ func (s *POSIXScheduler) Submit(op Op) (Ticket, error) {
 		return Ticket{}, errSchedulerClosed
 	}
 
-	_, err := countAndValidateOps(&op)
+	_, err := countAndValidateOps(&op, nil)
 	if err != nil {
 		return Ticket{}, err
 	}

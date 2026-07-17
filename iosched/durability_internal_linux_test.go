@@ -8,10 +8,43 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/miretskiy/dio/align"
 	"github.com/miretskiy/dio/giouring"
+	"github.com/miretskiy/dio/mempool"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+func TestURingDMARegistrationOwnership(t *testing.T) {
+	if !IOUringAvailable {
+		t.Skip("io_uring not available on this kernel")
+	}
+	s, err := NewURingScheduler(URingConfig{RingDepth: 8})
+	require.NoError(t, err)
+
+	var pool *mempool.SlabPool
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			require.NoError(t, s.Close())
+		}
+		if pool != nil {
+			pool.Close()
+		}
+	})
+
+	require.ErrorContains(t, s.usePool(nil), "nil DMA slab")
+	pool, err = mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	require.NoError(t, err)
+	require.NoError(t, s.usePool(pool))
+	require.Same(t, pool, s.registeredPool)
+	require.ErrorContains(t, s.usePool(pool), "already registered")
+
+	err = s.Close()
+	closed = true
+	require.NoError(t, err)
+	require.Nil(t, s.registeredPool)
+}
 
 func TestDurableWrite(t *testing.T) {
 	regular := os.NewFile(100, "regular")
@@ -44,7 +77,7 @@ func TestDurableWrite(t *testing.T) {
 func TestPlaceDurableWriteWithLinkedSync(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(2, 1, ring)
-	tickets, _ := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0).Durable())
+	tickets, handles := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0).Durable())
 
 	c.placeReady(true)
 	require.Len(t, ring.sqes, 2)
@@ -52,6 +85,10 @@ func TestPlaceDurableWriteWithLinkedSync(t *testing.T) {
 	require.NotZero(t, ring.sqes[0].Flags&giouring.SqeIOLink)
 	require.Equal(t, uint8(giouring.OpFsync), ring.sqes[1].OpCode)
 	require.Equal(t, giouring.FsyncDatasync, ring.sqes[1].OpcodeFlags)
+	completion := c.pending.Value(handles[0]).writeGroup
+	require.Equal(t, 1, completion.count)
+	require.Empty(t, completion.overflow)
+	require.Equal(t, handles[0], completion.inline[0].work)
 
 	c.failRemaining(nil, errors.New("test cleanup"))
 	c.releaseAllSlots()

@@ -291,16 +291,15 @@ func TestPrepareTimeout(t *testing.T) {
 
 func TestPrepareTimeoutRemove(t *testing.T) {
 	entry := &SubmissionQueueEntry{}
-	duration := time.Second
-	entry.PrepareTimeoutRemove(duration, 10, 15)
+	entry.PrepareTimeoutRemove(10, 15)
 
 	Equal(t, uint8(12), entry.OpCode)
 	Equal(t, uint8(0), entry.Flags)
 	Equal(t, uint16(0), entry.IoPrio)
 	Equal(t, int32(-1), entry.Fd)
-	Equal(t, uint64(10), entry.Off)
-	NotZero(t, entry.Addr)
-	Equal(t, uint32(1), entry.Len)
+	Equal(t, uint64(0), entry.Off)
+	Equal(t, uint64(10), entry.Addr)
+	Equal(t, uint32(0), entry.Len)
 	Equal(t, uint32(15), entry.OpcodeFlags)
 	Equal(t, uint64(0), entry.UserData)
 	Equal(t, uint16(0), entry.BufIG)
@@ -310,16 +309,16 @@ func TestPrepareTimeoutRemove(t *testing.T) {
 
 func TestPrepareTimeoutUpdate(t *testing.T) {
 	entry := &SubmissionQueueEntry{}
-	duration := time.Second
-	entry.PrepareTimeoutUpdate(duration, 10, 15)
+	spec := syscall.NsecToTimespec(time.Second.Nanoseconds())
+	entry.PrepareTimeoutUpdate(&spec, 10, 15)
 
 	Equal(t, uint8(12), entry.OpCode)
 	Equal(t, uint8(0), entry.Flags)
 	Equal(t, uint16(0), entry.IoPrio)
 	Equal(t, int32(-1), entry.Fd)
-	Equal(t, uint64(10), entry.Off)
-	NotZero(t, entry.Addr)
-	Equal(t, uint32(1), entry.Len)
+	Equal(t, uint64(uintptr(unsafe.Pointer(&spec))), entry.Off)
+	Equal(t, uint64(10), entry.Addr)
+	Equal(t, uint32(0), entry.Len)
 	Equal(t, uint32(15), entry.OpcodeFlags)
 	Equal(t, uint64(0), entry.UserData)
 	Equal(t, uint16(0), entry.BufIG)

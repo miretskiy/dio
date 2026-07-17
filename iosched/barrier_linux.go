@@ -181,7 +181,7 @@ func (f *fileTable) completedWork(c *coordinator, handle intrusive.Handle, root 
 		}
 		state.opening = 0
 		waiters := state.openWaiters
-		state.openWaiters = nil
+		state.openWaiters = state.openWaiters[:0]
 		for _, waiter := range waiters {
 			c.releaseWait(waiter)
 		}

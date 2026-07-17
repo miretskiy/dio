@@ -113,8 +113,8 @@ func (tester *networkTester) getConnection(fd int) *tcpConn {
 	iovecs := make([]syscall.Iovec, 1)
 	iovecs[0] = syscall.Iovec{
 		Base: &buffer[0],
-		Len:  uint64(len(buffer)),
 	}
+	iovecs[0].SetLen(len(buffer))
 
 	var (
 		msg      syscall.Msghdr
@@ -608,7 +608,7 @@ func TestMultiAcceptMultiRecvMultiDirectBufRingTCP(t *testing.T) {
 		repeatAccept:  false,
 		rwLoopNumber:  4,
 		setup: func(t *testing.T, ctx testContext, ring *Ring) {
-			fds := make([]int, 16)
+			fds := make([]int32, 16)
 			for i := range fds {
 				fds[i] = -1
 			}

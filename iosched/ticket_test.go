@@ -99,7 +99,7 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 func TestDurableWriteInLinkedChainRejected(t *testing.T) {
 	f := new(os.File)
 	op := WriteOp(f, nil, 0).Durable().Link(CloseOp(f))
-	_, err := countAndValidateOps(&op)
+	_, err := countAndValidateOps(&op, nil)
 	if err == nil || !strings.Contains(err.Error(), "Durable cannot be used in a linked chain") {
 		t.Fatalf("validation error: got %v", err)
 	}
@@ -107,7 +107,7 @@ func TestDurableWriteInLinkedChainRejected(t *testing.T) {
 
 func TestStandaloneDurableWriteAccepted(t *testing.T) {
 	op := WriteOp(new(os.File), nil, 0).Durable()
-	if _, err := countAndValidateOps(&op); err != nil {
+	if _, err := countAndValidateOps(&op, nil); err != nil {
 		t.Fatalf("validation error: %v", err)
 	}
 }

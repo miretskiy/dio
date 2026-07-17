@@ -40,9 +40,12 @@ func sysMunmap(ptr unsafe.Pointer, length uintptr) error {
 }
 
 func sysMadvise(address, length, advice uintptr) error {
-	_, _, err := syscall.Syscall(syscall.SYS_MADVISE, address, length, advice)
+	_, _, errno := syscall.Syscall(syscall.SYS_MADVISE, address, length, advice)
+	if errno != 0 {
+		return errno
+	}
 
-	return err
+	return nil
 }
 
 const liburingUdataTimeout uint64 = math.MaxUint64

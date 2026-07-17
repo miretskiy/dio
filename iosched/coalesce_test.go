@@ -79,7 +79,7 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(8, 0, ring)
 	f := os.NewFile(100, "a")
-	tickets, _ := acceptOps(&c,
+	tickets, handles := acceptOps(&c,
 		WriteOp(f, make([]byte, 4), 0),
 		WriteOp(f, make([]byte, 6), 4),
 		WriteOp(f, make([]byte, 2), 10),
@@ -90,11 +90,45 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 	require.Equal(t, uint8(giouring.OpWritev), ring.sqes[0].OpCode)
 	slot := c.slots.Value(intrusive.Handle(ring.sqes[0].UserData))
 	require.Len(t, slot.iovecs, 3)
+	completion := c.pending.Value(handles[0]).writeGroup
+	require.Equal(t, 3, completion.count)
+	last := len(handles) - 1
+	if last < len(completion.inline) {
+		require.Equal(t, handles[last], completion.inline[last].work)
+	} else {
+		require.Equal(t, handles[last], completion.overflow[last-len(completion.inline)].work)
+	}
 
 	c.failRemaining(nil, errors.New("test cleanup"))
 	c.releaseAllSlots()
 	for _, ticket := range tickets {
 		ticket.Wait()
+	}
+}
+
+func TestWriteCompletionSnapshotSurvivesLeaderRemoval(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(8, 0, ring)
+	f := os.NewFile(100, "a")
+	inlineTargets := len((writeGroupCompletion{}).inline)
+	ops := make([]Op, inlineTargets+1)
+	for i := range ops {
+		ops[i] = WriteOp(f, make([]byte, 4), int64(i*4))
+	}
+	tickets, handles := acceptOps(&c, ops...)
+
+	c.placeReady(true)
+	completion := c.pending.Value(handles[0]).writeGroup
+	require.Equal(t, len(ops), completion.count)
+	require.Len(t, completion.overflow, 1)
+	require.Equal(t, handles[inlineTargets], completion.overflow[0].work)
+
+	ring.complete(ring.sqes[0].UserData, int32(len(ops)*4))
+	c.reap()
+	for _, ticket := range tickets {
+		ticket.Wait()
+		require.NoError(t, ticket.Error())
+		require.Equal(t, 4, ticket.N())
 	}
 }
 

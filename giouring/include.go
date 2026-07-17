@@ -122,6 +122,7 @@ const (
 	SetupDeferTaskrun
 	SetupNoMmap
 	SetupRegisteredFdOnly
+	SetupNoSQArray
 )
 
 const (
@@ -227,8 +228,6 @@ const (
 	MsgData uint32 = iota
 	MsgSendFd
 )
-
-var msgDataVar = MsgData
 
 const (
 	MsgRingCQESkip uint32 = 1 << iota
@@ -425,7 +424,7 @@ type RsrcUpdate2 struct {
 	Resv2  uint32
 }
 
-const RegisterFilesSkip int = -2
+const RegisterFilesSkip int32 = -2
 
 const opSupported uint16 = 1 << 0
 
@@ -475,7 +474,7 @@ type BufReg struct {
 	RingAddr    uint64
 	RingEntries uint32
 	Bgid        uint16
-	Pad         uint16
+	Flags       uint16
 	Resv        [3]uint64
 }
 
