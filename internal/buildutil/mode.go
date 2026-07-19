@@ -24,9 +24,10 @@ func isTestBinary() bool {
 		return true
 	}
 	// argv fallback: standard "go test" binaries end in ".test" (also
-	// covers `go test -c -o foo.test`). Catches the case where buildutil.init
-	// runs before testing.init.
-	return strings.HasSuffix(os.Args[0], ".test")
+	// covers `go test -c -o foo.test`), while rules_go test binaries end in
+	// "_test". Catches the case where buildutil.init runs before testing.init.
+	return strings.HasSuffix(os.Args[0], ".test") ||
+		strings.HasSuffix(os.Args[0], "_test")
 }
 
 // TestMode reports whether the current process is a Go test binary. Determined
