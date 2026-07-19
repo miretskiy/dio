@@ -71,6 +71,26 @@ func TestVirtualOpenReplacesIdleSlot(t *testing.T) {
 	})
 }
 
+func TestDurableWrite(t *testing.T) {
+	forEachScheduler(t, func(t *testing.T, s iosched.Scheduler) {
+		f := newEmptyFile(t)
+		want := []byte("durable payload")
+
+		ticket, err := s.Submit(iosched.WriteOp(f, want, 0).Durable())
+		require.NoError(t, err)
+		ticket.Wait()
+		require.NoError(t, ticket.Error())
+		require.Equal(t, len(want), ticket.N())
+
+		got := make([]byte, len(want))
+		read, err := s.Submit(iosched.ReadOp(f, got, 0))
+		require.NoError(t, err)
+		read.Wait()
+		require.NoError(t, read.Error())
+		require.Equal(t, want, got)
+	})
+}
+
 // TestSchedulerCloseCompletesPending is the shutdown contract: no ticket is left
 // unfinished. It submits a burst, closes without waiting, then waits every
 // ticket under a timeout — each must return (completed, or failed with the close

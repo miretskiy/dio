@@ -30,8 +30,6 @@ func probeIOUring() bool {
 	return ring.HasFeature(giouring.FeatNoDrop)
 }
 
-const defaultRingDepth uint32 = 256
-
 type writeTarget struct {
 	work  intrusive.Handle
 	bytes int
@@ -88,7 +86,7 @@ var stagingClosed submission
 // doorbell. Close owns the ring lifetime and may issue synchronous cancellation
 // through its fd before tearing it down.
 type URingScheduler struct {
-	URingConfig
+	config schedulerConfig
 
 	ring *giouring.Ring
 	// registeredPool keeps fixed-buffer backing memory reachable until the
@@ -122,37 +120,33 @@ func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
 
 // NewURingScheduler creates an io_uring-backed scheduler. The kernel must
 // provide IORING_FEAT_NODROP.
-func NewURingScheduler(cfg URingConfig) (*URingScheduler, error) {
+func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	if !IOUringAvailable {
 		return nil, errors.New("iosched: io_uring not available on this kernel")
 	}
 
-	depth := cfg.RingDepth
-	if depth == 0 {
-		depth = defaultRingDepth
-	}
-	cfg.RingDepth = depth // store the effective depth back into the config
+	cfg := makeSchedulerConfig(opts)
 
 	var flags uint32
-	if cfg.SQPOLL {
+	if cfg.sqPoll {
 		flags |= giouring.SetupSQPoll
 	}
 
 	ring := giouring.NewRing()
-	if err := ring.QueueInit(depth, flags); err != nil {
+	if err := ring.QueueInit(cfg.ringDepth, flags); err != nil {
 		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
 	}
-	if cfg.VFiles > 0 {
-		if _, err := ring.RegisterFilesSparse(cfg.VFiles); err != nil {
+	if cfg.vfiles > 0 {
+		if _, err := ring.RegisterFilesSparse(cfg.vfiles); err != nil {
 			ring.QueueExit()
 			return nil, fmt.Errorf("iosched: io_uring_register_files_sparse: %w", err)
 		}
 	}
 
 	s := &URingScheduler{
-		URingConfig: cfg,
-		ring:        ring,
-		wakeup:      make(chan struct{}, 1),
+		config: cfg,
+		ring:   ring,
+		wakeup: make(chan struct{}, 1),
 	}
 	s.wg.Add(1)
 	go s.loop()
@@ -165,15 +159,15 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 		return Ticket{}, err
 	}
 
-	n, err := countAndValidateOps(&op, &s.URingConfig)
+	n, err := countAndValidateOps(&op, &s.config)
 	if err != nil {
 		return Ticket{}, err
 	}
-	if uint32(n) > s.RingDepth {
-		return Ticket{}, fmt.Errorf("iosched: linked chain length %d exceeds ring depth %d", n, s.RingDepth)
+	if uint32(n) > s.config.ringDepth {
+		return Ticket{}, fmt.Errorf("iosched: linked chain length %d exceeds ring depth %d", n, s.config.ringDepth)
 	}
-	if need := transformedSlotCount(&op, n); uint32(need) > s.RingDepth {
-		return Ticket{}, fmt.Errorf("iosched: operation requires %d ring slots, exceeds ring depth %d", need, s.RingDepth)
+	if need := transformedSlotCount(&op, n); uint32(need) > s.config.ringDepth {
+		return Ticket{}, fmt.Errorf("iosched: operation requires %d ring slots, exceeds ring depth %d", need, s.config.ringDepth)
 	}
 
 	request, ticket := newSubmission(op, n)
@@ -303,9 +297,9 @@ func (s *URingScheduler) loop() {
 	c := coordinator{
 		sched: s,
 		ring:  s.ring,
-		slots: intrusive.MakeFixedList[ringSlot](int(s.RingDepth)),
+		slots: intrusive.MakeFixedList[ringSlot](int(s.config.ringDepth)),
 	}
-	c.files = newFileTable(s.VFiles)
+	c.files = newFileTable(s.config.vfiles)
 
 	cause := c.run()
 	s.signalShutdown(cause)
@@ -327,7 +321,7 @@ func (c *coordinator) run() error {
 		// un-started work to keep pipeline full.
 
 		c.accept(reverseSubmissions(c.sched.stagingHead.Swap(nil)))
-		c.placeReady(!c.sched.DisableCoalescing)
+		c.placeReady(c.sched.config.coalescing)
 
 		// After placement, pending work requires at least one occupied ring slot.
 		if err := buildutil.Assert(c.slots.Len() > 0 || c.pending.Len() == 0); err != nil {
@@ -368,7 +362,7 @@ func (c *coordinator) accept(head *submission) {
 		}
 		c.nextSequence++
 		handle := c.pending.PushBack(work)
-		if err := c.files.admit(c, handle); err != nil {
+		if err := c.admit(handle); err != nil {
 			c.pending.Remove(handle)
 			completeFailed(root, err)
 			continue
@@ -803,12 +797,13 @@ func finishWriteTarget(c *coordinator, handle intrusive.Handle, n int, err error
 func (c *coordinator) finishOperation(handle intrusive.Handle, op *Op, n int, err error) {
 	work := c.pending.Value(handle)
 	root := work.root
+	err = writeResultError(op, n, err)
 	recordResult(root, op, n, err)
-	c.files.completedOperation(c, handle, op)
+	c.completedOperation(handle, op)
 	work.remaining--
 	last := work.remaining == 0
 	if last {
-		c.files.completedWork(c, handle, root)
+		c.completedWork(handle, root)
 		c.pending.Remove(handle)
 		root.done.Done()
 	}

@@ -15,7 +15,7 @@ const IOUringAvailable = false
 type URingScheduler struct{}
 
 // NewURingScheduler always returns an error on non-Linux platforms.
-func NewURingScheduler(_ URingConfig) (*URingScheduler, error) {
+func NewURingScheduler(_ ...Option) (*URingScheduler, error) {
 	return nil, errors.New("iosched: io_uring requires Linux")
 }
 

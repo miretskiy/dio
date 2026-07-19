@@ -2,6 +2,7 @@ package iosched
 
 import (
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -109,6 +110,34 @@ func TestStandaloneDurableWriteAccepted(t *testing.T) {
 	op := WriteOp(new(os.File), nil, 0).Durable()
 	if _, err := countAndValidateOps(&op, nil); err != nil {
 		t.Fatalf("validation error: %v", err)
+	}
+}
+
+func TestDurableWriteSyncOpPreservesTarget(t *testing.T) {
+	regular := new(os.File)
+	regularSync := WriteOp(regular, nil, 0).syncOp()
+	if regularSync.kind() != OpFdatasync || regularSync.f != regular {
+		t.Fatalf("regular sync op did not preserve file: %#v", regularSync)
+	}
+
+	virtualSync := VWriteOp(3, nil, 0).syncOp()
+	if virtualSync.kind() != OpFdatasync || !virtualSync.isVirtual() || virtualSync.vfd != 3 {
+		t.Fatalf("virtual sync op did not preserve slot: %#v", virtualSync)
+	}
+}
+
+func TestWriteResultError(t *testing.T) {
+	f := new(os.File)
+	write := WriteOp(f, make([]byte, 4), 0)
+	if err := writeResultError(&write, 2, nil); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short write error: got %v want %v", err, io.ErrShortWrite)
+	}
+	if err := writeResultError(&write, 4, nil); err != nil {
+		t.Fatalf("complete write error: %v", err)
+	}
+	read := ReadOp(f, make([]byte, 4), 0)
+	if err := writeResultError(&read, 2, nil); err != nil {
+		t.Fatalf("short read unexpectedly failed: %v", err)
 	}
 }
 

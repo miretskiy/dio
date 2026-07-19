@@ -1,6 +1,6 @@
 module github.com/miretskiy/dio
 
-go 1.24.0
+go 1.25.11
 
 require golang.org/x/sys v0.41.0
 

@@ -16,7 +16,7 @@ func availableSchedulers() []schedulerFactory {
 	return []schedulerFactory{
 		{name: "POSIX", newSched: newPOSIX},
 		{name: "URing", newSched: func(t *testing.T) iosched.Scheduler {
-			return newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 2})
+			return newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(2))
 		}},
 	}
 }
@@ -25,7 +25,7 @@ func TestURingCloseCompletesPending(t *testing.T) {
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 16})
+	s, err := iosched.NewURingScheduler(iosched.WithRingDepth(16))
 	require.NoError(t, err)
 	testSchedulerCloseCompletesPending(t, s)
 }

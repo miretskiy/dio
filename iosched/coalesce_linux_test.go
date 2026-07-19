@@ -33,7 +33,10 @@ func benchWriteCoalescing(b *testing.B, disable bool) {
 	if !iosched.IOUringAvailable {
 		b.Skip("io_uring not available")
 	}
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 4096, DisableCoalescing: disable})
+	s, err := iosched.NewURingScheduler(
+		iosched.WithRingDepth(4096),
+		iosched.WithCoalescing(!disable),
+	)
 	require.NoError(b, err)
 	b.Cleanup(func() { require.NoError(b, s.Close()) })
 

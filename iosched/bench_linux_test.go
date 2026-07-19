@@ -97,7 +97,7 @@ func BenchmarkRegularIO(b *testing.B) {
 	}
 	b.Cleanup(func() { f.Close() })
 
-	sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: readBenchDepth})
+	sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(readBenchDepth))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -142,10 +142,10 @@ func BenchmarkDirectIO(b *testing.B) {
 	}
 
 	path := benchFilePath(b, readBenchFileSize)
-	sched, err := iosched.NewURingScheduler(iosched.URingConfig{
-		RingDepth: readBenchDepth,
-		VFiles:    1,
-	})
+	sched, err := iosched.NewURingScheduler(
+		iosched.WithRingDepth(readBenchDepth),
+		iosched.WithVFiles(1),
+	)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 	const blockSize = 4096
 
 	f := benchFile(b, fileSize)
-	sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 256})
+	sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(256))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 	const blockSize = 4096
 
 	f := benchFile(b, fileSize)
-	sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 512})
+	sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(512))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 	for _, n := range []int{1, 2, 4, 8, 16, 32, 64, 128} {
 		b.Run(fmt.Sprintf("goroutines=%d", n), func(b *testing.B) {
 			f := benchFile(b, fileSize)
-			sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 512})
+			sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(512))
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -331,7 +331,7 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 	for _, batch := range []int{1, 8, 64, 256} {
 		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) {
 			f := benchFile(b, fileSize)
-			sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 512})
+			sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(512))
 			if err != nil {
 				b.Fatal(err)
 			}

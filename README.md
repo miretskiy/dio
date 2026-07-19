@@ -1,367 +1,235 @@
-# dio — Direct I/O primitives for Go
+# dio
 
-`dio` provides production-grade, bare-metal I/O primitives for Go programs
-that need to bypass the Linux page cache: page-aligned memory pooling,
-`io_uring`/`pread`/`pwrite` scheduling, and OS-level file-descriptor wrappers
-that correctly manage GC lifetime across raw syscalls.
+`dio` is a collection of low-level storage primitives for Go: aligned memory,
+fixed-size buffer pools, portable file syscalls, and synchronous or io_uring
+I/O scheduling.
 
-Extracted from an internal storage engine and battle-tested on NVMe hardware.
+The module requires Go 1.24 or newer. The `align`, `mempool`, `sys`, and POSIX
+scheduler APIs work on Linux and Darwin. io_uring support is Linux-only.
 
-```
+```sh
 go get github.com/miretskiy/dio
 ```
-
-Requires **Go 1.25+**. Fully functional on Linux and Darwin; graceful no-ops
-on other POSIX platforms.
-
----
 
 ## Packages
 
 | Package | Purpose |
-|---|---|
-| [`dio/align`](#dioalign) | Page-aligned memory allocation and O_DIRECT arithmetic |
-| [`dio/mempool`](#diomempool) | Fixed-capacity pool of pre-warmed mmap buffers |
-| [`dio/sys`](#diosys) | OS file-descriptor primitives: Fallocate, Fdatasync, PunchHole, … |
-| [`dio/iosched`](#dioiosched) | Pluggable I/O scheduler: synchronous pread/pwrite or async io_uring |
+| --- | --- |
+| `align` | Page-aligned allocation and range arithmetic |
+| `mempool` | Page-aligned fixed-slot and reference-counted buffer pools |
+| `sys` | Portable file allocation, syncing, direct I/O, and hole punching |
+| `iosched` | A common operation/ticket API over POSIX and io_uring |
+| `giouring` | Low-level Go definitions and syscalls for io_uring |
 
----
+Most applications should use `iosched`. `giouring` is the lower-level binding
+used to implement it.
 
-## dio/align
+## Aligned memory
 
-Alignment helpers for O_DIRECT I/O. All O_DIRECT operations on Linux require
-the buffer address, transfer size, and file offset to be multiples of the
-filesystem block size (4 KiB on most systems).
+Linux `O_DIRECT` generally requires the buffer address, transfer length, and
+file offset to be aligned. The `align` package centralizes those calculations
+and owns aligned mmap allocations.
 
 ```go
-import "github.com/miretskiy/dio/align"
-
-// Round a size up to the next 4 KiB boundary.
-aligned := align.PageAlign(4097) // → 8192
-
-// Compute aligned parameters for a byte range — useful before a pread.
-off, length := align.AlignRange(offset, int(size))
-buf := align.AllocAligned(int(length))
+buf := align.AllocAligned(1 << 20)
 defer align.FreeAligned(buf)
-n, err := f.ReadAt(buf, off)
-data := buf[offset-off : offset-off+size] // trim lead padding
 
-// Check whether a slice is page-aligned (required before O_DIRECT write).
-if !align.IsAligned(buf) {
-    return errors.New("buffer not page-aligned")
+alignedOffset, alignedLength := align.AlignRange(offset, length)
+_ = alignedOffset
+_ = alignedLength
+```
+
+`GrowAligned` preserves an allocation when it is already large enough and
+replaces it otherwise. Memory returned by `AllocAligned` is not managed by the
+garbage collector and must be released with `FreeAligned`.
+
+## Buffer pools
+
+`SlabPool` owns one contiguous aligned mapping divided into fixed-size slots.
+`Acquire` is non-blocking and returns `ErrSlabExhausted` when every slot is in
+use.
+
+```go
+pool, err := mempool.NewSlabPool(64<<20, 1<<20)
+if err != nil {
+    return err
+}
+defer pool.Close()
+
+slot, err := pool.Acquire()
+if err != nil {
+    return err
+}
+defer slot.Release()
+
+copy(slot.Data, payload)
+```
+
+A slab can be registered as one io_uring fixed buffer. The caller retains
+ownership and must close the scheduler before closing the pool.
+
+```go
+sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(256))
+if err != nil {
+    return err
+}
+defer sched.Close()
+
+if err := iosched.RegisterDMASlab(sched, pool); err != nil {
+    return err
 }
 
-// Grow a reusable aligned buffer without reallocating if already large enough.
-buf = align.GrowAligned(buf, newSize) // old buf freed if too small
+ticket, err := sched.Submit(iosched.WriteFixedOp(f, slot.Data, offset))
 ```
 
-### AllocAligned / FreeAligned
-
-`AllocAligned` uses `mmap(MAP_ANON)` — guaranteed page-aligned, pre-warmed
-to commit physical RAM. **Not managed by the GC**: you must call `FreeAligned`
-when done.
+`MmapPool` is the blocking, reference-counted alternative. Each `Acquire`
+returns a fresh `MmapBuffer`; `TryInc` adds a reference and every reference must
+eventually call `Unpin`.
 
 ```go
-buf := align.AllocAligned(1 << 20) // 1 MiB, page-aligned
-defer align.FreeAligned(buf)
-
-// buf is safe to pass to O_DIRECT read/write
-```
-
----
-
-## dio/mempool
-
-A fixed-capacity pool of pre-allocated, page-aligned mmap buffers.
-All memory is committed at construction time — the hot path never
-touches the kernel allocator.
-
-### Basic usage
-
-```go
-import "github.com/miretskiy/dio/mempool"
-
-// 32 × 1 MiB slabs, pre-allocated and pre-warmed.
 pool := mempool.NewMmapPool("writes", 1<<20, 32)
 defer pool.Close()
 
-// Acquire blocks until a buffer is available (token-bucket backpressure).
 buf := pool.Acquire()
-
-// Write data into it, then submit to the I/O path.
-copy(buf.Bytes(), payload)
-submitWrite(buf.AlignedBytes(int64(len(payload)))) // page-aligned prefix
-
-// Release when done — returns the raw memory to the pool.
-buf.Unpin()
-```
-
-### Non-blocking acquire
-
-```go
-buf, ok := pool.TryAcquire()
-if !ok {
-    // Pool is currently empty; handle backpressure explicitly.
-    metrics.PoolExhausted.Inc()
-    buf = pool.Acquire() // block
-}
 defer buf.Unpin()
+copy(buf.Bytes(), payload)
 ```
 
-### Sharing a buffer across concurrent readers
+## File operations
 
-The pool uses reference counting so multiple goroutines can read from
-the same buffer simultaneously.
-
-```go
-buf := pool.Acquire() // refCount = 1
-
-for _, reader := range readers {
-    if !buf.TryInc() { // refCount++; returns false if already released
-        break
-    }
-    go func(b *mempool.MmapBuffer) {
-        defer b.Unpin()
-        process(b.Bytes())
-    }(buf)
-}
-
-buf.Unpin() // writer releases its pin; last reader will return to pool
-```
-
-ABA safety: each `Acquire` wraps the raw memory in a **fresh** `*MmapBuffer`
-struct, so stale pointers held by racing readers remain distinct even when
-the underlying memory is reused.
-
-### Unpooled (one-off) buffers
-
-For allocations that exceed the pool's slab size:
+The `sys` package keeps `*os.File` live across raw syscalls and normalizes the
+platform differences around direct I/O and syncing.
 
 ```go
-buf := mempool.NewMmapBuffer(int64(largeSize))
-defer buf.Unpin() // Munmaps directly — no pool involved
-```
-
-### Strict misuse detection
-
-```go
-// In init() or TestMain — panics on double-release or other misuse.
-mempool.SetPanicOnMisuse(true)
-```
-
----
-
-## dio/sys
-
-OS-level file-descriptor primitives. Every function that issues a raw
-syscall accepts `*os.File` and calls `runtime.KeepAlive` after the syscall
-to prevent the GC from finalizing the file while the kernel holds its fd.
-
-### Creating and pre-allocating files
-
-```go
-import "github.com/miretskiy/dio/sys"
-
-// Open with O_DIRECT | O_DSYNC — bypasses page cache, syncs data on write.
-f, err := sys.CreateDirect(path, sys.FlDirectIO|sys.FlDSync)
+f, err := sys.CreateDirect(path, sys.FlDirectIO)
 if err != nil {
     return err
 }
 defer f.Close()
 
-// Pre-allocate contiguous disk space to reduce fragmentation.
-if err := sys.Fallocate(f, 512<<20 /* 512 MiB */); err != nil {
+if err := sys.Fallocate(f, 512<<20); err != nil {
+    return err
+}
+if err := sys.Fdatasync(f); err != nil {
     return err
 }
 ```
 
-### Writing and syncing
+Other operations include `OpenDirect`, `PunchHole`, `Fadvise`,
+`CopyFileRange`, `PreadAligned`, and `Ftruncate`. Unsupported optimizations are
+implemented as portable fallbacks or documented no-ops; use
+`sys.RequiresAlignment` and `sys.UseFadvise` when behavior matters to the
+caller.
+
+## I/O scheduling
+
+`Scheduler` accepts an `Op` and returns a `Ticket`. `URingScheduler.Submit` is a
+non-blocking handoff to a coordinator goroutine. `POSIXScheduler.Submit` runs
+the operation synchronously, so its returned ticket is already complete.
 
 ```go
-buf := align.AllocAligned(blockSize)
-defer align.FreeAligned(buf)
-fillBuffer(buf)
-
-if _, err := f.Write(buf); err != nil {
-    return err
-}
-
-// On Darwin, O_DSYNC is unavailable at open time — explicit sync required.
-if err := sys.SyncFile(f, sys.FlDSync); err != nil {
-    return err
-}
-```
-
-### Punching holes (sparse files)
-
-```go
-// Reclaim disk space occupied by a deleted record.
-// The range is aligned inward to block boundaries so adjacent data is safe.
-reclaimed, err := sys.PunchHole(f, recordOffset, recordSize)
-if err != nil {
-    return err
-}
-log.Printf("reclaimed %d bytes", reclaimed)
-```
-
-### Fadvise
-
-```go
-// Tell the kernel we will read sequentially — enables aggressive read-ahead.
-sys.Fadvise(f, 0, fileSize, sys.FadvSequential)
-
-// After reading, release the pages from the page cache.
-sys.Fadvise(f, 0, fileSize, sys.FadvDontNeed)
-```
-
-### Platform constants
-
-```go
-if sys.RequiresAlignment {
-    // Linux O_DIRECT: buffer address, size, and offset must all be 4 KiB-aligned.
-}
-if sys.UseFadvise {
-    // Linux: posix_fadvise is effective.
-    // Darwin: F_RDAHEAD is coarser; this is false.
-}
-```
-
----
-
-## dio/iosched
-
-Pluggable positioned I/O scheduler. The interface is identical on all
-platforms; the implementation is swapped at construction time.
-
-```go
-import "github.com/miretskiy/dio/iosched"
-
-// Pick the best available backend automatically:
-//   Linux + io_uring kernel support -> URingScheduler
-//   Otherwise                       -> POSIXScheduler
-sched := iosched.NewDefaultScheduler()
-defer sched.Close()
-
-f, _ := os.Open(path)
-defer f.Close()
-
-buf := make([]byte, blockSize)
-ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
-if err != nil {
-    return err
-}
-ticket.Wait()
-if err := ticket.Error(); err != nil {
-    return err
-}
-```
-
-### POSIXScheduler (sync Scheduler)
-
-Synchronous `Scheduler` implementation for callers that want the same
-`Submit`/`Ticket` API without io_uring. Each `Submit` performs the POSIX
-operation before returning, so `Ticket.Wait` is immediate.
-
-```go
-sched := iosched.NewPOSIXScheduler()
-defer sched.Close()
-```
-
-### URingScheduler (async, Linux only)
-
-Asynchronous io_uring scheduler. A single coordinator goroutine owns the ring.
-Submitters publish `Op` values through an intrusive lock-free MPSC stack and a
-buffered doorbell; the coordinator fills free SQ slots and reaps CQEs.
-The kernel must provide `IORING_FEAT_NODROP` so completion events cannot be
-silently lost.
-
-```go
-if !iosched.IOUringAvailable {
-    log.Println("io_uring not available, falling back to pwrite")
-}
-
-sched, err := iosched.NewURingScheduler(iosched.URingConfig{
-    RingDepth: 256,  // SQ/CQ entries, must be power of two
-    SQPOLL:    false, // true burns one CPU core for kernel-side polling
-})
-if err != nil {
-    return err
-}
+sched := iosched.NewDefaultScheduler(iosched.WithVFiles(64))
 defer sched.Close()
 
 ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
 if err != nil {
-    return err
+    return err // not accepted
 }
 ticket.Wait()
 if err := ticket.Error(); err != nil {
-    return err
+    return err // execution failed
 }
 n := ticket.N()
 ```
 
-`Submit` does not implement application-level backpressure. It is a
-non-blocking handoff into the scheduler; callers that need an in-flight cap
-should wrap the scheduler with their own semaphore, token bucket, queue, or
-retry policy.
-
-### Concurrent reads — batching in action
+`NewDefaultScheduler` chooses io_uring when the running Linux kernel provides
+the required features and falls back to POSIX otherwise. To require io_uring,
+construct it directly with the same options:
 
 ```go
-var wg sync.WaitGroup
-for _, req := range requests {
-    wg.Add(1)
-    go func(r Request) {
-        defer wg.Done()
-        buf := make([]byte, r.Size)
-        n, err := bio.ReadAt(f, buf, r.Offset)
-        r.Done(buf[:n], err)
-    }(req)
-}
-wg.Wait()
-// URingScheduler coalesces ready submissions into fewer io_uring_enter syscalls.
+sched, err := iosched.NewURingScheduler(
+    iosched.WithRingDepth(256),
+    iosched.WithVFiles(64),
+    iosched.WithCoalescing(true),
+)
 ```
 
----
+`WithSQPOLL` enables kernel submission-queue polling. It can require additional
+privileges and dedicates a kernel thread, so it should be an explicit choice.
 
-## KeepAlive contract
+The scheduler does not provide application-level backpressure. Callers that
+need an in-flight limit should own the semaphore, queue, or buffer pool that
+defines it. Submitted buffers must remain valid until the ticket completes.
 
-Every `sys` function that extracts a raw fd from `*os.File` and passes it
-to a kernel syscall follows this pattern:
+### Operations and ordering
+
+Positioned scalar and vectored reads/writes, `fsync`, `fdatasync`, file
+allocation, open, and close are represented as `Op` values. `Link` stops the
+remaining chain after an operation error; `HardLink` continues it.
 
 ```go
-fd := int(f.Fd())        // extract once before any loop
-var err error
-for {
-    err = unix.Fdatasync(fd)
-    if err != unix.EINTR { break }
-}
-runtime.KeepAlive(f)     // single KeepAlive after the loop
-return err
+op := iosched.WriteOp(f, payload, offset).
+    Link(iosched.FdatasyncOp(f))
+ticket, err := sched.Submit(op)
 ```
 
-`f.Fd()` returns a `uintptr`. Once extracted, the Go runtime no longer
-considers the integer a reference to `f`, so the GC could finalize `f`
-(closing the fd) while the kernel is blocked in the syscall. `KeepAlive`
-extends `f`'s lifetime to cover the entire loop.
+Reads may complete with a short count and no error. Writes are not retried; a
+short write returns its count and `io.ErrShortWrite`, following `io.Writer`
+semantics. A caller that wants retry policy can resubmit the remaining suffix at
+`offset + int64(ticket.N())`.
 
----
+Standalone writes can request durability directly:
 
-## Testing
+```go
+ticket, err := sched.Submit(iosched.WriteOp(f, payload, offset).Durable())
+```
 
-```bash
-# Unit tests (Darwin/Linux)
+The ticket completes after `fdatasync`. `Durable` is deliberately rejected in
+a linked chain; use an explicit `FdatasyncOp` there so ordering is visible.
+
+Separate submissions are otherwise unordered. The io_uring coordinator does
+provide file-lifecycle barriers: a virtual open holds later work for its slot,
+and close waits for previously accepted work on the file. Racing `Submit`
+calls do not create an application-visible order.
+
+### Virtual files
+
+Virtual operations name a scheduler-owned slot instead of passing `*os.File`.
+On io_uring these are registered-file slots; POSIX emulates the same API with a
+userspace table. Configure the io_uring table with `WithVFiles`.
+
+```go
+const slot = uint32(0)
+
+open := iosched.VOpenatOp(
+    unix.AT_FDCWD,
+    path,
+    unix.O_CREATE|unix.O_RDWR,
+    0o600,
+    slot,
+).Link(
+    iosched.VFallocateOp(slot, fileSize),
+    iosched.VWriteOp(slot, firstBlock, 0),
+)
+
+ticket, err := sched.Submit(open)
+```
+
+Wait for a close-containing ticket before reusing its slot. Contiguous,
+standalone writes accepted next to one another may be coalesced into a single
+`writev`; each original submission still receives its own ticket and count.
+
+## Validation
+
+```sh
 go test ./...
-
-# Race detector
-go test -race ./...
-
-# Linux-only tests (hole punch, io_uring) — run on an NVMe volume
-TMPDIR=/instance_storage go test ./... -v
+go vet ./...
+go test -race ./iosched
 ```
 
----
+The io_uring runtime tests require Linux. Cross-compiling on another host only
+checks that the Linux code builds; it does not exercise the kernel path.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0. See `LICENSE`.

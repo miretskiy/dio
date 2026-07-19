@@ -2,6 +2,7 @@ package iosched
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
@@ -76,6 +77,13 @@ func (o Op) Durable() Op {
 
 // durable reports whether o requests a post-write fdatasync.
 func (o *Op) durable() bool { return o.opFlags&opDurable != 0 }
+
+func (o Op) syncOp() Op {
+	if o.isVirtual() {
+		return VFdatasyncOp(o.vfd)
+	}
+	return FdatasyncOp(o.f)
+}
 
 // ReadOp constructs a positioned-read operation.
 func ReadOp(f *os.File, buf []byte, offset int64) Op {
@@ -331,7 +339,7 @@ func (t Ticket) Error() error { return t.err }
 // after Wait.
 func (t Ticket) N() int { return t.n }
 
-func countAndValidateOps(op *Op, uring *URingConfig) (int32, error) {
+func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 	var count int32
 	linked := op.linked != nil
 	for p := op; p != nil; p = p.linked {
@@ -345,11 +353,11 @@ func countAndValidateOps(op *Op, uring *URingConfig) (int32, error) {
 			}
 		}
 		if p.isVirtual() {
-			if uring != nil {
-				if uring.VFiles == 0 {
-					return 0, fmt.Errorf("iosched: virtual file ops require URingConfig.VFiles")
+			if cfg != nil {
+				if cfg.vfiles == 0 {
+					return 0, fmt.Errorf("iosched: virtual file ops require WithVFiles")
 				}
-				if p.vfd >= uring.VFiles {
+				if p.vfd >= cfg.vfiles {
 					return 0, fmt.Errorf("iosched: virtual file index %d outside configured table", p.vfd)
 				}
 			}
@@ -359,6 +367,32 @@ func countAndValidateOps(op *Op, uring *URingConfig) (int32, error) {
 		count++
 	}
 	return count, nil
+}
+
+func opBytes(op *Op) int {
+	switch op.kind() {
+	case OpWritev, OpReadv:
+		total := 0
+		for _, buf := range op.bufs {
+			total += len(buf)
+		}
+		return total
+	default:
+		return len(op.buf)
+	}
+}
+
+func writeResultError(op *Op, n int, err error) error {
+	if err != nil {
+		return err
+	}
+	switch op.kind() {
+	case OpWrite, OpWritev:
+		if n < opBytes(op) {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func recordResult(root, op *Op, n int, err error) {

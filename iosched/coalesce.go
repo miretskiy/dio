@@ -1,6 +1,8 @@
-//go:build linux
-
 package iosched
+
+// These rules are independent of io_uring, but only its asynchronous
+// coordinator has a ready batch to coalesce. POSIX Submit executes one request
+// synchronously; explicit WritevOp is its vectored-write path.
 
 // Linux permits at most 1024 iovecs for one readv/writev. Capping a coalesced
 // run here also bounds the reusable per-ring-slot completion/iovec buffers.
@@ -20,17 +22,4 @@ func sameWriteTarget(a, b *Op) bool {
 		return a.vfd == b.vfd
 	}
 	return a.f == b.f
-}
-
-func opBytes(op *Op) int {
-	switch op.kind() {
-	case OpWritev, OpReadv:
-		total := 0
-		for _, buf := range op.bufs {
-			total += len(buf)
-		}
-		return total
-	default:
-		return len(op.buf)
-	}
 }

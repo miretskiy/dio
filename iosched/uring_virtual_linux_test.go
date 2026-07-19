@@ -19,7 +19,7 @@ import (
 // without waiting; the open barrier keeps it out of the ring until the whole
 // open-fallocate-write chain has completed.
 func TestURing_VOpenFallocateWriteChain(t *testing.T) {
-	s := newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 4})
+	s := newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(4))
 	const vfd = uint32(1)
 	const size = int64(1 << 16)
 
@@ -58,7 +58,7 @@ func TestURing_VOpenFallocateWriteChain(t *testing.T) {
 // submitted after an open need no caller-side Wait, yet they cannot resolve the
 // virtual slot until the open CQE has installed the file.
 func TestURing_VOpenBlocksLaterReads(t *testing.T) {
-	s := newVURingSched(t, iosched.URingConfig{RingDepth: 64, VFiles: 2})
+	s := newVURingSched(t, iosched.WithRingDepth(64), iosched.WithVFiles(2))
 	const vfd = uint32(0)
 	want := []byte("read-after-open-without-an-artificial-wait")
 	path := filepath.Join(t.TempDir(), "open-barrier.dat")
@@ -90,7 +90,7 @@ func TestURing_VOpenBlocksLaterReads(t *testing.T) {
 // TestURing_VSlotRecycleAfterCloseWait covers the supported slot-reuse contract:
 // the close completes before the next open is submitted for that slot.
 func TestURing_VSlotRecycleAfterCloseWait(t *testing.T) {
-	s := newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 2})
+	s := newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(2))
 	const vfd = uint32(0)
 	dir := t.TempDir()
 
@@ -123,7 +123,7 @@ func TestURing_VSlotRecycleAfterCloseWait(t *testing.T) {
 // holds the close until the slot's in-flight ops drain — so it holds under
 // -count, unlike relying on the kernel not to race the close.
 func TestURing_VCloseDrainsInflightWrites(t *testing.T) {
-	s := newVURingSched(t, iosched.URingConfig{RingDepth: 256, VFiles: 2})
+	s := newVURingSched(t, iosched.WithRingDepth(256), iosched.WithVFiles(2))
 	const vfd = uint32(0)
 	const n = 64
 	const recLen = 64 // contiguous records → coalesced into one writev
@@ -236,7 +236,7 @@ func TestURing_CloseDrainsInflightWrites_Regular(t *testing.T) {
 // close is held until the write drains; the next open then recycles the slot. It
 // checks data survives the write, the drain, and the reopen across every reuse.
 func TestURing_VSlot1_Recycle(t *testing.T) {
-	s := newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 1})
+	s := newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(1))
 	const vfd = uint32(0)
 	const iters = 300
 	dir := t.TempDir()

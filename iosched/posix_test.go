@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/iosched"
 )
@@ -105,4 +106,80 @@ func TestPOSIXSchedulerErrors(t *testing.T) {
 			require.ErrorContains(t, tc.run(t), tc.want)
 		})
 	}
+}
+
+// The POSIX scheduler emulates virtual files with a userspace descriptor
+// table. These tests pin it directly so the emulation is exercised on Linux
+// too, where NewDefaultScheduler normally selects io_uring.
+func TestPOSIXVirtualOpenFallocateWriteChain(t *testing.T) {
+	s := iosched.NewPOSIXScheduler()
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	path := filepath.Join(t.TempDir(), "slab.dat")
+	const vfd = uint32(3)
+	const size = int64(1 << 16)
+	payload := []byte("openat + fallocate + write, fused")
+
+	chain := iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd).
+		Link(iosched.VFallocateOp(vfd, size), iosched.VWriteOp(vfd, payload, 0))
+	ticket := submitAndWait(t, s, chain)
+	require.NoError(t, ticket.Error())
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, info.Size(), size)
+
+	got := make([]byte, len(payload))
+	read := submitAndWait(t, s, iosched.VReadOp(vfd, got, 0))
+	require.NoError(t, read.Error())
+	require.Equal(t, len(payload), read.N())
+	require.Equal(t, payload, got)
+
+	closeTicket := submitAndWait(t, s, iosched.VCloseOp(vfd))
+	require.NoError(t, closeTicket.Error())
+
+	after := submitAndWait(t, s, iosched.VWriteOp(vfd, payload, 0))
+	require.Error(t, after.Error())
+}
+
+func TestPOSIXVirtualSlotRecycle(t *testing.T) {
+	s := iosched.NewPOSIXScheduler()
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	dir := t.TempDir()
+	const vfd = uint32(0)
+
+	for i, name := range []string{"a.dat", "b.dat"} {
+		path := filepath.Join(dir, name)
+		want := []byte{byte('A' + i)}
+
+		open := submitAndWait(t, s, iosched.VOpenatOp(
+			unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd,
+		))
+		require.NoError(t, open.Error())
+
+		write := submitAndWait(t, s, iosched.VWriteOp(vfd, want, 0))
+		require.NoError(t, write.Error())
+
+		closeTicket := submitAndWait(t, s, iosched.VCloseOp(vfd))
+		require.NoError(t, closeTicket.Error())
+	}
+}
+
+func TestFallocateOpGrowsFile(t *testing.T) {
+	s := iosched.NewPOSIXScheduler()
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+
+	path := filepath.Join(t.TempDir(), "grow.dat")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = f.Close() })
+
+	const size = int64(1 << 20)
+	ticket := submitAndWait(t, s, iosched.FallocateOp(f, size))
+	require.NoError(t, ticket.Error())
+
+	info, err := f.Stat()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, info.Size(), size)
 }

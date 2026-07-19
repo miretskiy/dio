@@ -150,6 +150,7 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 			return 0, nil
 		}
 		n, err = ignoringEINTR(syscall.Pwrite, int(f.Fd()), op.buf, op.offset)
+		err = writeResultError(op, n, err)
 		err = posixDurable(op, f, err)
 	case OpFsync:
 		err = f.Sync()
@@ -163,6 +164,7 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 		n, err = vectoredPOSIX(syscall.Pread, int(f.Fd()), op.bufs, op.offset)
 	case OpWritev:
 		n, err = vectoredPOSIX(syscall.Pwrite, int(f.Fd()), op.bufs, op.offset)
+		err = writeResultError(op, n, err)
 		err = posixDurable(op, f, err)
 	case OpOpenat:
 		// Plain openat: open the path and return the raw fd through Ticket.N; the

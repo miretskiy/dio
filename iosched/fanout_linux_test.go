@@ -172,7 +172,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 
 	ff := setupFanout(b)
 
-	sched, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 256})
+	sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(256))
 	if err != nil {
 		b.Fatal(err)
 	}

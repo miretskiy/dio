@@ -85,13 +85,13 @@ func isFileOperation(op *Op) bool {
 // admit records the two ordering conditions the scheduler provides: virtual
 // file operations wait for work containing an unfinished open, and close waits
 // for older file operations to complete.
-func (f *fileTable) admit(c *coordinator, handle intrusive.Handle) error {
+func (c *coordinator) admit(handle intrusive.Handle) error {
 	work := c.pending.Value(handle)
 
 	// Work submitted after close, and an open while prior slot work remains,
 	// have no useful ordering contract. Reject them before changing file state.
 	for op := work.root; op != nil; op = op.linked {
-		state := f.lookup(op)
+		state := c.files.lookup(op)
 		if state == nil {
 			continue
 		}
@@ -110,7 +110,7 @@ func (f *fileTable) admit(c *coordinator, handle intrusive.Handle) error {
 		if op.kind() == OpOpenat && !op.isVirtual() {
 			continue
 		}
-		state := f.state(op)
+		state := c.files.state(op)
 		if state.opening != 0 && state.opening != handle {
 			state.openWaiters = append(state.openWaiters, handle)
 			work.waitCount++
@@ -134,14 +134,14 @@ func (f *fileTable) admit(c *coordinator, handle intrusive.Handle) error {
 
 	for op := work.root; op != nil; op = op.linked {
 		if isFileOperation(op) {
-			f.state(op).active++
+			c.files.state(op).active++
 		}
 	}
 	return nil
 }
 
-func (f *fileTable) completedOperation(c *coordinator, handle intrusive.Handle, op *Op) {
-	state := f.lookup(op)
+func (c *coordinator) completedOperation(handle intrusive.Handle, op *Op) {
+	state := c.files.lookup(op)
 	if state == nil {
 		return
 	}
@@ -167,15 +167,15 @@ func (f *fileTable) completedOperation(c *coordinator, handle intrusive.Handle, 
 			}
 		}
 	}
-	f.removeIfEmpty(op, state)
+	c.files.removeIfEmpty(op, state)
 }
 
-func (f *fileTable) completedWork(c *coordinator, handle intrusive.Handle, root *Op) {
+func (c *coordinator) completedWork(handle intrusive.Handle, root *Op) {
 	for op := root; op != nil; op = op.linked {
 		if !isVirtualOpen(op) {
 			continue
 		}
-		state := f.lookup(op)
+		state := c.files.lookup(op)
 		if state == nil || state.opening != handle {
 			continue
 		}

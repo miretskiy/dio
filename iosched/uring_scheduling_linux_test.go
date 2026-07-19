@@ -60,7 +60,10 @@ func (f *fakeRingQueue) complete(slot uint64, result int32) {
 
 func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 	c := coordinator{
-		sched: &URingScheduler{URingConfig: URingConfig{RingDepth: uint32(depth), VFiles: vfiles}},
+		sched: &URingScheduler{config: schedulerConfig{
+			ringDepth: uint32(depth),
+			vfiles:    vfiles,
+		}},
 		ring:  ring,
 		slots: intrusive.MakeFixedList[ringSlot](depth),
 		files: newFileTable(vfiles),
@@ -166,8 +169,8 @@ func TestSubmitRejectsInvalidVirtualFileBeforeStaging(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &URingScheduler{
-				URingConfig: URingConfig{RingDepth: 1, VFiles: tc.vfiles},
-				wakeup:      make(chan struct{}, 1),
+				config: schedulerConfig{ringDepth: 1, vfiles: tc.vfiles},
+				wakeup: make(chan struct{}, 1),
 			}
 			_, err := s.Submit(tc.op(tc.vfd))
 			require.Error(t, err)
@@ -194,8 +197,8 @@ func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
 func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	ring := &fakeRingQueue{}
 	s := &URingScheduler{
-		URingConfig: URingConfig{RingDepth: 1, VFiles: 1},
-		wakeup:      make(chan struct{}, 1),
+		config: schedulerConfig{ringDepth: 1, vfiles: 1},
+		wakeup: make(chan struct{}, 1),
 	}
 	op := VReadOp(0, make([]byte, 1), 0)
 	request, ticket := newSubmission(op, 1)

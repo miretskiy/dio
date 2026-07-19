@@ -24,7 +24,8 @@ type Scheduler interface {
 	// Waiting is optional when the caller does not need the result. A Submit error
 	// means the operation was not accepted and the returned Ticket is invalid;
 	// execution and asynchronous admission errors are reported by a valid Ticket.
-	// Reads and writes absorb EINTR but may complete with a short count.
+	// Reads absorb EINTR and may complete with a short count. Writes are not
+	// retried; a short write reports io.ErrShortWrite together with its count.
 	//
 	// Operations in a Link or HardLink chain execute in order. Link cancels the
 	// remaining chain after a failure; HardLink continues it. URingScheduler
@@ -74,21 +75,4 @@ func RegisterDMASlab(s Scheduler, pool *mempool.SlabPool) error {
 		return p.usePool(pool)
 	}
 	return nil
-}
-
-// URingConfig configures the io_uring scheduler.
-type URingConfig struct {
-	// RingDepth is the number of SQ/CQ entries. Zero uses the default.
-	RingDepth uint32
-
-	// SQPOLL enables IORING_SETUP_SQPOLL.
-	SQPOLL bool
-
-	// VFiles registers a sparse virtual-file table of this size. Virtual-file
-	// ops require a non-zero table.
-	VFiles uint32
-
-	// DisableCoalescing turns off write coalescing (contiguous same-file plain
-	// writes in a batch merged into one writev). Coalescing is on by default.
-	DisableCoalescing bool
 }

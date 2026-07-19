@@ -20,27 +20,26 @@ import (
 	"github.com/miretskiy/dio/sys"
 )
 
-func newURingSched(t *testing.T, cfg ...iosched.URingConfig) *iosched.URingScheduler {
+func newURingSched(t *testing.T, opts ...iosched.Option) *iosched.URingScheduler {
 	t.Helper()
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	c := iosched.URingConfig{RingDepth: 64}
-	if len(cfg) > 0 {
-		c = cfg[0]
+	if len(opts) == 0 {
+		opts = []iosched.Option{iosched.WithRingDepth(64)}
 	}
-	s, err := iosched.NewURingScheduler(c)
+	s, err := iosched.NewURingScheduler(opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
 }
 
-func newVURingSched(t *testing.T, cfg iosched.URingConfig) *iosched.URingScheduler {
+func newVURingSched(t *testing.T, opts ...iosched.Option) *iosched.URingScheduler {
 	t.Helper()
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	s, err := iosched.NewURingScheduler(cfg)
+	s, err := iosched.NewURingScheduler(opts...)
 	if err != nil {
 		switch {
 		case errors.Is(err, unix.EINVAL), errors.Is(err, unix.EOPNOTSUPP), errors.Is(err, unix.ENOSYS):
@@ -123,7 +122,7 @@ func TestURing_Submit_Write(t *testing.T) {
 
 func TestURing_GroupCommit(t *testing.T) {
 	const chunks = 16
-	s := newURingSched(t, iosched.URingConfig{RingDepth: 8})
+	s := newURingSched(t, iosched.WithRingDepth(8))
 
 	path := filepath.Join(t.TempDir(), "gc.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, chunks*4096), 0644))
@@ -222,7 +221,7 @@ func TestURing_Concurrent(t *testing.T) {
 
 func TestURing_LinkedChainTooLargeIsRejected(t *testing.T) {
 	const ringDepth = 1
-	s := newURingSched(t, iosched.URingConfig{RingDepth: ringDepth})
+	s := newURingSched(t, iosched.WithRingDepth(ringDepth))
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
@@ -233,7 +232,7 @@ func TestURing_LinkedChainTooLargeIsRejected(t *testing.T) {
 }
 
 func TestURing_DurableWriteTooLargeIsRejected(t *testing.T) {
-	s := newURingSched(t, iosched.URingConfig{RingDepth: 1})
+	s := newURingSched(t, iosched.WithRingDepth(1))
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
@@ -243,7 +242,7 @@ func TestURing_DurableWriteTooLargeIsRejected(t *testing.T) {
 }
 
 func TestURing_CloseThenSubmit(t *testing.T) {
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{})
+	s, err := iosched.NewURingScheduler()
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
 
@@ -257,7 +256,7 @@ func TestURing_CloseThenSubmit(t *testing.T) {
 }
 
 func TestURing_SQPOLL(t *testing.T) {
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 64, SQPOLL: true})
+	s, err := iosched.NewURingScheduler(iosched.WithRingDepth(64), iosched.WithSQPOLL())
 	if err != nil {
 		t.Skipf("SQPOLL not available (may require CAP_SYS_NICE): %v", err)
 	}
@@ -305,7 +304,7 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 		workers = 16
 		rounds  = 64
 	)
-	s := newURingSched(t, iosched.URingConfig{RingDepth: 32})
+	s := newURingSched(t, iosched.WithRingDepth(32))
 
 	path := filepath.Join(t.TempDir(), "parallel-direct.dat")
 	f, err := sys.CreateDirect(path, sys.FlDirectIO)
@@ -363,7 +362,7 @@ func TestURing_ConcurrentDirectWriteAndFdatasync(t *testing.T) {
 }
 
 func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
-	s := newVURingSched(t, iosched.URingConfig{RingDepth: 16, VFiles: 4})
+	s := newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(4))
 	vfd := uint32(0)
 
 	path := filepath.Join(t.TempDir(), "vopen.dat")
@@ -403,7 +402,7 @@ func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, *mempool.Sl
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	s, err := iosched.NewURingScheduler(iosched.URingConfig{RingDepth: 64})
+	s, err := iosched.NewURingScheduler(iosched.WithRingDepth(64))
 	require.NoError(t, err)
 
 	var pool *mempool.SlabPool

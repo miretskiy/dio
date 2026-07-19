@@ -154,6 +154,21 @@ func TestCoalescedShortWriteCompletion(t *testing.T) {
 	require.Equal(t, 2, tickets[1].N())
 }
 
+func TestSingleShortWriteCompletion(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(1, 0, ring)
+	f := os.NewFile(100, "a")
+	tickets, _ := acceptOps(&c, WriteOp(f, make([]byte, 4), 0))
+	c.placeReady(true)
+	require.Len(t, ring.sqes, 1)
+
+	ring.complete(ring.sqes[0].UserData, 2)
+	c.reap()
+	tickets[0].Wait()
+	require.ErrorIs(t, tickets[0].Error(), io.ErrShortWrite)
+	require.Equal(t, 2, tickets[0].N())
+}
+
 func TestOpBytes(t *testing.T) {
 	writev := WritevOp(os.NewFile(100, "a"), [][]byte{make([]byte, 3), nil, make([]byte, 5)}, 0)
 	require.Equal(t, 8, opBytes(&writev))
