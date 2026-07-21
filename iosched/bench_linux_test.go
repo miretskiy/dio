@@ -120,12 +120,12 @@ func BenchmarkRegularIO(b *testing.B) {
 				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("submit: %w", err))
 				return
 			}
-			ticket.Wait()
-			if err := ticket.Error(); err != nil {
+			n, err := ticket.Wait()
+			if err != nil {
 				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, err))
 				return
-			} else if ticket.N() != readBenchBlockSize {
-				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, ticket.N()))
+			} else if n != readBenchBlockSize {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, n))
 				return
 			}
 		}
@@ -160,8 +160,7 @@ func BenchmarkDirectIO(b *testing.B) {
 	if err != nil {
 		b.Fatalf("submit vopen: %v", err)
 	}
-	openTicket.Wait()
-	if err := openTicket.Error(); err != nil {
+	if _, err := openTicket.Wait(); err != nil {
 		b.Fatalf("vopen: %v", err)
 	}
 
@@ -182,12 +181,12 @@ func BenchmarkDirectIO(b *testing.B) {
 				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("submit: %w", err))
 				return
 			}
-			ticket.Wait()
-			if err := ticket.Error(); err != nil {
+			n, err := ticket.Wait()
+			if err != nil {
 				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("read at %d: %w", offset, err))
 				return
-			} else if ticket.N() != readBenchBlockSize {
-				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, ticket.N()))
+			} else if n != readBenchBlockSize {
+				recordBenchErr(&errOnce, &benchErr, fmt.Errorf("short read at %d: %d", offset, n))
 				return
 			}
 		}
@@ -223,8 +222,7 @@ func BenchmarkSubmission_ReadAt_Serial(b *testing.B) {
 		if err != nil {
 			b.Fatalf("submit: %v", err)
 		}
-		ticket.Wait()
-		if err := ticket.Error(); err != nil {
+		if _, err := ticket.Wait(); err != nil {
 			b.Fatalf("read: %v", err)
 		}
 	}
@@ -259,8 +257,7 @@ func BenchmarkSubmission_ReadAt_Parallel(b *testing.B) {
 			if err != nil {
 				b.Fatalf("submit: %v", err)
 			}
-			ticket.Wait()
-			if err := ticket.Error(); err != nil {
+			if _, err := ticket.Wait(); err != nil {
 				b.Fatalf("read: %v", err)
 			}
 		}
@@ -307,8 +304,7 @@ func BenchmarkSubmission_Concurrency(b *testing.B) {
 							b.Errorf("submit: %v", err)
 							return
 						}
-						ticket.Wait()
-						if err := ticket.Error(); err != nil {
+						if _, err := ticket.Wait(); err != nil {
 							b.Errorf("read: %v", err)
 							return
 						}
@@ -357,8 +353,7 @@ func BenchmarkSubmission_BatchedReads(b *testing.B) {
 					tickets[j] = ticket
 				}
 				for j, ticket := range tickets {
-					ticket.Wait()
-					if err := ticket.Error(); err != nil {
+					if _, err := ticket.Wait(); err != nil {
 						b.Fatalf("read %d: %v", j, err)
 					}
 				}

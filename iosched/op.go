@@ -18,7 +18,7 @@ const (
 	OpWritev // pwritev - vectored positioned write
 
 	OpOpenat // openat - installs into a vfd slot, or returns a fd
-	OpClose  // close - frees a vfd slot, or closes a regular fd
+	OpClose  // close a vfd slot, or drain operations on a regular file
 
 	OpFsync     // fsync - flush data and metadata
 	OpFdatasync // fdatasync - flush data
@@ -116,15 +116,15 @@ func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
 }
 
 // ReadvOp constructs a vectored positioned read: bufs are filled from
-// consecutive file offsets starting at offset (preadv semantics). Ticket.N is
-// the total bytes read across all buffers.
+// consecutive file offsets starting at offset (preadv semantics). Ticket.Wait
+// returns the total bytes read across all buffers.
 func ReadvOp(f *os.File, bufs [][]byte, offset int64) Op {
 	return Op{opcode: OpReadv, f: f, bufs: bufs, offset: offset}
 }
 
 // WritevOp constructs a vectored positioned write: bufs are written to
-// consecutive file offsets starting at offset (pwritev semantics). Ticket.N is
-// the total bytes written across all buffers.
+// consecutive file offsets starting at offset (pwritev semantics). Ticket.Wait
+// returns the total bytes written across all buffers.
 func WritevOp(f *os.File, bufs [][]byte, offset int64) Op {
 	return Op{opcode: OpWritev, f: f, bufs: bufs, offset: offset}
 }
@@ -142,9 +142,9 @@ func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
 }
 
 // OpenatOp constructs a plain openat operation that opens path and returns the
-// new regular file descriptor in Ticket.N. The caller owns that fd and must
-// close it. To open directly into the registered-file table instead — no
-// process fd — use VOpenatOp.
+// new regular file descriptor as Ticket.Wait's integer result. The caller owns
+// that fd and must close it. To open directly into the registered-file table
+// instead — no process fd — use VOpenatOp.
 //
 // The dfd argument is the directory fd passed to openat(2), for example
 // unix.AT_FDCWD.
@@ -185,12 +185,14 @@ func VCloseOp(vfd uint32) Op {
 	return Op{opcode: OpClose | opVirtual, vfd: vfd}
 }
 
-// CloseOp closes f's descriptor through the scheduler; the scheduler drains f's
-// in-flight ops before the close runs. Op holds f for the duration to keep the
-// descriptor alive. From here dio owns the close: closing or otherwise using f
-// again is a use-after-close, which — as with any descriptor — dio does not
-// guard against.
-func CloseOp(f *os.File) Op {
+// DrainOp waits for previously accepted operations on f, including the
+// fdatasync synthesized by Durable writes. It does not close f; the caller
+// retains ownership and may call f.Close after the returned Ticket completes.
+//
+// DrainOp holds f strongly until completion, so asynchronous operations cannot
+// outlive the os.File and no caller-side runtime.KeepAlive is needed. Callers
+// must stop submitting work for f before submitting DrainOp.
+func DrainOp(f *os.File) Op {
 	return Op{opcode: OpClose, f: f}
 }
 
@@ -327,17 +329,12 @@ func (o *Op) prepareSubmission() Ticket {
 	return Ticket{o.completion}
 }
 
-// Wait blocks until the Ticket completes.
-func (t Ticket) Wait() {
+// Wait blocks until the Ticket completes and returns the root operation's byte
+// count (or opened file descriptor) and the first operation or scheduler error.
+func (t Ticket) Wait() (int, error) {
 	t.done.Wait()
+	return t.n, t.err
 }
-
-// Error returns an operation or scheduler error, valid after Wait.
-func (t Ticket) Error() error { return t.err }
-
-// N returns the root operation's byte count or opened file descriptor, valid
-// after Wait.
-func (t Ticket) N() int { return t.n }
 
 func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 	var count int32
@@ -351,6 +348,9 @@ func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 			if len(p.path) <= 1 {
 				return 0, fmt.Errorf("iosched: op %d has empty open path", count)
 			}
+		}
+		if kind == OpClose && !p.isVirtual() && p.linked != nil {
+			return 0, fmt.Errorf("iosched: DrainOp must be the final operation in a linked chain")
 		}
 		if p.isVirtual() {
 			if cfg != nil {

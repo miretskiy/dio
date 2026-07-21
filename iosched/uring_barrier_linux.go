@@ -83,8 +83,8 @@ func isFileOperation(op *Op) bool {
 }
 
 // admit records the two ordering conditions the scheduler provides: virtual
-// file operations wait for work containing an unfinished open, and close waits
-// for older file operations to complete.
+// file operations wait for work containing an unfinished open, while DrainOp
+// and VCloseOp wait for older file operations to complete.
 func (c *coordinator) admit(handle intrusive.Handle) error {
 	work := c.pending.Value(handle)
 
@@ -96,7 +96,7 @@ func (c *coordinator) admit(handle intrusive.Handle) error {
 			continue
 		}
 		if state.closing != 0 {
-			return fmt.Errorf("iosched: operation submitted before close completed")
+			return fmt.Errorf("iosched: operation submitted before file lifecycle barrier completed")
 		}
 		if isVirtualOpen(op) && (state.opening != 0 || state.active != 0) {
 			return fmt.Errorf("iosched: virtual open submitted before prior slot work completed")

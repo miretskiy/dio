@@ -30,12 +30,11 @@ func openRWFile(t *testing.T, path string) *os.File {
 	return f
 }
 
-func submitAndWait(t *testing.T, s iosched.Scheduler, op iosched.Op) iosched.Ticket {
+func submitAndWait(t *testing.T, s iosched.Scheduler, op iosched.Op) (int, error) {
 	t.Helper()
 	ticket, err := s.Submit(op)
 	require.NoError(t, err)
-	ticket.Wait()
-	return ticket
+	return ticket.Wait()
 }
 
 func TestNewDefaultScheduler(t *testing.T) {
@@ -56,19 +55,19 @@ func TestPOSIXScheduler(t *testing.T) {
 	_, err := rand.Read(payload)
 	require.NoError(t, err)
 
-	ticket := submitAndWait(t, s, iosched.WriteOp(f, payload, 0))
-	require.NoError(t, ticket.Error())
-	require.Equal(t, len(payload), ticket.N())
+	n, err := submitAndWait(t, s, iosched.WriteOp(f, payload, 0))
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
 
 	got := make([]byte, len(payload))
-	ticket = submitAndWait(t, s, iosched.ReadOp(f, got, 0))
-	require.NoError(t, ticket.Error())
-	require.Equal(t, len(got), ticket.N())
+	n, err = submitAndWait(t, s, iosched.ReadOp(f, got, 0))
+	require.NoError(t, err)
+	require.Equal(t, len(got), n)
 	require.Equal(t, payload, got)
 
-	ticket = submitAndWait(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
-	require.NoError(t, ticket.Error())
-	require.Equal(t, len(payload), ticket.N())
+	n, err = submitAndWait(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
 }
 
 func TestPOSIXSchedulerErrors(t *testing.T) {
@@ -122,24 +121,24 @@ func TestPOSIXVirtualOpenFallocateWriteChain(t *testing.T) {
 
 	chain := iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd).
 		Link(iosched.VFallocateOp(vfd, size), iosched.VWriteOp(vfd, payload, 0))
-	ticket := submitAndWait(t, s, chain)
-	require.NoError(t, ticket.Error())
+	_, err := submitAndWait(t, s, chain)
+	require.NoError(t, err)
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, info.Size(), size)
 
 	got := make([]byte, len(payload))
-	read := submitAndWait(t, s, iosched.VReadOp(vfd, got, 0))
-	require.NoError(t, read.Error())
-	require.Equal(t, len(payload), read.N())
+	n, err := submitAndWait(t, s, iosched.VReadOp(vfd, got, 0))
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
 	require.Equal(t, payload, got)
 
-	closeTicket := submitAndWait(t, s, iosched.VCloseOp(vfd))
-	require.NoError(t, closeTicket.Error())
+	_, err = submitAndWait(t, s, iosched.VCloseOp(vfd))
+	require.NoError(t, err)
 
-	after := submitAndWait(t, s, iosched.VWriteOp(vfd, payload, 0))
-	require.Error(t, after.Error())
+	_, err = submitAndWait(t, s, iosched.VWriteOp(vfd, payload, 0))
+	require.Error(t, err)
 }
 
 func TestPOSIXVirtualSlotRecycle(t *testing.T) {
@@ -153,16 +152,16 @@ func TestPOSIXVirtualSlotRecycle(t *testing.T) {
 		path := filepath.Join(dir, name)
 		want := []byte{byte('A' + i)}
 
-		open := submitAndWait(t, s, iosched.VOpenatOp(
+		_, err := submitAndWait(t, s, iosched.VOpenatOp(
 			unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, vfd,
 		))
-		require.NoError(t, open.Error())
+		require.NoError(t, err)
 
-		write := submitAndWait(t, s, iosched.VWriteOp(vfd, want, 0))
-		require.NoError(t, write.Error())
+		_, err = submitAndWait(t, s, iosched.VWriteOp(vfd, want, 0))
+		require.NoError(t, err)
 
-		closeTicket := submitAndWait(t, s, iosched.VCloseOp(vfd))
-		require.NoError(t, closeTicket.Error())
+		_, err = submitAndWait(t, s, iosched.VCloseOp(vfd))
+		require.NoError(t, err)
 	}
 }
 
@@ -176,8 +175,8 @@ func TestFallocateOpGrowsFile(t *testing.T) {
 	t.Cleanup(func() { _ = f.Close() })
 
 	const size = int64(1 << 20)
-	ticket := submitAndWait(t, s, iosched.FallocateOp(f, size))
-	require.NoError(t, ticket.Error())
+	_, err = submitAndWait(t, s, iosched.FallocateOp(f, size))
+	require.NoError(t, err)
 
 	info, err := f.Stat()
 	require.NoError(t, err)

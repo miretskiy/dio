@@ -65,8 +65,7 @@ func benchWriteCoalescing(b *testing.B, disable bool) {
 				tickets[i] = tk
 			}
 			for _, tk := range tickets {
-				tk.Wait()
-				if err := tk.Error(); err != nil {
+				if _, err := tk.Wait(); err != nil {
 					b.Error(err)
 				}
 			}

@@ -213,8 +213,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 			slot.Release()
 			b.Fatalf("submit read: %v", err)
 		}
-		readTicket.Wait()
-		if rerr := readTicket.Error(); rerr != nil {
+		if _, rerr := readTicket.Wait(); rerr != nil {
 			slot.Release()
 			b.Fatalf("read at %d: %v", offset, rerr)
 		}
@@ -230,8 +229,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 			writeTickets[si] = writeTicket
 		}
 		for si := range fanoutNumSinks {
-			writeTickets[si].Wait()
-			if werr := writeTickets[si].Error(); werr != nil {
+			if _, werr := writeTickets[si].Wait(); werr != nil {
 				slot.Release()
 				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}

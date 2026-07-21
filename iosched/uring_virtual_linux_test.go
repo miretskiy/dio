@@ -36,22 +36,22 @@ func TestURing_VOpenFallocateWriteChain(t *testing.T) {
 	// slot's open barrier.
 	secondTkt, err := s.Submit(iosched.VWriteOp(vfd, second, int64(len(first))))
 	require.NoError(t, err)
-	chainTkt.Wait()
-	secondTkt.Wait()
-	require.NoError(t, chainTkt.Error())
-	require.NoError(t, secondTkt.Error())
+	_, err = chainTkt.Wait()
+	require.NoError(t, err)
+	_, err = secondTkt.Wait()
+	require.NoError(t, err)
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, info.Size(), size)
 
 	got := make([]byte, len(first)+len(second))
-	rd := submitOne(t, s, iosched.VReadOp(vfd, got, 0))
-	require.NoError(t, rd.Error())
+	_, err = submitOne(t, s, iosched.VReadOp(vfd, got, 0))
+	require.NoError(t, err)
 	require.Equal(t, append(append([]byte{}, first...), second...), got)
 
-	cl := submitOne(t, s, iosched.VCloseOp(vfd))
-	require.NoError(t, cl.Error())
+	_, err = submitOne(t, s, iosched.VCloseOp(vfd))
+	require.NoError(t, err)
 }
 
 // TestURing_VOpenBlocksLaterReads is the open-barrier contract directly: reads
@@ -75,16 +75,16 @@ func TestURing_VOpenBlocksLaterReads(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	open.Wait()
-	require.NoError(t, open.Error())
+	_, err = open.Wait()
+	require.NoError(t, err)
 	for i, read := range reads {
-		read.Wait()
-		require.NoErrorf(t, read.Error(), "read %d", i)
+		_, err := read.Wait()
+		require.NoErrorf(t, err, "read %d", i)
 		require.Equal(t, want, bufs[i])
 	}
 
-	cl := submitOne(t, s, iosched.VCloseOp(vfd))
-	require.NoError(t, cl.Error())
+	_, err = submitOne(t, s, iosched.VCloseOp(vfd))
+	require.NoError(t, err)
 }
 
 // TestURing_VSlotRecycleAfterCloseWait covers the supported slot-reuse contract:
@@ -98,21 +98,21 @@ func TestURing_VSlotRecycleAfterCloseWait(t *testing.T) {
 		path := filepath.Join(dir, name)
 		want := []byte{byte('A' + i), byte('A' + i), byte('A' + i), byte('A' + i)}
 
-		op := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path,
+		_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path,
 			unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC, 0o600, vfd))
-		require.NoError(t, op.Error())
+		require.NoError(t, err)
 
-		w := submitOne(t, s, iosched.VWriteOp(vfd, want, 0))
-		require.NoError(t, w.Error())
+		_, err = submitOne(t, s, iosched.VWriteOp(vfd, want, 0))
+		require.NoError(t, err)
 
 		got := make([]byte, len(want))
-		rd := submitOne(t, s, iosched.VReadOp(vfd, got, 0))
-		require.NoError(t, rd.Error())
+		_, err = submitOne(t, s, iosched.VReadOp(vfd, got, 0))
+		require.NoError(t, err)
 		require.Equal(t, want, got)
 
 		// Wait the close before the next iteration reopens the same slot.
-		cl := submitOne(t, s, iosched.VCloseOp(vfd))
-		require.NoError(t, cl.Error())
+		_, err = submitOne(t, s, iosched.VCloseOp(vfd))
+		require.NoError(t, err)
 	}
 }
 
@@ -137,10 +137,10 @@ func TestURing_VCloseDrainsInflightWrites(t *testing.T) {
 		return b
 	}
 
-	open := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path,
+	_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path,
 		unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC, 0o600, vfd).
 		Link(iosched.VFallocateOp(vfd, int64(n*recLen))))
-	require.NoError(t, open.Error())
+	require.NoError(t, err)
 
 	// Fire N durable writes, then a close, without waiting between — the close
 	// races the writes' completion, and the drain must hold it behind them.
@@ -154,12 +154,12 @@ func TestURing_VCloseDrainsInflightWrites(t *testing.T) {
 	require.NoError(t, err)
 
 	for i, w := range writes {
-		w.Wait()
-		require.NoErrorf(t, w.Error(), "write %d", i)
-		require.Equal(t, recLen, w.N())
+		n, err := w.Wait()
+		require.NoErrorf(t, err, "write %d", i)
+		require.Equal(t, recLen, n)
 	}
-	closeTkt.Wait()
-	require.NoError(t, closeTkt.Error())
+	_, err = closeTkt.Wait()
+	require.NoError(t, err)
 
 	// Every record landed at its offset (read via a fresh fd, not the closed slot).
 	f, err := os.Open(path)
@@ -173,18 +173,10 @@ func TestURing_VCloseDrainsInflightWrites(t *testing.T) {
 	}
 }
 
-// drainKeepAlive holds files handed to CloseOp so their *os.File finalizer can't
-// double-close the descriptor dio already closed. A real caller keeps the file
-// referenced for the same reason; letting it finalize after handing off the fd is
-// the use-after-close dio does not guard against.
-var drainKeepAlive []*os.File
-
-// TestURing_CloseDrainsInflightWrites_Regular is the drain over a regular file
-// (no vfiles): durable writes fired with a CloseOp right behind them, no waits.
-// The close is held until the writes drain, so all land and are durable, and
-// dio's close leaves the file readable via a fresh fd. This is the same drain
-// code as the virtual case — only the key differs (VFiles+fd vs slot index).
-func TestURing_CloseDrainsInflightWrites_Regular(t *testing.T) {
+// TestURing_DrainWaitsForInflightWrites_Regular submits durable writes followed
+// immediately by DrainOp. Drain waits through their synthesized fdatasyncs but
+// leaves the os.File open and caller-owned.
+func TestURing_DrainWaitsForInflightWrites_Regular(t *testing.T) {
 	s := newURingSched(t)
 	const n = 64
 	const recLen = 64
@@ -192,7 +184,6 @@ func TestURing_CloseDrainsInflightWrites_Regular(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "drain-*.dat")
 	require.NoError(t, err)
 	path := f.Name()
-	drainKeepAlive = append(drainKeepAlive, f) // dio owns the close; keep f from finalizing
 
 	rec := func(i int) []byte {
 		b := make([]byte, recLen)
@@ -207,18 +198,24 @@ func TestURing_CloseDrainsInflightWrites_Regular(t *testing.T) {
 		writes[i], err = s.Submit(iosched.WriteOp(f, rec(i), int64(i)*recLen).Durable())
 		require.NoError(t, err)
 	}
-	closeTkt, err := s.Submit(iosched.CloseOp(f))
+	drainTkt, err := s.Submit(iosched.DrainOp(f))
 	require.NoError(t, err)
 
 	for i, w := range writes {
-		w.Wait()
-		require.NoErrorf(t, w.Error(), "write %d", i)
-		require.Equal(t, recLen, w.N())
+		n, err := w.Wait()
+		require.NoErrorf(t, err, "write %d", i)
+		require.Equal(t, recLen, n)
 	}
-	closeTkt.Wait()
-	require.NoError(t, closeTkt.Error())
+	_, err = drainTkt.Wait()
+	require.NoError(t, err)
 
-	// Read back via a fresh fd; dio has closed the original.
+	// Drain does not close f. The caller can still inspect it and then performs
+	// the one real close through os.File, clearing its finalizer safely.
+	_, err = f.Stat()
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Read back via a fresh fd after the caller-owned close.
 	rf, err := os.Open(path)
 	require.NoError(t, err)
 	defer rf.Close()
@@ -245,9 +242,9 @@ func TestURing_VSlot1_Recycle(t *testing.T) {
 		path := filepath.Join(dir, fmt.Sprintf("gen-%d.dat", i))
 		want := fmt.Appendf(nil, "payload-for-generation-%d", i)
 
-		open := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path,
+		_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path,
 			unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC, 0o600, vfd))
-		require.NoErrorf(t, open.Error(), "iter %d: open", i)
+		require.NoErrorf(t, err, "iter %d: open", i)
 
 		// Durable write and close fired with no wait between: the close is held
 		// until the write drains.
@@ -255,21 +252,21 @@ func TestURing_VSlot1_Recycle(t *testing.T) {
 		require.NoError(t, err)
 		cl, err := s.Submit(iosched.VCloseOp(vfd))
 		require.NoError(t, err)
-		w.Wait()
-		require.NoErrorf(t, w.Error(), "iter %d: write", i)
-		cl.Wait()
-		require.NoErrorf(t, cl.Error(), "iter %d: close", i)
+		_, err = w.Wait()
+		require.NoErrorf(t, err, "iter %d: write", i)
+		_, err = cl.Wait()
+		require.NoErrorf(t, err, "iter %d: close", i)
 
 		// Recycle the slot: reopen and read the data back.
-		reopen := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_RDWR, 0o600, vfd))
-		require.NoErrorf(t, reopen.Error(), "iter %d: reopen", i)
+		_, err = submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_RDWR, 0o600, vfd))
+		require.NoErrorf(t, err, "iter %d: reopen", i)
 
 		got := make([]byte, len(want))
-		rd := submitOne(t, s, iosched.VReadOp(vfd, got, 0))
-		require.NoErrorf(t, rd.Error(), "iter %d: read", i)
+		_, err = submitOne(t, s, iosched.VReadOp(vfd, got, 0))
+		require.NoErrorf(t, err, "iter %d: read", i)
 		require.Equalf(t, want, got, "iter %d: data", i)
 
-		cl2 := submitOne(t, s, iosched.VCloseOp(vfd))
-		require.NoErrorf(t, cl2.Error(), "iter %d: close2", i)
+		_, err = submitOne(t, s, iosched.VCloseOp(vfd))
+		require.NoErrorf(t, err, "iter %d: close2", i)
 	}
 }

@@ -584,11 +584,10 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iov
 	// it belongs on virtual read/write/fsync/fallocate — ops that name their file
 	// through the fd field.
 	//
-	// openat and close instead reach the table through the separate file_index
-	// field (the *Direct helpers set it via setTargetFixedFile), not the fd
-	// field, so they must NOT set IOSQE_FIXED_FILE — for close,
-	// io_uring_prep_close_direct(3) mandates this explicitly. Each clears it in
-	// its case below.
+	// Virtual open and close instead reach the table through the separate
+	// file_index field (the *Direct helpers set it via setTargetFixedFile), not
+	// the fd field, so they must NOT set IOSQE_FIXED_FILE. Regular DrainOp is a
+	// NOP and likewise names no file in its SQE. Those cases clear the flag below.
 	var sqeFlags uint32
 	fd := op.dfd
 	if op.kind() != OpOpenat {
@@ -643,15 +642,15 @@ func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iov
 			sqe.PrepareOpenat(op.dfd, op.path, op.openFlag, op.mode)
 		}
 	case OpClose:
-		// Closes direct descriptor fd. Per io_uring_prep_close_direct(3) the
-		// application must not set IOSQE_FIXED_FILE even though it targets a
-		// direct descriptor: the slot rides in file_index (set by
-		// PrepareCloseDirect), not the fd field.
+		// Virtual close removes the registered file from its slot. A regular
+		// DrainOp uses a NOP: the coordinator has already held it behind every
+		// previously accepted operation on f, and os.File ownership stays with
+		// the caller.
 		sqeFlags &^= uint32(giouring.SqeFixedFile)
 		if op.isVirtual() {
 			sqe.PrepareCloseDirect(uint32(fd))
 		} else {
-			sqe.PrepareClose(fd)
+			sqe.PrepareNop()
 		}
 	default:
 		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))

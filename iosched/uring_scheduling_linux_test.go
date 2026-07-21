@@ -188,9 +188,9 @@ func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
 	ring.complete(ring.sqes[0].UserData, -int32(syscall.ECANCELED))
 	c.reap()
 
-	tickets[0].Wait()
-	if !errors.Is(tickets[0].Error(), errSchedulerClosed) {
-		t.Fatalf("ticket error: got %v want %v", tickets[0].Error(), errSchedulerClosed)
+	_, err := tickets[0].Wait()
+	if !errors.Is(err, errSchedulerClosed) {
+		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
 }
 
@@ -222,9 +222,9 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	c.failRemaining(staged, cause)
 	c.releaseAllSlots()
 
-	ticket.Wait()
-	if !errors.Is(ticket.Error(), errSchedulerClosed) {
-		t.Fatalf("ticket error: got %v want %v", ticket.Error(), errSchedulerClosed)
+	_, err := ticket.Wait()
+	if !errors.Is(err, errSchedulerClosed) {
+		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
 	if len(ring.sqes) != 0 || ring.submitCalls != 0 {
 		t.Fatalf("shutdown placed work: sqes=%d submit calls=%d", len(ring.sqes), ring.submitCalls)
@@ -318,13 +318,13 @@ func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 
 	completeForTest(&c, handles[0], 0, 1, nil)
 	c.failRemaining(nil, err)
-	ticket.Wait()
+	n, gotErr := ticket.Wait()
 
-	if ticket.N() != 1 {
-		t.Fatalf("completed root count changed: %d", ticket.N())
+	if n != 1 {
+		t.Fatalf("completed root count changed: %d", n)
 	}
-	if !errors.Is(ticket.Error(), err) {
-		t.Fatalf("ticket error: got %v want %v", ticket.Error(), err)
+	if !errors.Is(gotErr, err) {
+		t.Fatalf("ticket error: got %v want %v", gotErr, err)
 	}
 }
 
@@ -343,14 +343,13 @@ func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
 	c.failRemaining(nil, ringErr)
 	c.releaseAllSlots()
 
-	for _, ticket := range tickets {
-		ticket.Wait()
+	n, err := tickets[0].Wait()
+	if n != 1 || err != nil {
+		t.Fatalf("consumed request: N=%d error=%v", n, err)
 	}
-	if tickets[0].N() != 1 || tickets[0].Error() != nil {
-		t.Fatalf("consumed request: N=%d error=%v", tickets[0].N(), tickets[0].Error())
-	}
-	if !errors.Is(tickets[1].Error(), ringErr) {
-		t.Fatalf("remaining request error: got %v want %v", tickets[1].Error(), ringErr)
+	_, err = tickets[1].Wait()
+	if !errors.Is(err, ringErr) {
+		t.Fatalf("remaining request error: got %v want %v", err, ringErr)
 	}
 	if c.pending.Len() != 0 || c.slots.Len() != 0 {
 		t.Fatalf("coordinator retained failed work: pending=%d slots=%d", c.pending.Len(), c.slots.Len())
@@ -415,8 +414,8 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	lateRoot := VReadOp(0, make([]byte, 1), 3)
 	lateRequest, late := newSubmission(lateRoot, int32(lateRoot.opCount()))
 	c.accept(lateRequest)
-	late.Wait()
-	if late.Error() == nil {
+	_, err := late.Wait()
+	if err == nil {
 		t.Fatal("work submitted behind a close at the end of a chain was accepted")
 	}
 
@@ -439,8 +438,8 @@ func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
 	if len(handles) != 1 {
 		t.Fatalf("accepted work: got %d want 1", len(handles))
 	}
-	tickets[1].Wait()
-	if tickets[1].Error() == nil {
+	_, err := tickets[1].Wait()
+	if err == nil {
 		t.Fatal("work submitted behind close was accepted")
 	}
 	completeForTest(&c, handles[0], 0, 0, nil)
@@ -509,8 +508,8 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	retryRoot := VOpenatOp(0, "b", 0, 0, 0)
 	retryRequest, retry := newSubmission(retryRoot, int32(retryRoot.opCount()))
 	c.accept(retryRequest)
-	retry.Wait()
-	if retry.Error() == nil {
+	_, err := retry.Wait()
+	if err == nil {
 		t.Fatal("retry open was accepted while prior slot work remained")
 	}
 
@@ -523,9 +522,9 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	}
 	handle, _ := c.pending.Front()
 	completeForTest(&c, handle, 0, 0, nil)
-	final.Wait()
-	if final.Error() != nil {
-		t.Fatalf("final open failed: %v", final.Error())
+	_, err = final.Wait()
+	if err != nil {
+		t.Fatalf("final open failed: %v", err)
 	}
 }
 
@@ -549,9 +548,9 @@ func TestWriteGroupPreservesCountsOnSyncError(t *testing.T) {
 	c.finishWrite(handles[0], 8, nil, syncErr)
 
 	for _, ticket := range tickets {
-		ticket.Wait()
-		if ticket.N() != 4 || !errors.Is(ticket.Error(), syncErr) {
-			t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", ticket.N(), ticket.Error(), syncErr)
+		n, err := ticket.Wait()
+		if n != 4 || !errors.Is(err, syncErr) {
+			t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", n, err, syncErr)
 		}
 	}
 }
@@ -572,9 +571,9 @@ func TestDurableWritePreservesCountsOnRingFailureAfterWrite(t *testing.T) {
 	c.releaseAllSlots()
 
 	ticket := tickets[0]
-	ticket.Wait()
-	if ticket.N() != 4 || !errors.Is(ticket.Error(), ringErr) {
-		t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", ticket.N(), ticket.Error(), ringErr)
+	n, err := ticket.Wait()
+	if n != 4 || !errors.Is(err, ringErr) {
+		t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", n, err, ringErr)
 	}
 }
 

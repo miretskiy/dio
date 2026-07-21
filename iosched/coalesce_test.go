@@ -126,9 +126,9 @@ func TestWriteCompletionSnapshotSurvivesLeaderRemoval(t *testing.T) {
 	ring.complete(ring.sqes[0].UserData, int32(len(ops)*4))
 	c.reap()
 	for _, ticket := range tickets {
-		ticket.Wait()
-		require.NoError(t, ticket.Error())
-		require.Equal(t, 4, ticket.N())
+		n, err := ticket.Wait()
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
 	}
 }
 
@@ -145,13 +145,12 @@ func TestCoalescedShortWriteCompletion(t *testing.T) {
 
 	ring.complete(ring.sqes[0].UserData, 6)
 	c.reap()
-	for _, ticket := range tickets {
-		ticket.Wait()
-	}
-	require.NoError(t, tickets[0].Error())
-	require.Equal(t, 4, tickets[0].N())
-	require.ErrorIs(t, tickets[1].Error(), io.ErrShortWrite)
-	require.Equal(t, 2, tickets[1].N())
+	n, err := tickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	n, err = tickets[1].Wait()
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Equal(t, 2, n)
 }
 
 func TestSingleShortWriteCompletion(t *testing.T) {
@@ -164,9 +163,9 @@ func TestSingleShortWriteCompletion(t *testing.T) {
 
 	ring.complete(ring.sqes[0].UserData, 2)
 	c.reap()
-	tickets[0].Wait()
-	require.ErrorIs(t, tickets[0].Error(), io.ErrShortWrite)
-	require.Equal(t, 2, tickets[0].N())
+	n, err := tickets[0].Wait()
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Equal(t, 2, n)
 }
 
 func TestOpBytes(t *testing.T) {

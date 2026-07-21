@@ -20,10 +20,10 @@ type Scheduler interface {
 	// non-blocking handoff; POSIXScheduler executes the operation before returning.
 	// Neither provides application-level backpressure.
 	//
-	// After an accepted submission, call Ticket.Wait before Error or N.
-	// Waiting is optional when the caller does not need the result. A Submit error
-	// means the operation was not accepted and the returned Ticket is invalid;
-	// execution and asynchronous admission errors are reported by a valid Ticket.
+	// After an accepted submission, Ticket.Wait returns its result. Waiting is
+	// optional when the caller does not need the result. A Submit error means the
+	// operation was not accepted and the returned Ticket is invalid; execution and
+	// asynchronous admission errors are returned by a valid Ticket's Wait.
 	// Reads absorb EINTR and may complete with a short count. Writes are not
 	// retried; a short write reports io.ErrShortWrite together with its count.
 	//
@@ -37,15 +37,15 @@ type Scheduler interface {
 	//     on the same virtual slot until its entire linked chain completes. This is
 	//     an ordering barrier, not error propagation; use Link when followers must
 	//     be canceled if open fails.
-	//   - CloseOp and VCloseOp wait for previously accepted operations on their
+	//   - DrainOp and VCloseOp wait for previously accepted operations on their
 	//     file to complete. Earlier operations in the same linked chain are ordered
-	//     before close by the chain and are not part of that drain. A standalone
-	//     Durable write remains active through its synthesized fdatasync, so a
-	//     following close waits for the flush too.
-	//   - Operations later in the same linked chain are ordered after its close.
-	//     Separate work submitted for a file after its close has been accepted but
-	//     before that close completes is unsupported. Wait for the close-containing
-	//     Ticket before submitting more work for that virtual slot.
+	//     before the barrier by the chain and are not part of that drain. A
+	//     standalone Durable write remains active through its synthesized
+	//     fdatasync, so a following barrier waits for the flush too.
+	//   - Operations later in the same linked chain are ordered after a VCloseOp.
+	//     Separate work submitted for a file after its lifecycle barrier has been
+	//     accepted but before it completes is unsupported. Callers must stop using
+	//     a regular file before DrainOp and may close it after the Ticket completes.
 	//
 	// These rules use the coordinator's acceptance order. Submit calls racing from
 	// different goroutines do not establish an application-visible order.

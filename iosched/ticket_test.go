@@ -14,10 +14,11 @@ func TestTicketErrorReportsLinkedError(t *testing.T) {
 	root := Op{}.Link(Op{})
 	ticket := root.prepareSubmission()
 	recordResult(&root, root.linked, 0, err)
-	if got := ticket.Error(); got != err {
+	root.done.Done()
+	_, got := ticket.Wait()
+	if got != err {
 		t.Fatalf("ticket error: got %v want %v", got, err)
 	}
-	root.done.Done()
 }
 
 func TestOpLinkBuildsFlatChain(t *testing.T) {
@@ -99,9 +100,18 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 
 func TestDurableWriteInLinkedChainRejected(t *testing.T) {
 	f := new(os.File)
-	op := WriteOp(f, nil, 0).Durable().Link(CloseOp(f))
+	op := WriteOp(f, nil, 0).Durable().Link(DrainOp(f))
 	_, err := countAndValidateOps(&op, nil)
 	if err == nil || !strings.Contains(err.Error(), "Durable cannot be used in a linked chain") {
+		t.Fatalf("validation error: got %v", err)
+	}
+}
+
+func TestDrainMustEndLinkedChain(t *testing.T) {
+	f := new(os.File)
+	op := DrainOp(f).Link(ReadOp(f, nil, 0))
+	_, err := countAndValidateOps(&op, nil)
+	if err == nil || !strings.Contains(err.Error(), "DrainOp must be the final operation") {
 		t.Fatalf("validation error: got %v", err)
 	}
 }

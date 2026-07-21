@@ -41,9 +41,9 @@ func runOp(t *testing.T, s iosched.Scheduler, op iosched.Op) int {
 	t.Helper()
 	ticket, err := s.Submit(op)
 	require.NoError(t, err)
-	ticket.Wait()
-	require.NoError(t, ticket.Error())
-	return ticket.N()
+	n, err := ticket.Wait()
+	require.NoError(t, err)
+	return n
 }
 
 func TestVirtualOpenReplacesIdleSlot(t *testing.T) {
@@ -78,16 +78,44 @@ func TestDurableWrite(t *testing.T) {
 
 		ticket, err := s.Submit(iosched.WriteOp(f, want, 0).Durable())
 		require.NoError(t, err)
-		ticket.Wait()
-		require.NoError(t, ticket.Error())
-		require.Equal(t, len(want), ticket.N())
+		n, err := ticket.Wait()
+		require.NoError(t, err)
+		require.Equal(t, len(want), n)
 
 		got := make([]byte, len(want))
 		read, err := s.Submit(iosched.ReadOp(f, got, 0))
 		require.NoError(t, err)
-		read.Wait()
-		require.NoError(t, read.Error())
+		_, err = read.Wait()
+		require.NoError(t, err)
 		require.Equal(t, want, got)
+	})
+}
+
+func TestDrainWaitsAndLeavesRegularFileOpen(t *testing.T) {
+	forEachScheduler(t, func(t *testing.T, s iosched.Scheduler) {
+		f, err := os.CreateTemp(t.TempDir(), "drain-*.dat")
+		require.NoError(t, err)
+
+		const writes = 16
+		payload := make([]byte, 4096)
+		tickets := make([]iosched.Ticket, writes)
+		for i := range tickets {
+			tickets[i], err = s.Submit(iosched.WriteOp(f, payload, int64(i*len(payload))).Durable())
+			require.NoError(t, err)
+		}
+		drain, err := s.Submit(iosched.DrainOp(f))
+		require.NoError(t, err)
+		_, err = drain.Wait()
+		require.NoError(t, err)
+
+		for _, ticket := range tickets {
+			n, err := ticket.Wait()
+			require.NoError(t, err)
+			require.Equal(t, len(payload), n)
+		}
+		_, err = f.Stat()
+		require.NoError(t, err, "DrainOp closed the caller-owned os.File")
+		require.NoError(t, f.Close())
 	})
 }
 
@@ -126,7 +154,7 @@ func testSchedulerCloseCompletesPending(t *testing.T, s iosched.Scheduler) {
 	}
 
 	for _, tk := range tickets {
-		if err := tk.Error(); err != nil {
+		if _, err := tk.Wait(); err != nil {
 			require.ErrorContains(t, err, "closed") // completed, or the close error
 		}
 	}

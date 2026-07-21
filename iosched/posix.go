@@ -159,7 +159,10 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 	case OpFallocate:
 		err = sys.Fallocate(f, op.length)
 	case OpClose:
-		err = f.Close()
+		// Regular-file close ownership stays with the caller. POSIX Submit is
+		// synchronous, so reaching this operation has already drained earlier
+		// submissions and linked predecessors.
+		err = nil
 	case OpReadv:
 		n, err = vectoredPOSIX(syscall.Pread, int(f.Fd()), op.bufs, op.offset)
 	case OpWritev:
@@ -167,8 +170,8 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 		err = writeResultError(op, n, err)
 		err = posixDurable(op, f, err)
 	case OpOpenat:
-		// Plain openat: open the path and return the raw fd through Ticket.N; the
-		// caller owns it. (The virtual/direct form is handled in runVirtualOp.)
+		// Plain openat: open the path and return the raw fd through Ticket.Wait;
+		// the caller owns it. (The virtual/direct form is handled in runVirtualOp.)
 		name := string(op.path[:len(op.path)-1])
 		fd, err := unix.Openat(op.dfd, name, op.openFlag, op.mode)
 		if err != nil {
