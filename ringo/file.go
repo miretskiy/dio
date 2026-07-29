@@ -5,7 +5,6 @@ package ringo
 import (
 	"errors"
 	"math"
-	"os"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -327,83 +326,34 @@ func (op *writevOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-// Read constructs a positioned read from file into buffer.
+// Read constructs a positioned read from fd into buffer.
 // liburing: io_uring_prep_read - https://man7.org/linux/man-pages/man3/io_uring_prep_read.3.html
-func Read(file *os.File, buffer []byte, offset int64) Op {
-	return newReadOp(FileFD(file), buffer, offset, FixedBuffer{}, false)
-}
-
-// ReadDirect constructs a positioned read from a registered-file slot.
-// liburing: io_uring_prep_read - https://man7.org/linux/man-pages/man3/io_uring_prep_read.3.html
-func ReadDirect(file FixedFile, buffer []byte, offset int64) Op {
-	return newReadOp(FixedFD(file), buffer, offset, FixedBuffer{}, false)
-}
-
-// ReadFixed constructs a positioned read into a fixed buffer.
-// liburing: io_uring_prep_read_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_read_fixed.3.html
-func ReadFixed(file *os.File, buffer FixedBuffer, offset int64) Op {
-	return newReadOp(FileFD(file), buffer.data, offset, buffer, true)
-}
-
-// ReadFixedDirect constructs a positioned read using both a registered-file
-// slot and a fixed buffer.
-// liburing: io_uring_prep_read_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_read_fixed.3.html
-func ReadFixedDirect(file FixedFile, buffer FixedBuffer, offset int64) Op {
-	return newReadOp(FixedFD(file), buffer.data, offset, buffer, true)
-}
-
-// ReadFD is the descriptor-generic form of Read.
-// liburing: io_uring_prep_read - https://man7.org/linux/man-pages/man3/io_uring_prep_read.3.html
-func ReadFD(fd FD, buffer []byte, offset int64) Op {
+func Read(fd FD, buffer []byte, offset int64) Op {
 	return newReadOp(fd, buffer, offset, FixedBuffer{}, false)
 }
 
-// Write constructs a positioned write from buffer to file.
+// ReadFixed constructs a positioned read from fd into a registered buffer.
+// liburing: io_uring_prep_read_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_read_fixed.3.html
+func ReadFixed(fd FD, buffer FixedBuffer, offset int64) Op {
+	return newReadOp(fd, buffer.data, offset, buffer, true)
+}
+
+// Write constructs a positioned write from buffer to fd.
 // liburing: io_uring_prep_write - https://man7.org/linux/man-pages/man3/io_uring_prep_write.3.html
-func Write(file *os.File, buffer []byte, offset int64) Op {
-	return newWriteOp(FileFD(file), buffer, offset, FixedBuffer{}, false)
-}
-
-// WriteDirect constructs a positioned write to a registered-file slot.
-// liburing: io_uring_prep_write - https://man7.org/linux/man-pages/man3/io_uring_prep_write.3.html
-func WriteDirect(file FixedFile, buffer []byte, offset int64) Op {
-	return newWriteOp(FixedFD(file), buffer, offset, FixedBuffer{}, false)
-}
-
-// WriteFixed constructs a positioned write from a fixed buffer.
-// liburing: io_uring_prep_write_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_write_fixed.3.html
-func WriteFixed(file *os.File, buffer FixedBuffer, offset int64) Op {
-	return newWriteOp(FileFD(file), buffer.data, offset, buffer, true)
-}
-
-// WriteFixedDirect constructs a positioned write using a registered-file slot
-// and fixed buffer.
-// liburing: io_uring_prep_write_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_write_fixed.3.html
-func WriteFixedDirect(file FixedFile, buffer FixedBuffer, offset int64) Op {
-	return newWriteOp(FixedFD(file), buffer.data, offset, buffer, true)
-}
-
-// WriteFD is the descriptor-generic form of Write.
-// liburing: io_uring_prep_write - https://man7.org/linux/man-pages/man3/io_uring_prep_write.3.html
-func WriteFD(fd FD, buffer []byte, offset int64) Op {
+func Write(fd FD, buffer []byte, offset int64) Op {
 	return newWriteOp(fd, buffer, offset, FixedBuffer{}, false)
 }
 
-// Readv constructs a vectored positioned read from file.
-// liburing: io_uring_prep_readv - https://man7.org/linux/man-pages/man3/io_uring_prep_readv.3.html
-func Readv(file *os.File, buffers [][]byte, offset int64) Op {
-	return newReadvOp(FileFD(file), buffers, offset, 0, FixedBuffer{}, false)
+// WriteFixed constructs a positioned write from a registered buffer to fd.
+// liburing: io_uring_prep_write_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_write_fixed.3.html
+func WriteFixed(fd FD, buffer FixedBuffer, offset int64) Op {
+	return newWriteOp(fd, buffer.data, offset, buffer, true)
 }
 
-// ReadvDirect constructs a vectored read from a registered-file slot.
-// liburing: io_uring_prep_readv - https://man7.org/linux/man-pages/man3/io_uring_prep_readv.3.html
-func ReadvDirect(file FixedFile, buffers [][]byte, offset int64) Op {
-	return newReadvOp(FixedFD(file), buffers, offset, 0, FixedBuffer{}, false)
-}
-
-// ReadvFD is the descriptor-generic form of Readv.
+// Readv constructs a vectored positioned read from fd. flags carries RWF_*
+// preadv2 flags, or zero for none.
 // liburing: io_uring_prep_readv2 - https://man7.org/linux/man-pages/man3/io_uring_prep_readv2.3.html
-func ReadvFD(fd FD, buffers [][]byte, offset int64, flags int) Op {
+func Readv(fd FD, buffers [][]byte, offset int64, flags int) Op {
 	return newReadvOp(fd, buffers, offset, flags, FixedBuffer{}, false)
 }
 
@@ -420,22 +370,11 @@ func ReadvFixed(
 	return newReadvOp(fd, buffers, offset, flags, registered, true)
 }
 
-// Writev constructs one vectored positioned write containing exactly buffers.
-// It does not discover or merge adjacent operations.
-// liburing: io_uring_prep_writev - https://man7.org/linux/man-pages/man3/io_uring_prep_writev.3.html
-func Writev(file *os.File, buffers [][]byte, offset int64) Op {
-	return newWritevOp(FileFD(file), buffers, offset, 0, FixedBuffer{}, false)
-}
-
-// WritevDirect constructs a vectored write to a registered-file slot.
-// liburing: io_uring_prep_writev - https://man7.org/linux/man-pages/man3/io_uring_prep_writev.3.html
-func WritevDirect(file FixedFile, buffers [][]byte, offset int64) Op {
-	return newWritevOp(FixedFD(file), buffers, offset, 0, FixedBuffer{}, false)
-}
-
-// WritevFD is the descriptor-generic form of Writev.
+// Writev constructs one vectored positioned write to fd containing exactly
+// buffers. flags carries RWF_* pwritev2 flags, or zero for none. It does not
+// discover or merge adjacent operations.
 // liburing: io_uring_prep_writev2 - https://man7.org/linux/man-pages/man3/io_uring_prep_writev2.3.html
-func WritevFD(fd FD, buffers [][]byte, offset int64, flags int) Op {
+func Writev(fd FD, buffers [][]byte, offset int64, flags int) Op {
 	return newWritevOp(fd, buffers, offset, flags, FixedBuffer{}, false)
 }
 
@@ -476,34 +415,18 @@ func (op *fsyncOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-// FsyncFD constructs IORING_OP_FSYNC with raw fsync flags.
+// Fsync constructs IORING_OP_FSYNC for fd.
 // liburing: io_uring_prep_fsync - https://man7.org/linux/man-pages/man3/io_uring_prep_fsync.3.html
-func FsyncFD(fd FD, flags uint32) Op { return &fsyncOp{fd: fd, flags: flags} }
+func Fsync(fd FD) Op { return &fsyncOp{fd: fd} }
 
-// Fsync constructs IORING_OP_FSYNC.
+// Fdatasync constructs IORING_OP_FSYNC with IORING_FSYNC_DATASYNC for fd.
 // liburing: io_uring_prep_fsync - https://man7.org/linux/man-pages/man3/io_uring_prep_fsync.3.html
-func Fsync(file *os.File) Op { return FsyncFD(FileFD(file), 0) }
-
-// FsyncDirect syncs a registered-file slot.
-// liburing: io_uring_prep_fsync - https://man7.org/linux/man-pages/man3/io_uring_prep_fsync.3.html
-func FsyncDirect(file FixedFile) Op { return FsyncFD(FixedFD(file), 0) }
-
-// Fdatasync constructs IORING_OP_FSYNC with IORING_FSYNC_DATASYNC.
-// liburing: io_uring_prep_fsync - https://man7.org/linux/man-pages/man3/io_uring_prep_fsync.3.html
-func Fdatasync(file *os.File) Op {
-	return FsyncFD(FileFD(file), rawFsyncDatasync)
-}
-
-// FdatasyncDirect syncs data for a registered-file slot.
-// liburing: io_uring_prep_fsync - https://man7.org/linux/man-pages/man3/io_uring_prep_fsync.3.html
-func FdatasyncDirect(file FixedFile) Op {
-	return FsyncFD(FixedFD(file), rawFsyncDatasync)
-}
+func Fdatasync(fd FD) Op { return &fsyncOp{fd: fd, flags: rawFsyncDatasync} }
 
 type fallocateOp struct {
 	opBase
 	fd             FD
-	mode           int
+	mode           FallocateFlags
 	offset, length uint64
 }
 
@@ -511,6 +434,9 @@ func (op *fallocateOp) opcode() rawOpcode { return rawOpFallocate }
 func (op *fallocateOp) validate(ring *Ring) error {
 	if err := op.opBase.validate(); err != nil {
 		return err
+	}
+	if op.mode&^allFallocateFlags != 0 {
+		return errors.New("ringo: invalid fallocate mode")
 	}
 	return op.fd.validate(ring)
 }
@@ -527,33 +453,26 @@ func (op *fallocateOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-// FallocateMode constructs IORING_OP_FALLOCATE with a Linux fallocate mode.
+// Fallocate allocates space in fd using mode 0. offset and length must be
+// nonnegative.
 // liburing: io_uring_prep_fallocate - https://man7.org/linux/man-pages/man3/io_uring_prep_fallocate.3.html
-func FallocateMode(fd FD, mode int, offset, length uint64) Op {
-	op := &fallocateOp{fd: fd, mode: mode, offset: offset, length: length}
-	if mode < 0 || !fitsInt32(mode) {
-		op.fail(errors.New("fallocate mode does not fit the kernel ABI"))
-	}
-	return op
-}
-
-// Fallocate allocates file space.
-// liburing: io_uring_prep_fallocate - https://man7.org/linux/man-pages/man3/io_uring_prep_fallocate.3.html
-func Fallocate(file *os.File, offset, length int64) Op {
-	op := &fallocateOp{
-		fd: FileFD(file), offset: uint64(offset), length: uint64(length),
-	}
+func Fallocate(fd FD, offset, length int64) Op {
+	op := &fallocateOp{fd: fd, offset: uint64(offset), length: uint64(length)}
 	if offset < 0 || length < 0 {
 		op.fail(errors.New("fallocate offset and length must be nonnegative"))
 	}
 	return op
 }
 
-// FallocateDirect allocates space in a registered file.
+// FallocateMode constructs IORING_OP_FALLOCATE with an explicit fallocate
+// mode. offset and length must be nonnegative.
 // liburing: io_uring_prep_fallocate - https://man7.org/linux/man-pages/man3/io_uring_prep_fallocate.3.html
-func FallocateDirect(file FixedFile, offset, length int64) Op {
+func FallocateMode(fd FD, mode FallocateFlags, offset, length int64) Op {
 	op := &fallocateOp{
-		fd: FixedFD(file), offset: uint64(offset), length: uint64(length),
+		fd:     fd,
+		mode:   mode,
+		offset: uint64(offset),
+		length: uint64(length),
 	}
 	if offset < 0 || length < 0 {
 		op.fail(errors.New("fallocate offset and length must be nonnegative"))
@@ -630,22 +549,11 @@ func (op *openAtOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-// Open is OpenAt relative to the current working directory.
-// liburing: io_uring_prep_openat - https://man7.org/linux/man-pages/man3/io_uring_prep_openat.3.html
-func Open(path string, flags int, mode uint32) Op {
-	return OpenAt(BorrowedFD(unix.AT_FDCWD), path, flags, mode)
-}
-
-// OpenAt constructs IORING_OP_OPENAT relative to dir and copies path.
+// OpenAt constructs IORING_OP_OPENAT relative to dir and copies path. Use
+// AtCWD as dir to open relative to the current working directory.
 // liburing: io_uring_prep_openat - https://man7.org/linux/man-pages/man3/io_uring_prep_openat.3.html
 func OpenAt(dir FD, path string, flags int, mode uint32) Op {
 	return newOpenAtOp(dir, path, flags, mode, nil)
-}
-
-// OpenDirect is OpenAtDirect relative to the current working directory.
-// liburing: io_uring_prep_openat_direct - https://man7.org/linux/man-pages/man3/io_uring_prep_openat_direct.3.html
-func OpenDirect(path string, flags int, mode uint32, file FixedFile) Op {
-	return OpenAtDirect(BorrowedFD(unix.AT_FDCWD), path, flags, mode, file)
 }
 
 // OpenAtDirect opens relative to dir and installs the result in file. New
@@ -763,19 +671,9 @@ func (op *statxOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-// Statx is StatxAt relative to the current working directory.
-// liburing: io_uring_prep_statx - https://man7.org/linux/man-pages/man3/io_uring_prep_statx.3.html
-func Statx(
-	path string,
-	flags int,
-	mask uint32,
-	result *unix.Statx_t,
-) Op {
-	return StatxAt(BorrowedFD(unix.AT_FDCWD), path, flags, mask, result)
-}
-
 // StatxAt constructs IORING_OP_STATX relative to dir and retains result until
-// final completion. An empty path is accepted only with AT_EMPTY_PATH.
+// final completion. Use AtCWD as dir to resolve relative to the current
+// working directory. An empty path is accepted only with AT_EMPTY_PATH.
 // liburing: io_uring_prep_statx - https://man7.org/linux/man-pages/man3/io_uring_prep_statx.3.html
 func StatxAt(
 	dir FD,
@@ -791,6 +689,40 @@ func StatxAt(
 	op.fail(err)
 	if !fitsInt32(flags) {
 		op.fail(errors.New("statx flags do not fit the kernel ABI"))
+	}
+	return op
+}
+
+type ftruncateOp struct {
+	opBase
+	fd     FD
+	length int64
+}
+
+func (op *ftruncateOp) opcode() rawOpcode { return rawOpFtruncate }
+func (op *ftruncateOp) validate(ring *Ring) error {
+	if err := op.opBase.validate(); err != nil {
+		return err
+	}
+	return op.fd.validate(ring)
+}
+func (op *ftruncateOp) prepare(sqe *rawSQE) {
+	fd, flags := op.fd.sqe()
+	*sqe = rawSQE{
+		Opcode: uint8(rawOpFtruncate),
+		Flags:  uint8(flags),
+		Fd:     fd,
+		Off:    uint64(op.length),
+	}
+	sqe.Flags |= uint8(op.sqeFlags)
+}
+
+// Ftruncate constructs IORING_OP_FTRUNCATE.
+// liburing: io_uring_prep_ftruncate - https://man7.org/linux/man-pages/man3/io_uring_prep_ftruncate.3.html
+func Ftruncate(fd FD, length int64) Op {
+	op := &ftruncateOp{fd: fd, length: length}
+	if length < 0 {
+		op.fail(errors.New("ftruncate length must be nonnegative"))
 	}
 	return op
 }
@@ -816,3 +748,27 @@ func (op *closeDirectOp) prepare(sqe *rawSQE) {
 // CloseDirect removes and closes the file in a registered-file slot.
 // liburing: io_uring_prep_close_direct - https://man7.org/linux/man-pages/man3/io_uring_prep_close_direct.3.html
 func CloseDirect(file FixedFile) Op { return &closeDirectOp{file: file} }
+
+type closeFDOp struct {
+	opBase
+	fd int
+}
+
+func (op *closeFDOp) opcode() rawOpcode { return rawOpClose }
+func (op *closeFDOp) validate(*Ring) error {
+	if err := op.opBase.validate(); err != nil {
+		return err
+	}
+	if !fitsInt32(op.fd) {
+		return errors.New("ringo: descriptor does not fit the kernel ABI")
+	}
+	return nil
+}
+func (op *closeFDOp) prepare(sqe *rawSQE) {
+	*sqe = rawSQE{Opcode: uint8(rawOpClose), Fd: int32(op.fd)}
+	sqe.Flags |= uint8(op.sqeFlags)
+}
+
+// CloseFD asynchronously closes a borrowed process descriptor.
+// liburing: io_uring_prep_close - https://man7.org/linux/man-pages/man3/io_uring_prep_close.3.html
+func CloseFD(fd int) Op { return &closeFDOp{fd: fd} }

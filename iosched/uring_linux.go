@@ -643,8 +643,10 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 
 func (c *coordinator) translateOp(op *Op) ringo.Op {
 	var direct ringo.FixedFile
+	fd := ringo.FileFD(op.f)
 	if op.isVirtual() {
 		direct = c.sched.fixedFiles[op.vfd]
+		fd = ringo.FixedFD(direct)
 	}
 
 	switch op.kind() {
@@ -654,55 +656,28 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 			if err != nil {
 				panic(fmt.Sprintf("iosched: validated fixed buffer became invalid: %v", err))
 			}
-			if op.isVirtual() {
-				return ringo.ReadFixedDirect(direct, buffer, op.offset)
-			}
-			return ringo.ReadFixed(op.f, buffer, op.offset)
+			return ringo.ReadFixed(fd, buffer, op.offset)
 		}
-		if op.isVirtual() {
-			return ringo.ReadDirect(direct, op.buf, op.offset)
-		}
-		return ringo.Read(op.f, op.buf, op.offset)
+		return ringo.Read(fd, op.buf, op.offset)
 	case OpWrite:
 		if op.isFixed() {
 			buffer, err := c.sched.registeredBuffers.Bind(op.buf)
 			if err != nil {
 				panic(fmt.Sprintf("iosched: validated fixed buffer became invalid: %v", err))
 			}
-			if op.isVirtual() {
-				return ringo.WriteFixedDirect(direct, buffer, op.offset)
-			}
-			return ringo.WriteFixed(op.f, buffer, op.offset)
+			return ringo.WriteFixed(fd, buffer, op.offset)
 		}
-		if op.isVirtual() {
-			return ringo.WriteDirect(direct, op.buf, op.offset)
-		}
-		return ringo.Write(op.f, op.buf, op.offset)
+		return ringo.Write(fd, op.buf, op.offset)
 	case OpReadv:
-		if op.isVirtual() {
-			return ringo.ReadvDirect(direct, op.bufs, op.offset)
-		}
-		return ringo.Readv(op.f, op.bufs, op.offset)
+		return ringo.Readv(fd, op.bufs, op.offset, 0)
 	case OpWritev:
-		if op.isVirtual() {
-			return ringo.WritevDirect(direct, op.bufs, op.offset)
-		}
-		return ringo.Writev(op.f, op.bufs, op.offset)
+		return ringo.Writev(fd, op.bufs, op.offset, 0)
 	case OpFsync:
-		if op.isVirtual() {
-			return ringo.FsyncDirect(direct)
-		}
-		return ringo.Fsync(op.f)
+		return ringo.Fsync(fd)
 	case OpFdatasync:
-		if op.isVirtual() {
-			return ringo.FdatasyncDirect(direct)
-		}
-		return ringo.Fdatasync(op.f)
+		return ringo.Fdatasync(fd)
 	case OpFallocate:
-		if op.isVirtual() {
-			return ringo.FallocateDirect(direct, op.offset, op.length)
-		}
-		return ringo.Fallocate(op.f, op.offset, op.length)
+		return ringo.Fallocate(fd, op.offset, op.length)
 	case OpOpenat:
 		path := string(op.path[:len(op.path)-1])
 		if op.isVirtual() {

@@ -31,7 +31,7 @@
 //	}
 //	defer ring.Close()
 //
-//	op := Read(file, buffer, 0)
+//	op := Read(FileFD(file), buffer, 0)
 //	handle, err := ring.Push(op)
 //	if err != nil {
 //		return err
@@ -201,15 +201,18 @@
 //
 // # File descriptors and registered resources
 //
-// FD makes descriptor ownership explicit:
+// FD makes descriptor lifetime explicit without transferring ownership. The
+// Ring never closes a descriptor it did not open:
 //
-//   - FileFD retains an *os.File through final completion.
+//   - FileFD retains an *os.File through final completion so it cannot be
+//     finalized mid-operation. The caller still owns and closes the file.
 //   - FixedFD names a typed slot in this Ring's fixed-file table.
 //   - BorrowedFD leaves descriptor lifetime entirely to the caller.
 //
 // Reachability prevents an os.File finalizer from closing a descriptor, but it
 // cannot prevent an explicit Close. CloseFD therefore accepts a borrowed
-// descriptor rather than an *os.File.
+// descriptor rather than an *os.File; closing a fixed-file slot uses
+// CloseDirect.
 //
 // FixedFiles and FixedBuffers are typed, Ring-owned resources. They are scoped
 // to one Ring and remain registered until Ring.Close.

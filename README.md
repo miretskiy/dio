@@ -231,7 +231,7 @@ if err != nil {
 }
 defer ring.Close()
 
-handle, err := ring.Push(ringo.Read(f, buf, offset))
+handle, err := ring.Push(ringo.Read(ringo.FileFD(f), buf, offset))
 if err != nil {
     return err
 }

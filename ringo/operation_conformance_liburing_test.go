@@ -62,14 +62,14 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 		},
 		{
 			name: "read",
-			op:   ReadFD(BorrowedFD(fd), buffer, 17),
+			op:   Read(BorrowedFD(fd), buffer, 17),
 			want: func(rawSQE) liburingoracle.SQE {
 				return liburingoracle.PrepareRead(fd, buffer, uint32(len(buffer)), 17)
 			},
 		},
 		{
 			name: "read-direct",
-			op:   ReadDirect(fixed, buffer, 17),
+			op:   Read(FixedFD(fixed), buffer, 17),
 			want: func(rawSQE) liburingoracle.SQE {
 				return withSQEFlags(
 					liburingoracle.PrepareRead(
@@ -104,7 +104,7 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 		},
 		{
 			name: "write",
-			op:   WriteFD(BorrowedFD(fd), buffer, 17),
+			op:   Write(BorrowedFD(fd), buffer, 17),
 			want: func(rawSQE) liburingoracle.SQE {
 				return liburingoracle.PrepareWrite(fd, buffer, uint32(len(buffer)), 17)
 			},
@@ -131,14 +131,14 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 		},
 		{
 			name: "fsync",
-			op:   FsyncFD(BorrowedFD(fd), rawFsyncDatasync),
+			op:   Fdatasync(BorrowedFD(fd)),
 			want: func(rawSQE) liburingoracle.SQE {
 				return liburingoracle.PrepareFsync(fd, rawFsyncDatasync)
 			},
 		},
 		{
 			name: "fallocate",
-			op:   FallocateMode(BorrowedFD(fd), 2, 17, 4096),
+			op:   FallocateMode(BorrowedFD(fd), FallocatePunchHole, 17, 4096),
 			want: func(rawSQE) liburingoracle.SQE {
 				return liburingoracle.PrepareFallocate(fd, 2, 17, 4096)
 			},

@@ -115,26 +115,17 @@ func (ring *rawRing) mapMemory(params *rawParams) error {
 	cqRingSize := uintptr(params.Cq_off.Cqes) +
 		uintptr(params.Cq_entries)*cqeSize
 
-	shared := rawFeatureFlags(params.Features)&rawFeatSingleMMap != 0
-	if shared && cqRingSize > sqRingSize {
-		sqRingSize = cqRingSize
-	}
-	sqMemory, err := mapRingMemory(ring.fd, rawSQRingOffset, sqRingSize)
+	// Every kernel new enough for IORING_SETUP_SUBMIT_ALL (5.18), which New
+	// requires, also provides IORING_FEAT_SINGLE_MMAP (5.4). The submission and
+	// completion rings therefore always share one mapping sized to the larger
+	// of the two.
+	ringSize := max(sqRingSize, cqRingSize)
+	sqMemory, err := mapRingMemory(ring.fd, rawSQRingOffset, ringSize)
 	if err != nil {
 		return err
 	}
 	ring.sq.ringMemory = sqMemory
-
-	if shared {
-		ring.cq.ringMemory = sqMemory
-	} else {
-		cqMemory, mapErr := mapRingMemory(ring.fd, rawCQRingOffset, cqRingSize)
-		if mapErr != nil {
-			ring.unmap()
-			return mapErr
-		}
-		ring.cq.ringMemory = cqMemory
-	}
+	ring.cq.ringMemory = sqMemory
 
 	sqeSize := unsafe.Sizeof(rawSQE{})
 	sqeMemory, err := mapRingMemory(
@@ -197,16 +188,13 @@ func (ring *rawRing) bindPointers(params *rawParams) {
 }
 
 func (ring *rawRing) unmap() {
-	sqRing := ring.sq.ringMemory
-	cqRing := ring.cq.ringMemory
+	// The submission and completion rings share one mapping (SINGLE_MMAP), so
+	// ring.cq.ringMemory aliases ring.sq.ringMemory and is not unmapped twice.
 	if ring.sq.sqeMemory != nil {
 		_ = unix.Munmap(ring.sq.sqeMemory)
 	}
-	if sqRing != nil {
-		_ = unix.Munmap(sqRing)
-	}
-	if cqRing != nil && unsafe.SliceData(cqRing) != unsafe.SliceData(sqRing) {
-		_ = unix.Munmap(cqRing)
+	if ring.sq.ringMemory != nil {
+		_ = unix.Munmap(ring.sq.ringMemory)
 	}
 	ring.sq = rawSubmissionQueue{}
 	ring.cq = rawCompletionQueue{}
@@ -215,10 +203,7 @@ func (ring *rawRing) unmap() {
 func (ring *rawRing) queueExit() error {
 	var err error
 	if ring.fd != -1 {
-		closeErr := syscall.Close(ring.fd)
-		if err == nil {
-			err = closeErr
-		}
+		err = syscall.Close(ring.fd)
 		ring.fd = -1
 	}
 	ring.unmap()

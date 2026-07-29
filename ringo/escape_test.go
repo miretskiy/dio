@@ -23,7 +23,7 @@ func growEscapeTestStack(depth int) byte {
 
 func sliceLiteralAddressIsStable() bool {
 	ring, fake := newFakeRing(1)
-	handle, err := ring.Push(ReadFD(BorrowedFD(1), []byte{1, 2, 3}, 0))
+	handle, err := ring.Push(Read(BorrowedFD(1), []byte{1, 2, 3}, 0))
 	if err != nil {
 		panic(err)
 	}
@@ -38,7 +38,7 @@ func sliceLiteralAddressIsStable() bool {
 func arraySliceAddressIsStable() bool {
 	var buffer [5]byte
 	ring, fake := newFakeRing(1)
-	handle, err := ring.Push(ReadFD(BorrowedFD(1), buffer[:], 0))
+	handle, err := ring.Push(Read(BorrowedFD(1), buffer[:], 0))
 	if err != nil {
 		panic(err)
 	}

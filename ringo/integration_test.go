@@ -75,9 +75,9 @@ func TestRingIntegrationReadWriteAndVectoredIO(t *testing.T) {
 	write := []byte("lifetime-safe")
 	read := make([]byte, len(write))
 	handles, err := ring.PushLinked(
-		Write(file, write, 0),
-		Then(LinkSoft, Fdatasync(file)),
-		Then(LinkSoft, Read(file, read, 0)),
+		Write(FileFD(file), write, 0),
+		Then(LinkSoft, Fdatasync(FileFD(file))),
+		Then(LinkSoft, Read(FileFD(file), read, 0)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -98,8 +98,8 @@ func TestRingIntegrationReadWriteAndVectoredIO(t *testing.T) {
 	vectorWrite := [][]byte{[]byte("vector-"), nil, []byte("io")}
 	vectorRead := [][]byte{make([]byte, 7), nil, make([]byte, 2)}
 	handles, err = ring.PushLinked(
-		Writev(file, vectorWrite, 128),
-		Then(LinkSoft, Readv(file, vectorRead, 128)),
+		Writev(FileFD(file), vectorWrite, 128, 0),
+		Then(LinkSoft, Readv(FileFD(file), vectorRead, 128, 0)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -142,10 +142,10 @@ func TestRingIntegrationDirectFileLifecycle(t *testing.T) {
 	}
 
 	handles, err := ring.PushLinked(
-		FallocateDirect(slot, 0, 4096),
-		Then(LinkHard, WriteDirect(slot, write, 0)),
-		Then(LinkHard, FdatasyncDirect(slot)),
-		Then(LinkHard, ReadDirect(slot, read, 0)),
+		Fallocate(FixedFD(slot), 0, 4096),
+		Then(LinkHard, Write(FixedFD(slot), write, 0)),
+		Then(LinkHard, Fdatasync(FixedFD(slot))),
+		Then(LinkHard, Read(FixedFD(slot), read, 0)),
 		Then(LinkHard, CloseDirect(slot)),
 	)
 	if err != nil {
@@ -176,8 +176,8 @@ func TestRingIntegrationLinkedDirectOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "linked-direct.dat")
 	data := []byte("open-and-write")
 	handles, err := ring.PushLinked(
-		OpenDirect(path, unix.O_CREAT|unix.O_RDWR, 0o600, slot),
-		Then(LinkSoft, WriteDirect(slot, data, 0)),
+		OpenAtDirect(AtCWD(), path, unix.O_CREAT|unix.O_RDWR, 0o600, slot),
+		Then(LinkSoft, Write(FixedFD(slot), data, 0)),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +257,7 @@ func TestRingIntegrationProbeEventFDAndRegisteredFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := []byte("registered-file")
-	write, err := ring.Push(WriteDirect(slot, data, 0))
+	write, err := ring.Push(Write(FixedFD(slot), data, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestRingIntegrationFixedFilesUpdate(t *testing.T) {
 		if updated, err := files.Update(0, test.file); err != nil || updated != 1 {
 			t.Fatalf("update fixed file: updated=%d err=%v", updated, err)
 		}
-		handle, err := ring.Push(WriteDirect(slot, test.data, 0))
+		handle, err := ring.Push(Write(FixedFD(slot), test.data, 0))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -348,7 +348,7 @@ func TestRingIntegrationMmapBackedFixedBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = file.Close() })
-	handle, err := ring.Push(WriteFixed(file, buffer, 0))
+	handle, err := ring.Push(WriteFixed(FileFD(file), buffer, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

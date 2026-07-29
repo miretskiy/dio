@@ -298,6 +298,12 @@ func (ring *Ring) Submit() (submitted int, err error) {
 
 // SubmitAndWait submits queued work and asks the kernel to wait until at least
 // minComplete completions are available. It does not reap them.
+//
+// minComplete must not exceed the number of operations currently in flight,
+// meaning pushed and not yet finally completed. Asking the kernel to wait for
+// more completions than can ever arrive blocks inside io_uring_enter until the
+// wait is otherwise satisfied: by those operations completing, by a queued
+// Timeout, by CancelAll, or by a signal. Passing 0 never waits.
 // liburing: io_uring_submit_and_wait - https://man7.org/linux/man-pages/man3/io_uring_submit_and_wait.3.html
 func (ring *Ring) SubmitAndWait(minComplete int) (submitted int, err error) {
 	if minComplete < 0 || uint64(minComplete) > math.MaxUint32 {

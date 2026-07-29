@@ -303,18 +303,18 @@ func TestSemanticFlagsRejectRawDiscriminatorBits(t *testing.T) {
 	); err == nil {
 		t.Fatal("PollUpdate accepted the kernel's private update-events bit")
 	}
-	if _, err := ring.Push(Fallocate(fakeFile(12340), -1, 1)); err == nil {
+	if _, err := ring.Push(Fallocate(FileFD(fakeFile(12340)), -1, 1)); err == nil {
 		t.Fatal("Fallocate accepted a negative offset")
 	}
 	if _, err := ring.Push(
-		FallocateMode(BorrowedFD(12340), -1, 0, 1),
+		FallocateMode(BorrowedFD(12340), FallocateFlags(1<<20), 0, 1),
 	); err == nil {
-		t.Fatal("FallocateMode accepted a negative mode")
+		t.Fatal("FallocateMode accepted unknown mode bits")
 	}
 	if _, err := ring.Push(
-		ReadvFD(BorrowedFD(12340), nil, 0, -1),
+		Readv(BorrowedFD(12340), nil, 0, -1),
 	); err == nil {
-		t.Fatal("ReadvFD accepted negative flags")
+		t.Fatal("Readv accepted negative flags")
 	}
 	if _, err := ring.Push(Ftruncate(BorrowedFD(12340), -1)); err == nil {
 		t.Fatal("Ftruncate accepted a negative length")
@@ -334,7 +334,7 @@ func TestVectorOperationsUseInlineMetadataForCommonSizes(t *testing.T) {
 func pushLocalBuffer(ring *Ring, file *os.File) (Handle, error) {
 	var buffer [32]byte
 	buffer[0] = 42
-	return ring.Push(Read(file, buffer[:], 17))
+	return ring.Push(Read(FileFD(file), buffer[:], 17))
 }
 
 func growStack(depth int) int {
@@ -371,7 +371,7 @@ func pushLocalVectors(ring *Ring, file *os.File) (Handle, error) {
 	var second [5]byte
 	first[0] = 1
 	second[0] = 2
-	return ring.Push(Writev(file, [][]byte{first[:], nil, second[:]}, 9))
+	return ring.Push(Writev(FileFD(file), [][]byte{first[:], nil, second[:]}, 9, 0))
 }
 
 func TestDrainMutatesInactiveOp(t *testing.T) {
@@ -474,7 +474,7 @@ func TestPushLinkedRejectsInvalidSequenceWithoutMutatingOperations(t *testing.T)
 func TestReadWriteOperationsReleaseAfterCompletionYield(t *testing.T) {
 	t.Run("read", func(t *testing.T) {
 		ring, fake := newFakeRing(1)
-		operation := ReadFD(BorrowedFD(12345), make([]byte, 32), 0)
+		operation := Read(BorrowedFD(12345), make([]byte, 32), 0)
 		state := operation.(*readOp)
 		handle, err := ring.Push(operation)
 		if err != nil {
@@ -494,7 +494,7 @@ func TestReadWriteOperationsReleaseAfterCompletionYield(t *testing.T) {
 
 	t.Run("write", func(t *testing.T) {
 		ring, fake := newFakeRing(1)
-		operation := WriteFD(BorrowedFD(12345), make([]byte, 32), 0)
+		operation := Write(BorrowedFD(12345), make([]byte, 32), 0)
 		state := operation.(*writeOp)
 		handle, err := ring.Push(operation)
 		if err != nil {
@@ -704,7 +704,7 @@ func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 		t.Fatal("registration did not use the retained backing buffer")
 	}
 
-	handle, err := ring.Push(ReadFixedDirect(file, buffer, 3))
+	handle, err := ring.Push(ReadFixed(FixedFD(file), buffer, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -718,10 +718,10 @@ func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 	}
 
 	other, _ := newFakeRing(1)
-	if _, err := other.Push(ReadDirect(file, make([]byte, 1), 0)); !errors.Is(err, ErrWrongRing) {
+	if _, err := other.Push(Read(FixedFD(file), make([]byte, 1), 0)); !errors.Is(err, ErrWrongRing) {
 		t.Fatalf("foreign fixed file: %v", err)
 	}
-	if _, err := other.Push(ReadFixed(fakeFile(12346), buffer, 0)); !errors.Is(err, ErrWrongRing) {
+	if _, err := other.Push(ReadFixed(FileFD(fakeFile(12346)), buffer, 0)); !errors.Is(err, ErrWrongRing) {
 		t.Fatalf("foreign registered buffer: %v", err)
 	}
 	if _, err := set.Bind(make([]byte, 1)); err == nil {
@@ -795,7 +795,7 @@ func TestCloseTearsDownKernelBeforeClearingReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ring.Push(Write(fakeFile(12345), make([]byte, 1), 0)); err != nil {
+	if _, err := ring.Push(Write(FileFD(fakeFile(12345)), make([]byte, 1), 0)); err != nil {
 		t.Fatal(err)
 	}
 	fake.closeFn = func() {
@@ -858,7 +858,7 @@ func BenchmarkReadPushSubmitReap(b *testing.B) {
 	fd := BorrowedFD(12345)
 	b.ReportAllocs()
 	for b.Loop() {
-		handle, err := ring.Push(ReadFD(fd, buffer, 0))
+		handle, err := ring.Push(Read(fd, buffer, 0))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -891,7 +891,7 @@ func BenchmarkConstructOperation(b *testing.B) {
 		buffer := make([]byte, 4096)
 		fd := BorrowedFD(12345)
 		for b.Loop() {
-			benchmarkOperation = ReadFD(fd, buffer, 0)
+			benchmarkOperation = Read(fd, buffer, 0)
 		}
 	})
 }

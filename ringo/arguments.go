@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 type descriptorKind uint8
@@ -19,9 +21,18 @@ const (
 	descriptorBorrowed
 )
 
-// FD identifies a descriptor argument to an operation. FileFD retains an
-// *os.File through final completion, BorrowedFD retains no owner, and FixedFD
-// names a ring-scoped registered-file slot.
+// FD identifies a descriptor argument to an operation. Its three constructors
+// differ only in how the descriptor's lifetime is anchored; none of them
+// transfers ownership of the descriptor to the Ring, and the Ring never closes
+// a descriptor it did not open:
+//
+//   - FileFD retains a reference to an *os.File so the file cannot be finalized
+//     while the kernel may still use its descriptor. The caller keeps ownership
+//     and remains responsible for closing the file.
+//   - FixedFD names a ring-scoped registered-file slot; the slot, not this FD,
+//     owns the installed file.
+//   - BorrowedFD wraps a raw descriptor and retains nothing; its lifetime is
+//     entirely the caller's responsibility.
 type FD struct {
 	kind   descriptorKind
 	file   *os.File
@@ -29,13 +40,18 @@ type FD struct {
 	fd     int
 }
 
-// FileFD returns a descriptor that retains file through final completion.
+// FileFD returns a descriptor backed by file. The Ring retains file through
+// the operation's final completion so the descriptor stays valid, but does not
+// take ownership: the caller still closes the file and must not do so until the
+// operation completes. There is deliberately no way to close an *os.File
+// through the Ring; use CloseFD with a borrowed descriptor or CloseDirect with
+// a fixed-file slot instead.
 func FileFD(file *os.File) FD {
 	return FD{kind: descriptorRegular, file: file}
 }
 
 // BorrowedFD returns a raw descriptor whose lifetime remains the caller's
-// responsibility.
+// responsibility. The Ring retains nothing.
 func BorrowedFD(fd int) FD {
 	return FD{kind: descriptorBorrowed, fd: fd}
 }
@@ -43,6 +59,13 @@ func BorrowedFD(fd int) FD {
 // FixedFD returns a descriptor backed by a ring-scoped fixed-file slot.
 func FixedFD(file FixedFile) FD {
 	return FD{kind: descriptorDirect, direct: file}
+}
+
+// AtCWD names the current working directory as the directory argument for path
+// operations such as OpenAt and StatxAt. It corresponds to AT_FDCWD and, like
+// BorrowedFD, retains nothing.
+func AtCWD() FD {
+	return BorrowedFD(unix.AT_FDCWD)
 }
 
 func (fd FD) validate(ring *Ring) error {
