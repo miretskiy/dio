@@ -7,7 +7,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/miretskiy/dio/giouring"
 	"github.com/stretchr/testify/require"
 )
 
@@ -36,11 +35,8 @@ func TestPlaceDurableWriteWithLinkedSync(t *testing.T) {
 	tickets, handles := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0).Durable())
 
 	c.placeReady(true)
-	require.Len(t, ring.sqes, 2)
-	require.Equal(t, uint8(giouring.OpWrite), ring.sqes[0].OpCode)
-	require.NotZero(t, ring.sqes[0].Flags&giouring.SqeIOLink)
-	require.Equal(t, uint8(giouring.OpFsync), ring.sqes[1].OpCode)
-	require.Equal(t, giouring.FsyncDatasync, ring.sqes[1].OpcodeFlags)
+	require.Len(t, ring.handles, 2)
+	require.Equal(t, []int{2}, ring.batches)
 	completion := c.pending.Value(handles[0]).writeGroup
 	require.Equal(t, 1, completion.count)
 	require.Empty(t, completion.overflow)
@@ -57,9 +53,8 @@ func TestPlacePlainWriteWithoutSync(t *testing.T) {
 	tickets, _ := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0))
 
 	c.placeReady(true)
-	require.Len(t, ring.sqes, 1)
-	require.Equal(t, uint8(giouring.OpWrite), ring.sqes[0].OpCode)
-	require.Zero(t, ring.sqes[0].Flags&giouring.SqeIOLink)
+	require.Len(t, ring.handles, 1)
+	require.Equal(t, []int{1}, ring.batches)
 
 	c.failRemaining(nil, errors.New("test cleanup"))
 	c.releaseAllSlots()

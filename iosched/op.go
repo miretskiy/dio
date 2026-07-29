@@ -1,6 +1,7 @@
 package iosched
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -348,6 +349,21 @@ func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 			if len(p.path) <= 1 {
 				return 0, fmt.Errorf("iosched: op %d has empty open path", count)
 			}
+			if bytes.IndexByte(p.path[:len(p.path)-1], 0) >= 0 {
+				return 0, fmt.Errorf("iosched: op %d open path contains NUL", count)
+			}
+			if int(int32(p.dfd)) != p.dfd {
+				return 0, fmt.Errorf("iosched: op %d directory descriptor does not fit the kernel ABI", count)
+			}
+		}
+		if (kind == OpReadv || kind == OpWritev) && len(p.bufs) > maxCoalescedWrites {
+			return 0, fmt.Errorf(
+				"iosched: op %d has %d buffers, exceeds Linux IOV_MAX %d",
+				count, len(p.bufs), maxCoalescedWrites,
+			)
+		}
+		if kind == OpFallocate && (p.offset < 0 || p.length < 0) {
+			return 0, fmt.Errorf("iosched: op %d has negative fallocate range", count)
 		}
 		if kind == OpClose && !p.isVirtual() && p.linked != nil {
 			return 0, fmt.Errorf("iosched: DrainOp must be the final operation in a linked chain")

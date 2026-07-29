@@ -1,5 +1,7 @@
 package iosched
 
+import "github.com/miretskiy/dio/mempool"
+
 const defaultRingDepth uint32 = 256
 
 type schedulerConfig struct {
@@ -7,6 +9,8 @@ type schedulerConfig struct {
 	sqPoll     bool
 	vfiles     uint32
 	coalescing bool
+	dmaPool    *mempool.SlabPool
+	dmaPoolSet bool
 }
 
 func makeSchedulerConfig(opts []Option) schedulerConfig {
@@ -57,4 +61,15 @@ func WithSQPOLL() Option {
 // one writev. Coalescing is enabled by default. The POSIX backend ignores it.
 func WithCoalescing(enabled bool) Option {
 	return optionFunc(func(c *schedulerConfig) { c.coalescing = enabled })
+}
+
+// WithDMASlab registers pool as one fixed buffer before the io_uring
+// coordinator starts. The scheduler retains pool until Close returns; callers
+// must release all pool slots and close the scheduler before closing pool. The
+// POSIX fallback ignores this option.
+func WithDMASlab(pool *mempool.SlabPool) Option {
+	return optionFunc(func(c *schedulerConfig) {
+		c.dmaPool = pool
+		c.dmaPoolSet = true
+	})
 }

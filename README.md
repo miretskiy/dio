@@ -4,7 +4,7 @@
 fixed-size buffer pools, portable file syscalls, and synchronous or io_uring
 I/O scheduling.
 
-The module requires Go 1.24 or newer. The `align`, `mempool`, `sys`, and POSIX
+The module requires Go 1.25.11 or newer. The `align`, `mempool`, `sys`, and POSIX
 scheduler APIs work on Linux and Darwin. io_uring support is Linux-only.
 
 ```sh
@@ -19,10 +19,11 @@ go get github.com/miretskiy/dio
 | `mempool` | Page-aligned fixed-slot and reference-counted buffer pools |
 | `sys` | Portable file allocation, syncing, direct I/O, and hole punching |
 | `iosched` | A common operation/ticket API over POSIX and io_uring |
-| `giouring` | Low-level Go definitions and syscalls for io_uring |
+| `ringo` | Lifetime-safe low-level io_uring operations and resource ownership |
 
-Most applications should use `iosched`. `giouring` is the lower-level binding
-used to implement it.
+Most applications should use `iosched`. `ringo` is the lower-level Linux API
+used to implement it; unlike a raw SQE binding, it owns every kernel-visible Go
+object from `Push` through final completion reaping.
 
 ## Aligned memory
 
@@ -69,15 +70,14 @@ A slab can be registered as one io_uring fixed buffer. The caller retains
 ownership and must close the scheduler before closing the pool.
 
 ```go
-sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(256))
+sched, err := iosched.NewURingScheduler(
+    iosched.WithRingDepth(256),
+    iosched.WithDMASlab(pool),
+)
 if err != nil {
     return err
 }
 defer sched.Close()
-
-if err := iosched.RegisterDMASlab(sched, pool); err != nil {
-    return err
-}
 
 ticket, err := sched.Submit(iosched.WriteFixedOp(f, slot.Data, offset))
 ```
@@ -219,16 +219,54 @@ Wait for a close-containing ticket before reusing its slot. Contiguous,
 standalone writes accepted next to one another may be coalesced into a single
 `writev`; each original submission still receives its own ticket and count.
 
+## Low-level io_uring
+
+Ringo exposes typed operations without exposing SQEs, CQEs, raw `user_data`, or
+manual completion-queue advancement:
+
+```go
+ring, err := ringo.New(ringo.WithDepth(256))
+if err != nil {
+    return err
+}
+defer ring.Close()
+
+handle, err := ring.Push(ringo.Read(f, buf, offset))
+if err != nil {
+    return err
+}
+_, err = ring.SubmitAndWait(1)
+if err != nil {
+    return err
+}
+for completion := range ring.Reap() {
+    if completion.Handle != handle {
+        continue
+    }
+    return completion.Err
+}
+```
+
+`Push` permanently consumes the Op; discard every copy and use only its
+Handle. Referenced files, buffers, copied paths, and iovecs remain retained
+through the final CQE; multishot completions remain retained while their
+`More` flag is set. Fixed-file and fixed-buffer registrations remain owned
+until `Ring.Close`. Retention does not prevent access through another slice or
+pointer alias: callers must not modify memory the kernel may read or access
+memory the kernel may write while an operation is active. Callers also
+serialize calls on the same ring, avoid explicitly closing retained files,
+submit pushed work, reap completions, and handle short I/O.
+
 ## Validation
 
 ```sh
-go test ./...
-go vet ./...
-go test -race ./iosched
+./scripts/check.sh
 ```
 
-The io_uring runtime tests require Linux. Cross-compiling on another host only
-checks that the Linux code builds; it does not exercise the kernel path.
+The script requires `staticcheck` in `PATH` and runs tests, `go vet`,
+Staticcheck, and the scheduler race tests. On non-Linux hosts it also compiles
+and analyzes the Linux build. The io_uring runtime tests still require Linux;
+cross-compiling checks the Linux code but does not exercise the kernel path.
 
 ## License
 

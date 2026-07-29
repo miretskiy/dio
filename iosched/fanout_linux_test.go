@@ -172,15 +172,18 @@ func BenchmarkFanout_URing(b *testing.B) {
 
 	ff := setupFanout(b)
 
-	sched, err := iosched.NewURingScheduler(iosched.WithRingDepth(256))
+	// 1 GiB slab, 1 MiB slots.  Size is a 2 MiB multiple → MAP_HUGETLB attempted.
+	pool, err := mempool.NewSlabPool(1<<30, fanoutChunk)
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	// 1 GiB slab, 1 MiB slots.  Size is a 2 MiB multiple → MAP_HUGETLB attempted.
-	pool, err := mempool.NewSlabPool(1<<30, fanoutChunk)
+	sched, err := iosched.NewURingScheduler(
+		iosched.WithRingDepth(256),
+		iosched.WithDMASlab(pool),
+	)
 	if err != nil {
-		_ = sched.Close()
+		pool.Close()
 		b.Fatal(err)
 	}
 	defer func() {
@@ -189,10 +192,6 @@ func BenchmarkFanout_URing(b *testing.B) {
 		}
 		pool.Close()
 	}()
-
-	if err := iosched.RegisterDMASlab(sched, pool); err != nil {
-		b.Fatal(err)
-	}
 
 	writeTickets := make([]iosched.Ticket, fanoutNumSinks)
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/miretskiy/dio/giouring"
 	"github.com/miretskiy/dio/internal/intrusive"
 	"github.com/stretchr/testify/require"
 )
@@ -86,10 +85,7 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 	)
 
 	c.placeReady(true)
-	require.Len(t, ring.sqes, 1)
-	require.Equal(t, uint8(giouring.OpWritev), ring.sqes[0].OpCode)
-	slot := c.slots.Value(intrusive.Handle(ring.sqes[0].UserData))
-	require.Len(t, slot.iovecs, 3)
+	require.Len(t, ring.handles, 1)
 	completion := c.pending.Value(handles[0]).writeGroup
 	require.Equal(t, 3, completion.count)
 	last := len(handles) - 1
@@ -123,7 +119,7 @@ func TestWriteCompletionSnapshotSurvivesLeaderRemoval(t *testing.T) {
 	require.Len(t, completion.overflow, 1)
 	require.Equal(t, handles[inlineTargets], completion.overflow[0].work)
 
-	ring.complete(ring.sqes[0].UserData, int32(len(ops)*4))
+	ring.complete(ring.handles[0], int32(len(ops)*4))
 	c.reap()
 	for _, ticket := range tickets {
 		n, err := ticket.Wait()
@@ -141,9 +137,9 @@ func TestCoalescedShortWriteCompletion(t *testing.T) {
 		WriteOp(f, make([]byte, 4), 4),
 	)
 	c.placeReady(true)
-	require.Len(t, ring.sqes, 1)
+	require.Len(t, ring.handles, 1)
 
-	ring.complete(ring.sqes[0].UserData, 6)
+	ring.complete(ring.handles[0], 6)
 	c.reap()
 	n, err := tickets[0].Wait()
 	require.NoError(t, err)
@@ -159,9 +155,9 @@ func TestSingleShortWriteCompletion(t *testing.T) {
 	f := os.NewFile(100, "a")
 	tickets, _ := acceptOps(&c, WriteOp(f, make([]byte, 4), 0))
 	c.placeReady(true)
-	require.Len(t, ring.sqes, 1)
+	require.Len(t, ring.handles, 1)
 
-	ring.complete(ring.sqes[0].UserData, 2)
+	ring.complete(ring.handles[0], 2)
 	c.reap()
 	n, err := tickets[0].Wait()
 	require.ErrorIs(t, err, io.ErrShortWrite)

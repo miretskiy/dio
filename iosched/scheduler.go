@@ -8,8 +8,6 @@ package iosched
 import (
 	"errors"
 	"io"
-
-	"github.com/miretskiy/dio/mempool"
 )
 
 var errSchedulerClosed = errors.New("iosched: scheduler closed")
@@ -56,23 +54,4 @@ type Scheduler interface {
 	// Close must be called exactly once. Callers must stop submitting first;
 	// racing Close with Submit is not supported.
 	io.Closer
-}
-
-// pooler is implemented by schedulers that support pre-registered DMA buffers.
-type pooler interface {
-	usePool(*mempool.SlabPool) error
-}
-
-// RegisterDMASlab registers pool as one fixed buffer with scheduler s via
-// io_uring_register_buffers. An URingScheduler accepts one pool, retains it
-// until Scheduler.Close returns, and expects registration to happen before
-// fixed-buffer operations are submitted. The caller retains ownership: all
-// Slots must be released and the scheduler closed before pool.Close is called.
-//
-// If s does not support registered buffers, RegisterDMASlab is a no-op.
-func RegisterDMASlab(s Scheduler, pool *mempool.SlabPool) error {
-	if p, ok := s.(pooler); ok {
-		return p.usePool(pool)
-	}
-	return nil
 }

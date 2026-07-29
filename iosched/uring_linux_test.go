@@ -77,17 +77,6 @@ func submitOne(t *testing.T, s *iosched.URingScheduler, op iosched.Op) (int, err
 	return ticket.Wait()
 }
 
-func linkAll(ops ...iosched.Op) iosched.Op {
-	if len(ops) == 0 {
-		panic("empty linked op chain")
-	}
-	root := ops[len(ops)-1]
-	for i := len(ops) - 2; i >= 0; i-- {
-		root = ops[i].Link(root)
-	}
-	return root
-}
-
 func TestURing_Submit_Read(t *testing.T) {
 	s := newURingSched(t)
 	path, data := writeUringFile(t, 4096)
@@ -401,20 +390,18 @@ func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, *mempool.Sl
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	s, err := iosched.NewURingScheduler(iosched.WithRingDepth(64))
+	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	require.NoError(t, err)
+	s, err := iosched.NewURingScheduler(
+		iosched.WithRingDepth(64),
+		iosched.WithDMASlab(pool),
+	)
 	require.NoError(t, err)
 
-	var pool *mempool.SlabPool
 	t.Cleanup(func() {
 		require.NoError(t, s.Close())
-		if pool != nil {
-			pool.Close()
-		}
+		pool.Close()
 	})
-
-	pool, err = mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
-	require.NoError(t, err)
-	require.NoError(t, iosched.RegisterDMASlab(s, pool))
 	return s, pool
 }
 
@@ -502,9 +489,9 @@ func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	require.NoError(t, err)
 	defer slot.Release()
 
-	_, err = submitOne(t, s, iosched.WriteFixedOp(f, slot.Data, 0))
+	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Data, 0))
 	require.Error(t, err)
-	t.Logf("kernel error for unregistered fixed op: %v", err)
+	t.Logf("validation error for unregistered fixed op: %v", err)
 }
 
 func TestNewDefaultScheduler_UsesURing(t *testing.T) {

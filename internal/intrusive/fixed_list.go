@@ -31,11 +31,20 @@ func MakeFixedList[T any](capacity int) FixedList[T] {
 
 // PushBack acquires a slot. It panics when the list is full.
 func (l *FixedList[T]) PushBack() Handle {
-	if l.Len() == len(l.list.nodes) {
+	handle, ok := l.TryPushBack()
+	if !ok {
 		panic("intrusive: fixed list is full")
 	}
+	return handle
+}
+
+// TryPushBack acquires a slot if one is available.
+func (l *FixedList[T]) TryPushBack() (Handle, bool) {
+	if l.Len() == len(l.list.nodes) {
+		return 0, false
+	}
 	index, _ := l.list.pushBack()
-	return l.list.handle(index)
+	return l.list.handle(index), true
 }
 
 // Remove returns handle to the list without clearing its value.
@@ -46,6 +55,12 @@ func (l *FixedList[T]) Remove(handle Handle) {
 // Value returns the value identified by handle. Its address remains stable.
 func (l *FixedList[T]) Value(handle Handle) *T {
 	return l.list.Value(handle)
+}
+
+// TryValue returns the value identified by handle, or false if handle is
+// invalid, stale, or no longer occupied.
+func (l *FixedList[T]) TryValue(handle Handle) (*T, bool) {
+	return l.list.TryValue(handle)
 }
 
 // Front returns the first handle in l.

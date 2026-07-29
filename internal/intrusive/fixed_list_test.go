@@ -26,6 +26,26 @@ func TestFixedListCapacityAndReuse(t *testing.T) {
 	assertPanics(t, "stale handle", func() { list.Value(first) })
 }
 
+func TestFixedListTryOperations(t *testing.T) {
+	list := MakeFixedList[int](1)
+	handle, ok := list.TryPushBack()
+	if !ok {
+		t.Fatal("TryPushBack rejected an available slot")
+	}
+	if _, ok := list.TryPushBack(); ok {
+		t.Fatal("TryPushBack accepted a full list")
+	}
+	if value, ok := list.TryValue(handle); !ok || value != list.Value(handle) {
+		t.Fatal("TryValue did not return the occupied slot")
+	}
+	list.Remove(handle)
+	for _, invalid := range []Handle{0, handle, Handle(1<<32 | 2)} {
+		if value, ok := list.TryValue(invalid); ok || value != nil {
+			t.Fatalf("TryValue accepted invalid handle %d", invalid)
+		}
+	}
+}
+
 func TestFixedListTraversal(t *testing.T) {
 	list := MakeFixedList[int](4)
 	for _, value := range []int{1, 2, 3} {

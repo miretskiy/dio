@@ -86,7 +86,9 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 		Link(Op{buf: []byte("linked")})
 	root := op
 	ticket := root.prepareSubmission()
-	op = Op{}
+	if op.completion != nil {
+		t.Fatal("preparing the submission copy modified the caller's operation")
+	}
 
 	if string(root.buf) != "root" {
 		t.Fatal("submission did not retain its root operation copy")

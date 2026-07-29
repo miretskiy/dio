@@ -104,6 +104,16 @@ func (l *List[T]) Value(handle Handle) *T {
 	return &n.value
 }
 
+// TryValue returns the value identified by handle, or false if handle is
+// invalid, stale, or no longer occupied.
+func (l *List[T]) TryValue(handle Handle) (*T, bool) {
+	_, n, ok := l.tryNode(handle)
+	if !ok {
+		return nil, false
+	}
+	return &n.value, true
+}
+
 // Front returns the first handle in l.
 func (l *List[T]) Front() (Handle, bool) {
 	return l.handle(l.head), l.head != 0
@@ -146,15 +156,23 @@ func (l *List[T]) Len() int {
 }
 
 func (l *List[T]) node(handle Handle) (uint32, *node[T]) {
-	index := handle.index()
-	if uint64(index) > uint64(len(l.nodes)) {
-		panic("intrusive: invalid handle")
-	}
-	n := &l.nodes[index-1]
-	if n.generation != handle.generation() || n.prev == freeNode {
+	index, n, ok := l.tryNode(handle)
+	if !ok {
 		panic("intrusive: invalid handle")
 	}
 	return index, n
+}
+
+func (l *List[T]) tryNode(handle Handle) (uint32, *node[T], bool) {
+	index := uint32(handle)
+	if index == 0 || uint64(index) > uint64(len(l.nodes)) {
+		return 0, nil, false
+	}
+	n := &l.nodes[index-1]
+	if n.generation != uint32(uint64(handle)>>32) || n.prev == freeNode {
+		return 0, nil, false
+	}
+	return index, n, true
 }
 
 func (l *List[T]) handle(index uint32) Handle {
@@ -170,8 +188,4 @@ func (h Handle) index() uint32 {
 		panic("intrusive: invalid handle")
 	}
 	return index
-}
-
-func (h Handle) generation() uint32 {
-	return uint32(uint64(h) >> 32)
 }

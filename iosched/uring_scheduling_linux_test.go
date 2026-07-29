@@ -4,30 +4,62 @@ package iosched
 
 import (
 	"errors"
+	"iter"
 	"os"
 	"sync"
 	"syscall"
 	"testing"
 
-	"github.com/miretskiy/dio/giouring"
 	"github.com/miretskiy/dio/internal/intrusive"
+	"github.com/miretskiy/dio/ringo"
 	"github.com/stretchr/testify/require"
 )
 
 type fakeRingQueue struct {
-	sqes            []giouring.SubmissionQueueEntry
-	cqes            []giouring.CompletionQueueEvent
+	handles         []ringHandle
+	batches         []int
+	linkChains      [][]ringo.LinkType
+	cqes            []ringCompletion
 	submitErrs      []error
 	submitCalls     int
 	submitAndWaitFn func(*fakeRingQueue)
+	nextHandle      uint64
 }
 
-func (f *fakeRingQueue) GetSQE() *giouring.SubmissionQueueEntry {
-	f.sqes = append(f.sqes, giouring.SubmissionQueueEntry{})
-	return &f.sqes[len(f.sqes)-1]
+func (f *fakeRingQueue) Push(ringo.Op) (ringHandle, error) {
+	handle := f.allocateHandle()
+	f.handles = append(f.handles, handle)
+	f.batches = append(f.batches, 1)
+	return handle, nil
 }
 
-func (f *fakeRingQueue) SubmitAndWait(uint32) (uint, error) {
+func (f *fakeRingQueue) PushLinked(
+	_ ringo.Op,
+	link ringo.Link,
+	other ...ringo.Link,
+) ([]ringHandle, error) {
+	types := make([]ringo.LinkType, len(other)+1)
+	types[0] = link.Type
+	for index := range other {
+		types[index+1] = other[index].Type
+	}
+	f.linkChains = append(f.linkChains, types)
+	count := len(other) + 2
+	handles := make([]ringHandle, count)
+	for i := range handles {
+		handles[i] = f.allocateHandle()
+		f.handles = append(f.handles, handles[i])
+	}
+	f.batches = append(f.batches, len(handles))
+	return handles, nil
+}
+
+func (f *fakeRingQueue) allocateHandle() ringHandle {
+	f.nextHandle++
+	return ringHandle{testID: f.nextHandle}
+}
+
+func (f *fakeRingQueue) SubmitAndWait(int) (int, error) {
 	f.submitCalls++
 	if f.submitAndWaitFn != nil {
 		f.submitAndWaitFn(f)
@@ -40,32 +72,43 @@ func (f *fakeRingQueue) SubmitAndWait(uint32) (uint, error) {
 	if err != nil {
 		return 0, err
 	}
-	return uint(len(f.sqes)), nil
+	return len(f.handles), nil
 }
 
-func (f *fakeRingQueue) ForEachCQE(fn func(*giouring.CompletionQueueEvent)) uint32 {
-	for i := range f.cqes {
-		fn(&f.cqes[i])
+func (f *fakeRingQueue) Reap() iter.Seq[ringCompletion] {
+	return func(yield func(ringCompletion) bool) {
+		count := len(f.cqes)
+		for range count {
+			completion := f.cqes[0]
+			f.cqes = f.cqes[1:]
+			if !yield(completion) {
+				return
+			}
+		}
 	}
-	return uint32(len(f.cqes))
 }
 
-func (f *fakeRingQueue) CQAdvance(count uint32) {
-	f.cqes = f.cqes[count:]
-}
-
-func (f *fakeRingQueue) complete(slot uint64, result int32) {
-	f.cqes = append(f.cqes, giouring.CompletionQueueEvent{UserData: slot, Res: result})
+func (f *fakeRingQueue) complete(handle ringHandle, result int32) {
+	completion := ringCompletion{handle: handle}
+	if result < 0 {
+		completion.err = syscall.Errno(-result)
+	} else {
+		completion.result = int(result)
+	}
+	f.cqes = append(f.cqes, completion)
 }
 
 func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 	c := coordinator{
-		sched: &URingScheduler{config: schedulerConfig{
-			ringDepth: uint32(depth),
-			vfiles:    vfiles,
-		}},
+		sched: &URingScheduler{
+			config: schedulerConfig{
+				ringDepth: uint32(depth),
+				vfiles:    vfiles,
+			},
+			fixedFiles: make([]ringo.FixedFile, vfiles),
+		},
 		ring:  ring,
-		slots: intrusive.MakeFixedList[ringSlot](depth),
+		slots: make(map[ringHandle]ringSlot, depth),
 		files: newFileTable(vfiles),
 	}
 	return c
@@ -185,13 +228,32 @@ func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
 	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
 	c.placeReady(false)
 	c.sched.signalShutdown(errSchedulerClosed)
-	ring.complete(ring.sqes[0].UserData, -int32(syscall.ECANCELED))
+	ring.complete(ring.handles[0], -int32(syscall.ECANCELED))
 	c.reap()
 
 	_, err := tickets[0].Wait()
 	if !errors.Is(err, errSchedulerClosed) {
 		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
+}
+
+func TestPlaceChainPreservesMixedLinks(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(3, 1, ring)
+	acceptOps(
+		&c,
+		VReadOp(0, make([]byte, 1), 0).
+			Link(VReadOp(0, make([]byte, 1), 1)).
+			HardLink(VReadOp(0, make([]byte, 1), 2)),
+	)
+	c.placeReady(false)
+
+	require.Equal(t, []int{3}, ring.batches)
+	require.Equal(
+		t,
+		[][]ringo.LinkType{{ringo.LinkSoft, ringo.LinkHard}},
+		ring.linkChains,
+	)
 }
 
 func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
@@ -210,7 +272,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	c := coordinator{
 		sched: s,
 		ring:  ring,
-		slots: intrusive.MakeFixedList[ringSlot](1),
+		slots: make(map[ringHandle]ringSlot, 1),
 		files: newFileTable(1),
 	}
 	cause := c.run()
@@ -226,8 +288,8 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	if !errors.Is(err, errSchedulerClosed) {
 		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
-	if len(ring.sqes) != 0 || ring.submitCalls != 0 {
-		t.Fatalf("shutdown placed work: sqes=%d submit calls=%d", len(ring.sqes), ring.submitCalls)
+	if len(ring.handles) != 0 || ring.submitCalls != 0 {
+		t.Fatalf("shutdown placed work: sqes=%d submit calls=%d", len(ring.handles), ring.submitCalls)
 	}
 	if s.tryPush(new(submission)) {
 		t.Fatal("submission succeeded after close")
@@ -240,7 +302,7 @@ func TestResourceErrorReapsAvailableCompletion(t *testing.T) {
 	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
 	c.placeReady(false)
 	ring.submitErrs = []error{syscall.EAGAIN}
-	ring.complete(ring.sqes[0].UserData, 1)
+	ring.complete(ring.handles[0], 1)
 
 	if err := c.submitAndWait(); err != nil {
 		t.Fatal(err)
@@ -255,7 +317,7 @@ func TestEINTRReturnsToCoordinator(t *testing.T) {
 	c.placeReady(false)
 	ring.submitAndWaitFn = func(f *fakeRingQueue) {
 		if f.submitCalls == 2 {
-			f.complete(f.sqes[0].UserData, 1)
+			f.complete(f.handles[0], 1)
 		}
 	}
 	if err := c.submitAndWait(); err != nil {
@@ -337,7 +399,7 @@ func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
 		VReadOp(1, make([]byte, 1), 0),
 	)
 	c.placeReady(false)
-	ring.complete(ring.sqes[0].UserData, 1)
+	ring.complete(ring.handles[0], 1)
 
 	c.reap()
 	c.failRemaining(nil, ringErr)
@@ -351,8 +413,8 @@ func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
 	if !errors.Is(err, ringErr) {
 		t.Fatalf("remaining request error: got %v want %v", err, ringErr)
 	}
-	if c.pending.Len() != 0 || c.slots.Len() != 0 {
-		t.Fatalf("coordinator retained failed work: pending=%d slots=%d", c.pending.Len(), c.slots.Len())
+	if c.pending.Len() != 0 || len(c.slots) != 0 {
+		t.Fatalf("coordinator retained failed work: pending=%d slots=%d", c.pending.Len(), len(c.slots))
 	}
 }
 
@@ -564,7 +626,7 @@ func TestDurableWritePreservesCountsOnRingFailureAfterWrite(t *testing.T) {
 	)
 	c.placeReady(true)
 
-	writeSlot := ring.sqes[0].UserData
+	writeSlot := ring.handles[0]
 	ring.complete(writeSlot, 4)
 	c.reap()
 	c.failRemaining(nil, ringErr)
@@ -592,35 +654,6 @@ func TestFileTableReusesRegularState(t *testing.T) {
 	}
 }
 
-func TestReleaseSlotClearsPointersAndReusesStorage(t *testing.T) {
-	c := newTestCoordinator(1, 0, &fakeRingQueue{})
-	buf := make([]byte, 8)
-	handle := c.slots.PushBack()
-	rs := c.slots.Value(handle)
-	*rs = ringSlot{
-		op:       &Op{buf: buf},
-		complete: completeNormal,
-		iovecs:   []syscall.Iovec{{Base: &buf[0], Len: 8}},
-	}
-	iovecCap := cap(rs.iovecs)
-	c.releaseSlot(handle)
-
-	if rs.op != nil || rs.complete != nil {
-		t.Fatal("released slot retained request")
-	}
-	for i, iv := range rs.iovecs[:cap(rs.iovecs)] {
-		if iv.Base != nil {
-			t.Fatalf("iovec[%d].Base not cleared", i)
-		}
-	}
-	if cap(rs.iovecs) != iovecCap {
-		t.Fatal("released slot dropped reusable iovec storage")
-	}
-	if c.slots.Len() != 0 {
-		t.Fatalf("released slot remains occupied: %d", c.slots.Len())
-	}
-}
-
 func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(4, 2, ring)
@@ -629,43 +662,42 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 		VReadOp(1, make([]byte, 1), 0),
 	)
 	c.placeReady(false)
-	if len(ring.sqes) != 2 {
-		t.Fatalf("SQEs before open completion: got %d want 2", len(ring.sqes))
+	if len(ring.handles) != 2 {
+		t.Fatalf("SQEs before open completion: got %d want 2", len(ring.handles))
 	}
 
 	// Accept the same-slot read only after the open has already been handed to
 	// the ring. Its SQE still cannot be prepared before the open CQE arrives.
-	readTickets, allHandles := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	readTickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
 	tickets = append(tickets, readTickets...)
-	handles = allHandles
 	c.placeReady(false)
-	if len(ring.sqes) != 2 {
+	if len(ring.handles) != 2 {
 		t.Fatal("same-slot read reached the ring while the open was in flight")
 	}
 
-	var openSlot, otherSlot uint64
+	var openSlot, otherSlot ringHandle
 	foundOpen, foundOther := false, false
-	for i := range ring.sqes {
-		sqe := &ring.sqes[i]
+	for ringHandle, slot := range c.slots {
+		op := slot.op
 		switch {
-		case sqe.OpCode == giouring.OpOpenat:
-			openSlot = sqe.UserData
+		case op.kind() == OpOpenat:
+			openSlot = ringHandle
 			foundOpen = true
-		case sqe.OpCode == giouring.OpRead && sqe.Fd == 1:
-			otherSlot = sqe.UserData
+		case op.kind() == OpRead && op.isVirtual() && op.vfd == 1:
+			otherSlot = ringHandle
 			foundOther = true
-		case sqe.OpCode == giouring.OpRead && sqe.Fd == 0:
+		case op.kind() == OpRead && op.isVirtual() && op.vfd == 0:
 			t.Fatal("same-slot read reached the ring before open completed")
 		}
 	}
 	if !foundOpen || !foundOther {
-		t.Fatalf("missing initial SQEs: open=%v other=%v sqes=%+v", foundOpen, foundOther, ring.sqes)
+		t.Fatalf("missing initial SQEs: open=%v other=%v sqes=%+v", foundOpen, foundOther, ring.handles)
 	}
 	if openSlot == otherSlot {
-		t.Fatalf("initial SQEs reused slot %d: %+v; ring slots=%+v", openSlot, ring.sqes, c.slots)
+		t.Fatalf("initial SQEs reused slot %+v: %+v; ring slots=%+v", openSlot, ring.handles, c.slots)
 	}
-	openRingSlot := c.slots.Value(intrusive.Handle(openSlot))
-	otherRingSlot := c.slots.Value(intrusive.Handle(otherSlot))
+	openRingSlot := c.slots[openSlot]
+	otherRingSlot := c.slots[otherSlot]
 	if openRingSlot.work != handles[0] || otherRingSlot.work != handles[1] {
 		t.Fatalf("wrong work in slots: open=%d other=%d handles=%v", openRingSlot.work, otherRingSlot.work, handles)
 	}
@@ -673,19 +705,20 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 	ring.complete(otherSlot, 1)
 	c.reap()
 	c.placeReady(false)
-	if len(ring.sqes) != 2 {
+	if len(ring.handles) != 2 {
 		t.Fatal("same-slot read escaped while open completion was withheld")
 	}
 
 	ring.complete(openSlot, 0)
 	c.reap()
 	c.placeReady(false)
-	if len(ring.sqes) != 3 {
-		t.Fatalf("read not placed after open completion: sqes=%d", len(ring.sqes))
+	if len(ring.handles) != 3 {
+		t.Fatalf("read not placed after open completion: sqes=%d", len(ring.handles))
 	}
-	last := ring.sqes[len(ring.sqes)-1]
-	if last.OpCode != giouring.OpRead || last.Fd != 0 {
-		t.Fatalf("last SQE = {opcode:%d fd:%d}, want same-slot read", last.OpCode, last.Fd)
+	last := ring.handles[len(ring.handles)-1]
+	lastOp := c.slots[last].op
+	if lastOp.kind() != OpRead || !lastOp.isVirtual() || lastOp.vfd != 0 {
+		t.Fatalf("last operation = %+v, want same-slot read", lastOp)
 	}
 
 	c.failRemaining(nil, errors.New("test cleanup"))
@@ -707,35 +740,34 @@ func TestCoordinatorCloseDrainWithAdversarialCompletions(t *testing.T) {
 	closeTickets, _ := acceptOps(&c, VCloseOp(0))
 	tickets = append(tickets, closeTickets...)
 	c.placeReady(false)
-	if len(ring.sqes) != 2 {
+	if len(ring.handles) != 2 {
 		t.Fatal("close reached the ring before the older same-slot read completed")
 	}
 
-	var sameSlot, otherSlot uint64
-	for i := range ring.sqes {
-		sqe := &ring.sqes[i]
-		if sqe.Fd == 0 {
-			sameSlot = sqe.UserData
-		} else if sqe.Fd == 1 {
-			otherSlot = sqe.UserData
+	var sameSlot, otherSlot ringHandle
+	for handle, slot := range c.slots {
+		if slot.op.vfd == 0 {
+			sameSlot = handle
+		} else if slot.op.vfd == 1 {
+			otherSlot = handle
 		}
 	}
-	if sameSlot == 0 || otherSlot == 0 {
-		t.Fatalf("missing read SQEs: %+v", ring.sqes)
+	if sameSlot == (ringHandle{}) || otherSlot == (ringHandle{}) {
+		t.Fatalf("missing read SQEs: %+v", ring.handles)
 	}
 
 	ring.complete(otherSlot, 1)
 	c.reap()
 	c.placeReady(false)
-	if len(ring.sqes) != 2 {
+	if len(ring.handles) != 2 {
 		t.Fatal("unrelated completion released the close")
 	}
 
 	ring.complete(sameSlot, 1)
 	c.reap()
 	c.placeReady(false)
-	if len(ring.sqes) != 3 || ring.sqes[2].OpCode != giouring.OpClose {
-		t.Fatalf("close was not placed after the same-slot read: %+v", ring.sqes)
+	if len(ring.handles) != 3 || c.slots[ring.handles[2]].op.kind() != OpClose {
+		t.Fatalf("close was not placed after the same-slot read: %+v", ring.handles)
 	}
 
 	c.failRemaining(nil, errors.New("test cleanup"))

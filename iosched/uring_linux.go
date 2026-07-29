@@ -4,17 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"runtime"
+	"iter"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
-	"github.com/miretskiy/dio/giouring"
 	"github.com/miretskiy/dio/internal/buildutil"
 	"github.com/miretskiy/dio/internal/intrusive"
 	"github.com/miretskiy/dio/mempool"
+	"github.com/miretskiy/dio/ringo"
 )
 
 // IOUringAvailable reports whether the running kernel provides the io_uring
@@ -22,12 +21,7 @@ import (
 var IOUringAvailable = probeIOUring()
 
 func probeIOUring() bool {
-	ring := giouring.NewRing()
-	if err := ring.QueueInit(1, 0); err != nil {
-		return false
-	}
-	defer ring.QueueExit()
-	return ring.HasFeature(giouring.FeatNoDrop)
+	return ringo.Available()
 }
 
 type writeTarget struct {
@@ -65,8 +59,6 @@ type ringSlot struct {
 	work     intrusive.Handle
 	op       *Op
 	complete completionFn
-
-	iovecs []syscall.Iovec
 }
 
 // submission is the scheduler-owned envelope for one validated Submit call.
@@ -88,65 +80,69 @@ var stagingClosed submission
 type URingScheduler struct {
 	config schedulerConfig
 
-	ring *giouring.Ring
-	// registeredPool keeps fixed-buffer backing memory reachable until the
-	// ring is closed. The caller still owns and closes the pool.
-	registeredPool *mempool.SlabPool
-	stagingHead    atomic.Pointer[submission]
-	wakeup         chan struct{}
+	ring              *ringo.Ring
+	fixedFiles        []ringo.FixedFile
+	registeredPool    *mempool.SlabPool
+	registeredBuffers *ringo.FixedBuffers
+	stagingHead       atomic.Pointer[submission]
+	wakeup            chan struct{}
 
 	stop atomic.Pointer[error]
 
 	wg sync.WaitGroup
 }
 
-func (s *URingScheduler) usePool(pool *mempool.SlabPool) error {
-	if pool == nil {
-		return errors.New("iosched: cannot register a nil DMA slab")
-	}
-	if s.registeredPool != nil {
-		return errors.New("iosched: a DMA slab is already registered")
-	}
-
-	data := pool.RawData()
-	iovs := []syscall.Iovec{{Base: &data[0]}}
-	iovs[0].SetLen(len(data))
-	if _, err := s.ring.RegisterBuffers(iovs); err != nil {
-		return fmt.Errorf("iosched: io_uring_register_buffers: %w", err)
-	}
-	s.registeredPool = pool
-	return nil
-}
-
 // NewURingScheduler creates an io_uring-backed scheduler. The kernel must
-// provide IORING_FEAT_NODROP.
+// provide the setup and feature guarantees required by ringo.New.
 func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	if !IOUringAvailable {
 		return nil, errors.New("iosched: io_uring not available on this kernel")
 	}
 
 	cfg := makeSchedulerConfig(opts)
-
-	var flags uint32
-	if cfg.sqPoll {
-		flags |= giouring.SetupSQPoll
+	if cfg.dmaPoolSet && cfg.dmaPool == nil {
+		return nil, errors.New("iosched: cannot register a nil DMA slab")
 	}
+	dmaPool := cfg.dmaPool
+	cfg.dmaPool = nil
+	cfg.dmaPoolSet = false
 
-	ring := giouring.NewRing()
-	if err := ring.QueueInit(cfg.ringDepth, flags); err != nil {
-		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
+	ringOptions := []ringo.Option{ringo.WithDepth(cfg.ringDepth)}
+	if cfg.sqPoll {
+		ringOptions = append(ringOptions, ringo.WithSQPoll())
 	}
 	if cfg.vfiles > 0 {
-		if _, err := ring.RegisterFilesSparse(cfg.vfiles); err != nil {
-			ring.QueueExit()
-			return nil, fmt.Errorf("iosched: io_uring_register_files_sparse: %w", err)
+		ringOptions = append(ringOptions, ringo.WithFixedFiles(cfg.vfiles))
+	}
+	ring, err := ringo.New(ringOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("iosched: io_uring_setup: %w", err)
+	}
+	cfg.ringDepth = uint32(ring.Capacity())
+
+	fixedFiles := make([]ringo.FixedFile, cfg.vfiles)
+	for index := range fixedFiles {
+		fixedFiles[index], err = ring.FixedFiles().File(uint32(index))
+		if err != nil {
+			_ = ring.Close()
+			return nil, fmt.Errorf("iosched: fixed-file slot %d: %w", index, err)
 		}
 	}
 
 	s := &URingScheduler{
-		config: cfg,
-		ring:   ring,
-		wakeup: make(chan struct{}, 1),
+		config:     cfg,
+		ring:       ring,
+		fixedFiles: fixedFiles,
+		wakeup:     make(chan struct{}, 1),
+	}
+	if dmaPool != nil {
+		buffers, err := ring.RegisterBuffers(dmaPool.RawData())
+		if err != nil {
+			_ = ring.Close()
+			return nil, fmt.Errorf("iosched: io_uring_register_buffers: %w", err)
+		}
+		s.registeredPool = dmaPool
+		s.registeredBuffers = buffers
 	}
 	s.wg.Add(1)
 	go s.loop()
@@ -169,6 +165,9 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 	if need := transformedSlotCount(&op, n); uint32(need) > s.config.ringDepth {
 		return Ticket{}, fmt.Errorf("iosched: operation requires %d ring slots, exceeds ring depth %d", need, s.config.ringDepth)
 	}
+	if err := s.validateFixedBuffers(&op); err != nil {
+		return Ticket{}, err
+	}
 
 	request, ticket := newSubmission(op, n)
 	if !s.tryPush(request) {
@@ -179,6 +178,21 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 	default:
 	}
 	return ticket, nil
+}
+
+func (s *URingScheduler) validateFixedBuffers(root *Op) error {
+	for op := root; op != nil; op = op.linked {
+		if !op.isFixed() {
+			continue
+		}
+		if s.registeredBuffers == nil {
+			return errors.New("iosched: fixed-buffer operation requires WithDMASlab")
+		}
+		if _, err := s.registeredBuffers.Bind(op.buf); err != nil {
+			return fmt.Errorf("iosched: fixed buffer is outside the registered DMA slab: %w", err)
+		}
+	}
+	return nil
 }
 
 // transformedSlotCount accounts for SQEs synthesized by the coordinator. A
@@ -234,10 +248,7 @@ func (s *URingScheduler) Close() error {
 	if !alreadyClosing {
 		// ANY ignores the match key; ALL cancels every request. Bound the
 		// synchronous cancellation call; Close still waits for the coordinator.
-		_, _ = s.ring.RegisterSyncCancel(&giouring.SyncCancelReg{
-			Flags:   giouring.AsyncCancelAny | giouring.AsyncCancelAll,
-			Timeout: syscall.Timespec{Sec: 1},
-		})
+		_ = s.ring.CancelAll(time.Second)
 
 		// The coordinator may instead be idle on the userspace doorbell.
 		select {
@@ -246,11 +257,10 @@ func (s *URingScheduler) Close() error {
 		}
 	}
 	s.wg.Wait()
-	pool := s.registeredPool
-	s.ring.QueueExit()
-	runtime.KeepAlive(pool)
+	err := s.ring.Close()
 	s.registeredPool = nil
-	return nil
+	s.registeredBuffers = nil
+	return err
 }
 
 func (s *URingScheduler) signalShutdown(err error) bool {
@@ -266,18 +276,73 @@ func (s *URingScheduler) stopCause() error {
 }
 
 type ringQueue interface {
-	GetSQE() *giouring.SubmissionQueueEntry
-	SubmitAndWait(waitFor uint32) (submitted uint, err error)
-	ForEachCQE(func(*giouring.CompletionQueueEvent)) uint32
-	CQAdvance(uint32)
+	Push(ringo.Op) (ringHandle, error)
+	PushLinked(ringo.Op, ringo.Link, ...ringo.Link) ([]ringHandle, error)
+	SubmitAndWait(minComplete int) (submitted int, err error)
+	Reap() iter.Seq[ringCompletion]
+}
+
+type ringHandle struct {
+	handle ringo.Handle
+	testID uint64
+}
+
+type ringCompletion struct {
+	handle ringHandle
+	result int
+	err    error
+}
+
+type liveRingQueue struct {
+	ring *ringo.Ring
+}
+
+func (queue liveRingQueue) Push(op ringo.Op) (ringHandle, error) {
+	handle, err := queue.ring.Push(op)
+	return ringHandle{handle: handle}, err
+}
+
+func (queue liveRingQueue) PushLinked(
+	first ringo.Op,
+	link ringo.Link,
+	other ...ringo.Link,
+) ([]ringHandle, error) {
+	handles, err := queue.ring.PushLinked(first, link, other...)
+	if err != nil {
+		return nil, err
+	}
+	wrapped := make([]ringHandle, len(handles))
+	for i := range handles {
+		wrapped[i].handle = handles[i]
+	}
+	return wrapped, nil
+}
+
+func (queue liveRingQueue) SubmitAndWait(minComplete int) (int, error) {
+	return queue.ring.SubmitAndWait(minComplete)
+}
+
+func (queue liveRingQueue) Reap() iter.Seq[ringCompletion] {
+	return func(yield func(ringCompletion) bool) {
+		for completion := range queue.ring.Reap() {
+			if !yield(ringCompletion{
+				handle: ringHandle{handle: completion.Handle},
+				result: completion.Result,
+				err:    completion.Err,
+			}) {
+				return
+			}
+		}
+	}
 }
 
 type coordinator struct {
 	sched *URingScheduler
 	ring  ringQueue
 
-	// slots contains one entry per SQE until its CQE is reaped.
-	slots intrusive.FixedList[ringSlot]
+	// slots maps Ringo's opaque completion identities back to scheduler-owned
+	// logical completion state.
+	slots map[ringHandle]ringSlot
 
 	pending intrusive.List[workItem]
 	// ready contains pending handles eligible for placement. Work waiting for
@@ -286,6 +351,9 @@ type coordinator struct {
 	// coalesced contains every pending handle selected for the next placement,
 	// in ready order. Contiguous writes extend it beyond the first item.
 	coalesced []intrusive.Handle
+	// writeBuffers is coordinator-owned scratch for translating a coalesced
+	// write group. Ringo snapshots the slice headers into the resulting Op.
+	writeBuffers [][]byte
 
 	files        fileTable
 	nextSequence uint64
@@ -296,8 +364,8 @@ func (s *URingScheduler) loop() {
 
 	c := coordinator{
 		sched: s,
-		ring:  s.ring,
-		slots: intrusive.MakeFixedList[ringSlot](int(s.config.ringDepth)),
+		ring:  liveRingQueue{ring: s.ring},
+		slots: make(map[ringHandle]ringSlot, s.config.ringDepth),
 	}
 	c.files = newFileTable(s.config.vfiles)
 
@@ -324,11 +392,11 @@ func (c *coordinator) run() error {
 		c.placeReady(c.sched.config.coalescing)
 
 		// After placement, pending work requires at least one occupied ring slot.
-		if err := buildutil.Assert(c.slots.Len() > 0 || c.pending.Len() == 0); err != nil {
+		if err := buildutil.Assert(len(c.slots) > 0 || c.pending.Len() == 0); err != nil {
 			return fmt.Errorf("iosched: pending work has no runnable or in-flight operation: %w", err)
 		}
 
-		if c.slots.Len() > 0 {
+		if len(c.slots) > 0 {
 			if err := c.submitAndWait(); err != nil {
 				return fmt.Errorf("iosched: ring error: %w", err)
 			}
@@ -414,7 +482,7 @@ func (c *coordinator) placeReady(coalesce bool) {
 				need++
 			}
 		}
-		if need > c.slots.Cap()-c.slots.Len() {
+		if need > int(c.sched.config.ringDepth)-len(c.slots) {
 			return
 		}
 
@@ -476,12 +544,41 @@ func (c *coordinator) durableWrite(handles []intrusive.Handle) bool {
 	return durable
 }
 
+func ringoLinkType(op *Op) ringo.LinkType {
+	if op.sqeFlags&sqeHardLink != 0 {
+		return ringo.LinkHard
+	}
+	return ringo.LinkSoft
+}
+
 func (c *coordinator) placeChain(handle intrusive.Handle) {
 	work := c.pending.Value(handle)
-	for op := work.root; op != nil; op = op.linked {
-		slot := c.allocSlot()
-		c.initSlot(slot, handle, op, completeNormal)
-		c.prepareSlot(slot, op)
+	root := work.root
+	first := c.translateOp(root)
+	if root.linked == nil {
+		ringHandle, err := c.ring.Push(first)
+		if err != nil {
+			panic(fmt.Sprintf("iosched: Ringo rejected a validated operation: %v", err))
+		}
+		c.slots[ringHandle] = ringSlot{work: handle, op: root, complete: completeNormal}
+		return
+	}
+
+	links := make([]ringo.Link, 0, root.opCount()-1)
+	for op := root; op.linked != nil; op = op.linked {
+		links = append(
+			links,
+			ringo.Then(ringoLinkType(op), c.translateOp(op.linked)),
+		)
+	}
+	ringHandles, err := c.ring.PushLinked(first, links[0], links[1:]...)
+	if err != nil {
+		panic(fmt.Sprintf("iosched: Ringo rejected a validated chain: %v", err))
+	}
+	op := root
+	for _, ringHandle := range ringHandles {
+		c.slots[ringHandle] = ringSlot{work: handle, op: op, complete: completeNormal}
+		op = op.linked
 	}
 }
 
@@ -504,178 +601,133 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 		}
 	}
 
-	writeSlot := c.allocSlot()
 	prepared := *firstOp
 	if len(handles) > 1 {
 		prepared.opcode = OpWritev | (prepared.opcode & opVirtual)
+		c.writeBuffers = c.writeBuffers[:0]
+		for _, handle := range handles {
+			c.writeBuffers = append(
+				c.writeBuffers,
+				c.pending.Value(handle).root.buf,
+			)
+		}
+		prepared.bufs = c.writeBuffers
 	}
 	complete := completeWrite
 	if durable {
-		prepared.sqeFlags |= sqeLink
 		complete = recordDurableWrite
 	}
-	c.initSlot(writeSlot, leader, firstOp, complete)
-
-	if len(handles) > 1 {
-		rs := c.slots.Value(writeSlot)
-		for _, handle := range handles {
-			rs.iovecs = appendIovec(rs.iovecs, c.pending.Value(handle).root.buf)
+	write := c.translateOp(&prepared)
+	if !durable {
+		ringHandle, err := c.ring.Push(write)
+		if err != nil {
+			panic(fmt.Sprintf("iosched: Ringo rejected a validated write: %v", err))
 		}
+		c.slots[ringHandle] = ringSlot{work: leader, op: firstOp, complete: complete}
+		return
 	}
 
-	var syncSlot intrusive.Handle
-	if durable {
-		syncSlot = c.allocSlot()
-		c.initSlot(syncSlot, leader, firstOp, completeDurableWrite)
+	sync := prepared.syncOp()
+	ringHandles, err := c.ring.PushLinked(
+		write,
+		ringo.Then(ringo.LinkSoft, c.translateOp(&sync)),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("iosched: Ringo rejected a validated durable write: %v", err))
 	}
-	c.prepareSlot(writeSlot, &prepared)
-	if durable {
-		sync := prepared.syncOp()
-		c.prepareSlot(syncSlot, &sync)
+	c.slots[ringHandles[0]] = ringSlot{work: leader, op: firstOp, complete: complete}
+	c.slots[ringHandles[1]] = ringSlot{
+		work: leader, op: firstOp, complete: completeDurableWrite,
 	}
 }
 
-func (c *coordinator) allocSlot() intrusive.Handle {
-	return c.slots.PushBack()
-}
-
-func (c *coordinator) initSlot(
-	handle intrusive.Handle, work intrusive.Handle, op *Op, complete completionFn,
-) {
-	rs := c.slots.Value(handle)
-	rs.work = work
-	rs.op = op
-	rs.complete = complete
-	clear(rs.iovecs)
-	rs.iovecs = rs.iovecs[:0]
-}
-
-func (c *coordinator) prepareSlot(handle intrusive.Handle, op *Op) {
-	rs := c.slots.Value(handle)
-	sqe := c.ring.GetSQE()
-	if err := buildutil.Assert(sqe != nil); err != nil {
-		panic(fmt.Sprintf("iosched: GetSQE returned nil for slot %d: %v", handle, err))
-	}
-	if len(rs.iovecs) == 0 {
-		if k := op.kind(); k == OpReadv || k == OpWritev {
-			for _, buf := range op.bufs {
-				rs.iovecs = appendIovec(rs.iovecs, buf)
-			}
-		}
-	}
-	prepareSQE(sqe, op, rs.iovecs)
-	sqe.SetData64(uint64(handle))
-}
-
-// fd returns the descriptor op names: a virtual op's slot index (vfd) or a
-// regular op's process fd. Whether it's a fixed file is op.isVirtual().
-func (o *Op) fd() int {
-	if o.isVirtual() {
-		return int(o.vfd)
-	}
-	return int(o.f.Fd())
-}
-
-func prepareSQE(sqe *giouring.SubmissionQueueEntry, op *Op, iovecs []syscall.Iovec) {
-	// A "direct descriptor" (a.k.a. registered/fixed file) is a file held in
-	// io_uring's own table and named by a slot index, not a process fd.
-	// IOSQE_FIXED_FILE is the switch into that world: it tells the kernel to read
-	// the SQE's fd field as a registered slot index rather than a process fd. So
-	// it belongs on virtual read/write/fsync/fallocate — ops that name their file
-	// through the fd field.
-	//
-	// Virtual open and close instead reach the table through the separate
-	// file_index field (the *Direct helpers set it via setTargetFixedFile), not
-	// the fd field, so they must NOT set IOSQE_FIXED_FILE. Regular DrainOp is a
-	// NOP and likewise names no file in its SQE. Those cases clear the flag below.
-	var sqeFlags uint32
-	fd := op.dfd
-	if op.kind() != OpOpenat {
-		fd = op.fd()
-	}
+func (c *coordinator) translateOp(op *Op) ringo.Op {
+	var direct ringo.FixedFile
 	if op.isVirtual() {
-		sqeFlags |= uint32(giouring.SqeFixedFile)
-	}
-	if op.isLinked() {
-		if op.sqeFlags&sqeHardLink != 0 {
-			sqeFlags |= uint32(giouring.SqeIOHardlink)
-		} else {
-			sqeFlags |= uint32(giouring.SqeIOLink)
-		}
+		direct = c.sched.fixedFiles[op.vfd]
 	}
 
-	buf := slicePtr(op.buf)
 	switch op.kind() {
 	case OpRead:
 		if op.isFixed() {
-			sqe.PrepareReadFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
-		} else {
-			sqe.PrepareRead(fd, buf, uint32(len(op.buf)), uint64(op.offset))
+			buffer, err := c.sched.registeredBuffers.Bind(op.buf)
+			if err != nil {
+				panic(fmt.Sprintf("iosched: validated fixed buffer became invalid: %v", err))
+			}
+			if op.isVirtual() {
+				return ringo.ReadFixedDirect(direct, buffer, op.offset)
+			}
+			return ringo.ReadFixed(op.f, buffer, op.offset)
 		}
+		if op.isVirtual() {
+			return ringo.ReadDirect(direct, op.buf, op.offset)
+		}
+		return ringo.Read(op.f, op.buf, op.offset)
 	case OpWrite:
 		if op.isFixed() {
-			sqe.PrepareWriteFixed(fd, buf, uint32(len(op.buf)), uint64(op.offset), 0)
-		} else {
-			sqe.PrepareWrite(fd, buf, uint32(len(op.buf)), uint64(op.offset))
+			buffer, err := c.sched.registeredBuffers.Bind(op.buf)
+			if err != nil {
+				panic(fmt.Sprintf("iosched: validated fixed buffer became invalid: %v", err))
+			}
+			if op.isVirtual() {
+				return ringo.WriteFixedDirect(direct, buffer, op.offset)
+			}
+			return ringo.WriteFixed(op.f, buffer, op.offset)
 		}
+		if op.isVirtual() {
+			return ringo.WriteDirect(direct, op.buf, op.offset)
+		}
+		return ringo.Write(op.f, op.buf, op.offset)
 	case OpReadv:
-		sqe.PrepareReadv(fd, slicePtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
+		if op.isVirtual() {
+			return ringo.ReadvDirect(direct, op.bufs, op.offset)
+		}
+		return ringo.Readv(op.f, op.bufs, op.offset)
 	case OpWritev:
-		sqe.PrepareWritev(fd, slicePtr(iovecs), uint32(len(iovecs)), uint64(op.offset))
+		if op.isVirtual() {
+			return ringo.WritevDirect(direct, op.bufs, op.offset)
+		}
+		return ringo.Writev(op.f, op.bufs, op.offset)
 	case OpFsync:
-		sqe.PrepareFsync(fd, 0)
+		if op.isVirtual() {
+			return ringo.FsyncDirect(direct)
+		}
+		return ringo.Fsync(op.f)
 	case OpFdatasync:
-		sqe.PrepareFsync(fd, giouring.FsyncDatasync)
+		if op.isVirtual() {
+			return ringo.FdatasyncDirect(direct)
+		}
+		return ringo.Fdatasync(op.f)
 	case OpFallocate:
-		sqe.PrepareFallocate(fd, 0, uint64(op.offset), uint64(op.length))
+		if op.isVirtual() {
+			return ringo.FallocateDirect(direct, op.offset, op.length)
+		}
+		return ringo.Fallocate(op.f, op.offset, op.length)
 	case OpOpenat:
-		// openat's fd field is the dirfd (a real fd / AT_FDCWD), not a registered
-		// index, so IOSQE_FIXED_FILE must stay off. The direct form installs the
-		// opened file into registered slot fd (carried in file_index); the plain
-		// form returns a regular fd in the completion result.
-		sqeFlags &^= uint32(giouring.SqeFixedFile)
+		path := string(op.path[:len(op.path)-1])
 		if op.isVirtual() {
-			// Durability is per-write (Op.Durable), not a property of the open,
-			// so open flags pass through unchanged.
-			sqe.PrepareOpenatDirect(op.dfd, op.path, op.openFlag, op.mode, op.vfd)
-		} else {
-			sqe.PrepareOpenat(op.dfd, op.path, op.openFlag, op.mode)
+			return ringo.OpenAtDirect(
+				ringo.BorrowedFD(op.dfd),
+				path,
+				op.openFlag,
+				op.mode,
+				direct,
+			)
 		}
+		return ringo.OpenAt(
+			ringo.BorrowedFD(op.dfd),
+			path,
+			op.openFlag,
+			op.mode,
+		)
 	case OpClose:
-		// Virtual close removes the registered file from its slot. A regular
-		// DrainOp uses a NOP: the coordinator has already held it behind every
-		// previously accepted operation on f, and os.File ownership stays with
-		// the caller.
-		sqeFlags &^= uint32(giouring.SqeFixedFile)
 		if op.isVirtual() {
-			sqe.PrepareCloseDirect(uint32(fd))
-		} else {
-			sqe.PrepareNop()
+			return ringo.CloseDirect(direct)
 		}
+		return ringo.Nop()
 	default:
 		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
 	}
-
-	if sqeFlags != 0 {
-		sqe.SetFlags(sqeFlags)
-	}
-}
-
-func slicePtr[T any](buf []T) uintptr {
-	if len(buf) == 0 {
-		return 0
-	}
-	return uintptr(unsafe.Pointer(&buf[0]))
-}
-
-// appendIovec appends an iovec for b unless b is empty.
-func appendIovec(iv []syscall.Iovec, b []byte) []syscall.Iovec {
-	if len(b) == 0 {
-		return iv
-	}
-	iovec := syscall.Iovec{Base: &b[0]}
-	iovec.SetLen(len(b))
-	return append(iv, iovec)
 }
 
 // submitAndWait submits queued SQEs and asks io_uring to wait for at least one
@@ -698,31 +750,32 @@ func (c *coordinator) submitAndWait() error {
 	}
 }
 
-func (c *coordinator) reap() uint32 {
-	count := c.ring.ForEachCQE(c.reapOne)
-	if count > 0 {
-		c.ring.CQAdvance(count)
+func (c *coordinator) reap() int {
+	count := 0
+	for completion := range c.ring.Reap() {
+		c.reapOne(completion)
+		count++
 	}
 	return count
 }
 
-func (c *coordinator) reapOne(cqe *giouring.CompletionQueueEvent) {
-	handle := intrusive.Handle(cqe.GetData64())
-	rs := c.slots.Value(handle)
-
-	var n int
-	var err error
-	if cqe.Res < 0 {
-		err = syscall.Errno(-cqe.Res)
-		if err == syscall.ECANCELED && c.sched.stopCause() == errSchedulerClosed {
+func (c *coordinator) reapOne(completion ringCompletion) {
+	slot, ok := c.slots[completion.handle]
+	if !ok {
+		panic(fmt.Sprintf(
+			"iosched: Ringo returned unknown completion handle with error %v",
+			completion.err,
+		))
+	}
+	err := completion.err
+	if err != nil {
+		if errors.Is(err, syscall.ECANCELED) && c.sched.stopCause() == errSchedulerClosed {
 			err = errSchedulerClosed
 		}
-	} else {
-		n = int(cqe.Res)
 	}
 
-	rs.complete(c, rs, n, err)
-	c.releaseSlot(handle)
+	slot.complete(c, &slot, completion.result, err)
+	delete(c.slots, completion.handle)
 }
 
 func completeNormal(c *coordinator, slot *ringSlot, n int, err error) {
@@ -808,22 +861,8 @@ func (c *coordinator) finishOperation(handle intrusive.Handle, op *Op, n int, er
 	}
 }
 
-func (c *coordinator) releaseSlot(handle intrusive.Handle) {
-	rs := c.slots.Value(handle)
-	rs.work = 0
-	rs.op = nil
-	rs.complete = nil
-	// Retain the descriptor arrays for slot reuse, but clear every Go pointer
-	// into caller buffers as soon as the CQE is consumed.
-	clear(rs.iovecs)
-	rs.iovecs = rs.iovecs[:0]
-	c.slots.Remove(handle)
-}
-
 func (c *coordinator) releaseAllSlots() {
-	for handle := range c.slots.All() {
-		c.releaseSlot(handle)
-	}
+	clear(c.slots)
 }
 
 func (c *coordinator) failRemaining(staged *submission, err error) {
