@@ -9,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/miretskiy/dio/internal/intrusive"
 	"github.com/miretskiy/dio/ringo"
@@ -112,6 +113,12 @@ func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 		files: newFileTable(vfiles),
 	}
 	return c
+}
+
+// releaseAllSlots is test-only cleanup for cases that deliberately stop before
+// their fake ring produces final completions.
+func (c *coordinator) releaseAllSlots() {
+	clear(c.slots)
 }
 
 func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
@@ -280,9 +287,8 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 		t.Fatalf("run error: got %v want %v", cause, errSchedulerClosed)
 	}
 	staged := reverseSubmissions(s.closeStaging())
-	c.reap()
+	c.drainSlots()
 	c.failRemaining(staged, cause)
-	c.releaseAllSlots()
 
 	_, err := ticket.Wait()
 	if !errors.Is(err, errSchedulerClosed) {
@@ -390,10 +396,10 @@ func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 	}
 }
 
-func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
+func TestCleanupDrainsPlacedCompletionsBeforeFailingUnplacedWork(t *testing.T) {
 	ringErr := errors.New("ring failed")
 	ring := &fakeRingQueue{}
-	c := newTestCoordinator(2, 2, ring)
+	c := newTestCoordinator(1, 2, ring)
 	tickets, _ := acceptOps(&c,
 		VReadOp(0, make([]byte, 1), 0),
 		VReadOp(1, make([]byte, 1), 0),
@@ -401,9 +407,8 @@ func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
 	c.placeReady(false)
 	ring.complete(ring.handles[0], 1)
 
-	c.reap()
+	c.drainSlots()
 	c.failRemaining(nil, ringErr)
-	c.releaseAllSlots()
 
 	n, err := tickets[0].Wait()
 	if n != 1 || err != nil {
@@ -415,6 +420,47 @@ func TestCleanupReapsPostedCompletionsBeforeFailingRemaining(t *testing.T) {
 	}
 	if c.pending.Len() != 0 || len(c.slots) != 0 {
 		t.Fatalf("coordinator retained failed work: pending=%d slots=%d", c.pending.Len(), len(c.slots))
+	}
+}
+
+func TestDrainSlotsWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(1, 1, ring)
+	c.sched.signalShutdown(errSchedulerClosed)
+	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	c.placeReady(false)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ring.submitAndWaitFn = func(f *fakeRingQueue) {
+		close(entered)
+		<-release
+		f.complete(f.handles[0], -int32(syscall.ECANCELED))
+	}
+	drained := make(chan struct{})
+	go func() {
+		c.drainSlots()
+		close(drained)
+	}()
+
+	<-entered
+	select {
+	case <-drained:
+		t.Fatal("drain returned before the final completion")
+	default:
+	}
+
+	close(release)
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("drain did not return after the final completion")
+	}
+	if _, err := tickets[0].Wait(); !errors.Is(err, errSchedulerClosed) {
+		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
+	}
+	if c.pending.Len() != 0 || len(c.slots) != 0 {
+		t.Fatalf("coordinator retained drained work: pending=%d slots=%d", c.pending.Len(), len(c.slots))
 	}
 }
 

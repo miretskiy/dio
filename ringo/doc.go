@@ -82,9 +82,10 @@
 // eventually returns ErrFull. Ringo has no background reaper.
 //
 // A submit call may report both progress and an error. That error does not
-// return ownership of pushed operations to the caller. Ring.Close first tears
-// down the kernel ring, then releases pending operations and registered
-// resources.
+// return ownership of pushed operations to the caller. Ring.Close requires
+// every pushed operation to have reached a final completion and been reaped;
+// it returns ErrPending without changing the Ring otherwise. This avoids
+// treating asynchronous kernel ring teardown as an operation-lifetime barrier.
 //
 // # Operations and memory safety
 //
@@ -177,8 +178,8 @@
 // duplicate or already-consumed Ops panic when detected, with no post-panic
 // reuse guarantee. The variadic []Link backing array is not retained. Ringo has
 // no caller-visible Reset or pooling API. Its private scalar Read and Write
-// pools are released only after the final completion or kernel-ring teardown
-// and do not relax the permanent consumption rule.
+// pools are released only after the final completion and do not relax the
+// permanent consumption rule.
 //
 // # Completion and concurrency rules
 //

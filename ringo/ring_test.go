@@ -727,6 +727,23 @@ func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 	if _, err := set.Bind(make([]byte, 1)); err == nil {
 		t.Fatal("Bind accepted an unregistered buffer")
 	}
+
+	if _, err := ring.Submit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.Close(); !errors.Is(err, ErrPending) {
+		t.Fatalf("close retained operation: %v", err)
+	}
+	if ring.files == nil || ring.buffers == nil || len(set.buffers) != 1 {
+		t.Fatal("failed Close released registered resources")
+	}
+	fake.complete(handle, 16, 0)
+	if completions := collect(ring.Reap()); len(completions) != 1 {
+		t.Fatalf("final completions: got %d want 1", len(completions))
+	}
+	if err := ring.Close(); err != nil {
+		t.Fatalf("close idle ring: %v", err)
+	}
 }
 
 func TestFixedFilesUpdate(t *testing.T) {
@@ -789,26 +806,40 @@ func TestFixedFilesUpdate(t *testing.T) {
 	}
 }
 
-func TestCloseTearsDownKernelBeforeClearingReferences(t *testing.T) {
+func TestCloseRejectsPendingOperations(t *testing.T) {
 	ring, fake := newFakeRing(1)
 	set, err := ring.RegisterBuffers(make([]byte, 16))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ring.Push(Write(FileFD(fakeFile(12345)), make([]byte, 1), 0)); err != nil {
+	handle, err := ring.Push(Write(FileFD(fakeFile(12345)), make([]byte, 1), 0))
+	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := ring.Submit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.Close(); !errors.Is(err, ErrPending) {
+		t.Fatalf("close with pending operation: %v", err)
+	}
+	if fake.closed || ring.pending.Len() != 1 || ring.backend == nil ||
+		ring.buffers == nil || len(set.buffers) != 1 {
+		t.Fatal("failed Close changed ring ownership")
+	}
+
+	fake.complete(handle, 1, 0)
+	for range ring.Reap() {
+	}
 	fake.closeFn = func() {
-		if ring.pending.Len() != 1 || ring.buffers == nil || len(set.buffers) != 1 {
-			t.Fatal("Close cleared references before kernel teardown")
+		if ring.pending.Len() != 0 || ring.buffers == nil || len(set.buffers) != 1 {
+			t.Fatal("Close cleared resources before closing the idle ring")
 		}
 	}
 	if err := ring.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !fake.closed || ring.pending.Len() != 0 || ring.backend != nil ||
-		ring.buffers != nil || len(set.buffers) != 0 {
-		t.Fatal("Close did not release state after kernel teardown")
+	if !fake.closed || ring.backend != nil || ring.buffers != nil || len(set.buffers) != 0 {
+		t.Fatal("Close did not release idle ring state")
 	}
 	if err := ring.Close(); err != nil {
 		t.Fatalf("idempotent Close: %v", err)

@@ -251,11 +251,13 @@ for completion := range ring.Reap() {
 Handle. Referenced files, buffers, copied paths, and iovecs remain retained
 through the final CQE; multishot completions remain retained while their
 `More` flag is set. Fixed-file and fixed-buffer registrations remain owned
-until `Ring.Close`. Retention does not prevent access through another slice or
-pointer alias: callers must not modify memory the kernel may read or access
-memory the kernel may write while an operation is active. Callers also
-serialize calls on the same ring, avoid explicitly closing retained files,
-submit pushed work, reap completions, and handle short I/O.
+until `Ring.Close`. `Close` returns `ringo.ErrPending` without changing the ring
+if a pushed operation has not reached a final completion and been reaped.
+Retention does not prevent access through another slice or pointer alias:
+callers must not modify memory the kernel may read or access memory the kernel
+may write while an operation is active. Callers also serialize calls on the
+same ring, avoid explicitly closing retained files, submit pushed work, reap
+completions, and handle short I/O.
 
 ## Validation
 

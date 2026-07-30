@@ -238,11 +238,11 @@ func (s *URingScheduler) closeStaging() *submission {
 	return head
 }
 
-// Close stops the coordinator and releases ring resources. Work that has not
-// completed is failed with the scheduler-closed error. Close waits for the
-// coordinator goroutine, which may be blocked waiting for in-flight file I/O.
-// Close must be called exactly once. Callers must stop submitting first;
-// racing Close with Submit is not supported.
+// Close stops the coordinator and releases ring resources. Unplaced work is
+// failed with the scheduler-closed error. Placed work retains its resources
+// until its final completion; Close requests cancellation but may wait for
+// noncancelable in-flight file I/O. Close must be called exactly once. Callers
+// must stop submitting first; racing Close with Submit is not supported.
 func (s *URingScheduler) Close() error {
 	alreadyClosing := !s.signalShutdown(errSchedulerClosed)
 	if !alreadyClosing {
@@ -257,10 +257,12 @@ func (s *URingScheduler) Close() error {
 		}
 	}
 	s.wg.Wait()
-	err := s.ring.Close()
+	if err := s.ring.Close(); err != nil {
+		return err
+	}
 	s.registeredPool = nil
 	s.registeredBuffers = nil
-	return err
+	return nil
 }
 
 func (s *URingScheduler) signalShutdown(err error) bool {
@@ -370,11 +372,15 @@ func (s *URingScheduler) loop() {
 	c.files = newFileTable(s.config.vfiles)
 
 	cause := c.run()
-	s.signalShutdown(cause)
+	if s.signalShutdown(cause) {
+		// A coordinator error, rather than Close, initiated shutdown.
+		// Cancellation is best effort; draining final completions below is
+		// the ownership barrier.
+		_ = s.ring.CancelAll(time.Second)
+	}
 	staged := reverseSubmissions(s.closeStaging())
-	c.reap()
+	c.drainSlots()
 	c.failRemaining(staged, cause)
-	c.releaseAllSlots()
 }
 
 func (c *coordinator) run() error {
@@ -734,6 +740,24 @@ func (c *coordinator) reap() int {
 	return count
 }
 
+// drainSlots keeps every placed operation and its ticket alive until Ringo
+// yields the operation's final completion. Cancellation only shortens this
+// wait; an unsupported, timed-out, or otherwise failed cancellation does not
+// relax the ownership boundary.
+func (c *coordinator) drainSlots() {
+	for len(c.slots) != 0 {
+		if c.reap() != 0 {
+			continue
+		}
+		if err := c.submitAndWait(); err != nil {
+			// An enter error does not prove that previously submitted I/O has
+			// stopped. Keep the state and retry rather than completing tickets
+			// whose buffers may still be in use.
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func (c *coordinator) reapOne(completion ringCompletion) {
 	slot, ok := c.slots[completion.handle]
 	if !ok {
@@ -834,10 +858,6 @@ func (c *coordinator) finishOperation(handle intrusive.Handle, op *Op, n int, er
 		c.pending.Remove(handle)
 		root.done.Done()
 	}
-}
-
-func (c *coordinator) releaseAllSlots() {
-	clear(c.slots)
 }
 
 func (c *coordinator) failRemaining(staged *submission, err error) {

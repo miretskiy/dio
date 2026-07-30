@@ -22,6 +22,9 @@ var (
 	ErrFull = errors.New("ringo: ring is full")
 	// ErrClosed reports use of a closed Ring.
 	ErrClosed = errors.New("ringo: ring is closed")
+	// ErrPending reports that Close cannot release a Ring that still owns
+	// operations awaiting final completion reaping.
+	ErrPending = errors.New("ringo: ring has pending operations")
 	// ErrWrongRing reports a ring-scoped handle or resource used with another
 	// Ring.
 	ErrWrongRing = errors.New("ringo: resource belongs to another ring")
@@ -433,18 +436,19 @@ func (ring *Ring) CancelAll(timeout time.Duration) error {
 	return err
 }
 
-// Close tears down the kernel ring before releasing any pending operation or
-// registered-resource references. Close is idempotent.
+// Close releases an idle Ring. Every pushed operation must have reached a
+// final completion and been reaped first. If operations remain, Close returns
+// ErrPending without changing the Ring. Close is idempotent after success.
 // liburing: io_uring_queue_exit - https://man7.org/linux/man-pages/man3/io_uring_queue_exit.3.html
 func (ring *Ring) Close() error {
 	if ring.closed {
 		return nil
 	}
+	if ring.pending.Len() != 0 {
+		return ErrPending
+	}
 	ring.closed = true
 	err := ring.backend.queueExit()
-	for handle := range ring.pending.All() {
-		ring.release(handle)
-	}
 	if ring.buffers != nil {
 		clear(ring.buffers.buffers)
 		ring.buffers.buffers = nil
