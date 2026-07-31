@@ -156,9 +156,13 @@ func makeIovecs(
 	}
 	count := nonemptyBuffers(owned)
 	var iovecs []syscall.Iovec
-	if count <= len(inlineIovecs) {
+	switch {
+	case count == 0:
+		// Leave iovecs nil so the SQE encodes address 0 rather than the
+		// unspecified address unsafe.SliceData yields for a zero-capacity slice.
+	case count <= len(inlineIovecs):
 		iovecs = inlineIovecs[:0:count]
-	} else {
+	default:
 		iovecs = make([]syscall.Iovec, 0, count)
 	}
 	for _, buffer := range owned {

@@ -52,10 +52,16 @@ type workItem struct {
 	writeGroup writeGroupCompletion
 }
 
-type completionFn func(*coordinator, *ringSlot, int, error)
+// completionFn takes its slot by value. Passing a pointer would force the
+// coordinator's copy to escape through the indirect call, costing one heap
+// allocation per completion, and no implementation mutates it.
+type completionFn func(*coordinator, ringSlot, int, error)
 
-// ringSlot holds state that must remain live until an SQE completes.
+// ringSlot holds state that must remain live until an SQE completes. handle
+// identifies the operation occupying this table entry; a zero handle marks the
+// entry free.
 type ringSlot struct {
+	handle   ringHandle
 	work     intrusive.Handle
 	op       *Op
 	complete completionFn
@@ -88,6 +94,11 @@ type URingScheduler struct {
 	wakeup            chan struct{}
 
 	stop atomic.Pointer[error]
+
+	// drainErr records that the coordinator gave up waiting for placed
+	// operations. It is written before wg.Done and read after wg.Wait, so the
+	// WaitGroup supplies the ordering.
+	drainErr error
 
 	wg sync.WaitGroup
 }
@@ -238,17 +249,29 @@ func (s *URingScheduler) closeStaging() *submission {
 	return head
 }
 
+// shutdownCancelTimeout bounds each synchronous cancellation attempt during
+// shutdown. Cancellation is best effort, so exceeding it is not an error.
+const shutdownCancelTimeout = time.Second
+
 // Close stops the coordinator and releases ring resources. Unplaced work is
 // failed with the scheduler-closed error. Placed work retains its resources
 // until its final completion; Close requests cancellation but may wait for
 // noncancelable in-flight file I/O. Close must be called exactly once. Callers
 // must stop submitting first; racing Close with Submit is not supported.
+//
+// Close returns an error if the ring stopped reporting completions while
+// operations were still placed. Tickets for that work report the same error,
+// and Ringo permanently retains those operands because the kernel may still be
+// using them. A caller that registered a DMA slab must not close it in that
+// case, and must not reuse the buffers involved.
 func (s *URingScheduler) Close() error {
 	alreadyClosing := !s.signalShutdown(errSchedulerClosed)
 	if !alreadyClosing {
 		// ANY ignores the match key; ALL cancels every request. Bound the
 		// synchronous cancellation call; Close still waits for the coordinator.
-		_ = s.ring.CancelAll(time.Second)
+		// This attempt is what breaks a coordinator out of a blocking
+		// SubmitAndWait; the coordinator cancels again before it drains.
+		_ = s.ring.CancelAll(shutdownCancelTimeout)
 
 		// The coordinator may instead be idle on the userspace doorbell.
 		select {
@@ -257,7 +280,10 @@ func (s *URingScheduler) Close() error {
 		}
 	}
 	s.wg.Wait()
-	if err := s.ring.Close(); err != nil {
+	// Ringo's Close always releases the ring. If the drain gave up, it retains
+	// the operands of whatever is still in flight and reports ringo.ErrPending,
+	// so the registered DMA slab must outlive this call in that case.
+	if err := errors.Join(s.drainErr, s.ring.Close()); err != nil {
 		return err
 	}
 	s.registeredPool = nil
@@ -284,9 +310,13 @@ type ringQueue interface {
 	Reap() iter.Seq[ringCompletion]
 }
 
+// ringHandle pairs Ringo's opaque identity with the dense slot index it exposes.
+// The index addresses the coordinator's slot table directly, which keeps a hash
+// off the completion path; the identity distinguishes the slot's current
+// occupant from a stale entry left by a previous one.
 type ringHandle struct {
 	handle ringo.Handle
-	testID uint64
+	index  int
 }
 
 type ringCompletion struct {
@@ -297,14 +327,18 @@ type ringCompletion struct {
 
 type liveRingQueue struct {
 	ring *ringo.Ring
+	// wrapped is scratch for one PushLinked result. Callers copy the handles
+	// into c.slots before the next placement, so reusing it avoids an
+	// allocation per linked chain, and every durable write is one.
+	wrapped []ringHandle
 }
 
-func (queue liveRingQueue) Push(op ringo.Op) (ringHandle, error) {
+func (queue *liveRingQueue) Push(op ringo.Op) (ringHandle, error) {
 	handle, err := queue.ring.Push(op)
-	return ringHandle{handle: handle}, err
+	return ringHandle{handle: handle, index: handle.Index()}, err
 }
 
-func (queue liveRingQueue) PushLinked(
+func (queue *liveRingQueue) PushLinked(
 	first ringo.Op,
 	link ringo.Link,
 	other ...ringo.Link,
@@ -313,22 +347,27 @@ func (queue liveRingQueue) PushLinked(
 	if err != nil {
 		return nil, err
 	}
-	wrapped := make([]ringHandle, len(handles))
-	for i := range handles {
-		wrapped[i].handle = handles[i]
+	queue.wrapped = queue.wrapped[:0]
+	for _, handle := range handles {
+		queue.wrapped = append(
+			queue.wrapped, ringHandle{handle: handle, index: handle.Index()},
+		)
 	}
-	return wrapped, nil
+	return queue.wrapped, nil
 }
 
-func (queue liveRingQueue) SubmitAndWait(minComplete int) (int, error) {
+func (queue *liveRingQueue) SubmitAndWait(minComplete int) (int, error) {
 	return queue.ring.SubmitAndWait(minComplete)
 }
 
-func (queue liveRingQueue) Reap() iter.Seq[ringCompletion] {
+func (queue *liveRingQueue) Reap() iter.Seq[ringCompletion] {
 	return func(yield func(ringCompletion) bool) {
 		for completion := range queue.ring.Reap() {
 			if !yield(ringCompletion{
-				handle: ringHandle{handle: completion.Handle},
+				handle: ringHandle{
+					handle: completion.Handle,
+					index:  completion.Handle.Index(),
+				},
 				result: completion.Result,
 				err:    completion.Err,
 			}) {
@@ -342,9 +381,12 @@ type coordinator struct {
 	sched *URingScheduler
 	ring  ringQueue
 
-	// slots maps Ringo's opaque completion identities back to scheduler-owned
-	// logical completion state.
-	slots map[ringHandle]ringSlot
+	// slots holds scheduler-owned completion state indexed by ringHandle.index.
+	// Entries are addressed, not hashed, so a completion costs an array access.
+	// An occupied entry carries the handle it belongs to.
+	slots []ringSlot
+	// placed counts occupied entries in slots.
+	placed int
 
 	pending intrusive.List[workItem]
 	// ready contains pending handles eligible for placement. Work waiting for
@@ -356,6 +398,9 @@ type coordinator struct {
 	// writeBuffers is coordinator-owned scratch for translating a coalesced
 	// write group. Ringo snapshots the slice headers into the resulting Op.
 	writeBuffers [][]byte
+	// links is coordinator-owned scratch for one linked chain. PushLinked does
+	// not retain the slice, so it can be reused across placements.
+	links []ringo.Link
 
 	files        fileTable
 	nextSequence uint64
@@ -366,20 +411,28 @@ func (s *URingScheduler) loop() {
 
 	c := coordinator{
 		sched: s,
-		ring:  liveRingQueue{ring: s.ring},
-		slots: make(map[ringHandle]ringSlot, s.config.ringDepth),
+		ring:  &liveRingQueue{ring: s.ring},
+		slots: make([]ringSlot, s.config.ringDepth),
 	}
 	c.files = newFileTable(s.config.vfiles)
 
 	cause := c.run()
-	if s.signalShutdown(cause) {
-		// A coordinator error, rather than Close, initiated shutdown.
-		// Cancellation is best effort; draining final completions below is
-		// the ownership barrier.
-		_ = s.ring.CancelAll(time.Second)
-	}
+	s.signalShutdown(cause)
+	// Cancellation is best effort and it races submission: Close cancels before
+	// it waits for the coordinator, so a batch placed in between was never
+	// offered to that cancellation, and a coordinator-initiated shutdown has not
+	// cancelled at all. Ask once more now that placement has stopped. Draining
+	// final completions below remains the ownership barrier.
+	_ = s.ring.CancelAll(shutdownCancelTimeout)
 	staged := reverseSubmissions(s.closeStaging())
-	c.drainSlots()
+	if err := c.drainSlots(); err != nil {
+		// Placed work never reported, and the coordinator cannot prove whether
+		// the kernel is still using its operands. Report that to whoever holds
+		// those tickets and to Close.
+		s.drainErr = err
+		c.failWork(staged, cause, err)
+		return
+	}
 	c.failRemaining(staged, cause)
 }
 
@@ -398,11 +451,11 @@ func (c *coordinator) run() error {
 		c.placeReady(c.sched.config.coalescing)
 
 		// After placement, pending work requires at least one occupied ring slot.
-		if err := buildutil.Assert(len(c.slots) > 0 || c.pending.Len() == 0); err != nil {
+		if err := buildutil.Assert(c.placed > 0 || c.pending.Len() == 0); err != nil {
 			return fmt.Errorf("iosched: pending work has no runnable or in-flight operation: %w", err)
 		}
 
-		if len(c.slots) > 0 {
+		if c.placed > 0 {
 			if err := c.submitAndWait(); err != nil {
 				return fmt.Errorf("iosched: ring error: %w", err)
 			}
@@ -488,7 +541,7 @@ func (c *coordinator) placeReady(coalesce bool) {
 				need++
 			}
 		}
-		if need > int(c.sched.config.ringDepth)-len(c.slots) {
+		if need > int(c.sched.config.ringDepth)-c.placed {
 			return
 		}
 
@@ -566,24 +619,24 @@ func (c *coordinator) placeChain(handle intrusive.Handle) {
 		if err != nil {
 			panic(fmt.Sprintf("iosched: Ringo rejected a validated operation: %v", err))
 		}
-		c.slots[ringHandle] = ringSlot{work: handle, op: root, complete: completeNormal}
+		c.place(ringHandle, ringSlot{work: handle, op: root, complete: completeNormal})
 		return
 	}
 
-	links := make([]ringo.Link, 0, root.opCount()-1)
+	c.links = c.links[:0]
 	for op := root; op.linked != nil; op = op.linked {
-		links = append(
-			links,
+		c.links = append(
+			c.links,
 			ringo.Then(ringoLinkType(op), c.translateOp(op.linked)),
 		)
 	}
-	ringHandles, err := c.ring.PushLinked(first, links[0], links[1:]...)
+	ringHandles, err := c.ring.PushLinked(first, c.links[0], c.links[1:]...)
 	if err != nil {
 		panic(fmt.Sprintf("iosched: Ringo rejected a validated chain: %v", err))
 	}
 	op := root
 	for _, ringHandle := range ringHandles {
-		c.slots[ringHandle] = ringSlot{work: handle, op: op, complete: completeNormal}
+		c.place(ringHandle, ringSlot{work: handle, op: op, complete: completeNormal})
 		op = op.linked
 	}
 }
@@ -629,7 +682,7 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 		if err != nil {
 			panic(fmt.Sprintf("iosched: Ringo rejected a validated write: %v", err))
 		}
-		c.slots[ringHandle] = ringSlot{work: leader, op: firstOp, complete: complete}
+		c.place(ringHandle, ringSlot{work: leader, op: firstOp, complete: complete})
 		return
 	}
 
@@ -641,10 +694,10 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 	if err != nil {
 		panic(fmt.Sprintf("iosched: Ringo rejected a validated durable write: %v", err))
 	}
-	c.slots[ringHandles[0]] = ringSlot{work: leader, op: firstOp, complete: complete}
-	c.slots[ringHandles[1]] = ringSlot{
+	c.place(ringHandles[0], ringSlot{work: leader, op: firstOp, complete: complete})
+	c.place(ringHandles[1], ringSlot{
 		work: leader, op: firstOp, complete: completeDurableWrite,
-	}
+	})
 }
 
 func (c *coordinator) translateOp(op *Op) ringo.Op {
@@ -716,7 +769,8 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 func (c *coordinator) submitAndWait() error {
 	_, err := c.ring.SubmitAndWait(1)
 	switch {
-	case err == nil, errors.Is(err, syscall.EINTR):
+	case err == nil:
+		// Ringo retries EINTR itself, so it never reaches here.
 		return nil
 	case errors.Is(err, syscall.EAGAIN), errors.Is(err, syscall.EBUSY):
 		// io_uring_enter documents both errors as temporary resource
@@ -740,27 +794,67 @@ func (c *coordinator) reap() int {
 	return count
 }
 
+// drainStallLimit bounds how many consecutive drain rounds may reap nothing
+// before the coordinator stops waiting. On a usable ring SubmitAndWait blocks
+// until at least one completion is available, so a round that reaps nothing
+// means the ring can no longer report: it has recorded a fault, or entering it
+// keeps failing. Neither clears on its own. Tests lower these.
+var (
+	drainStallLimit = 1024
+	drainStallDelay = time.Millisecond
+)
+
 // drainSlots keeps every placed operation and its ticket alive until Ringo
 // yields the operation's final completion. Cancellation only shortens this
 // wait; an unsupported, timed-out, or otherwise failed cancellation does not
 // relax the ownership boundary.
-func (c *coordinator) drainSlots() {
-	for len(c.slots) != 0 {
+//
+// It returns an error only when the ring stops reporting completions
+// altogether, leaving c.slots populated. That is not recoverable: the
+// coordinator cannot tell an operation whose completion was lost from one still
+// running, so it can prove nothing about the operands either still holds.
+func (c *coordinator) drainSlots() error {
+	stalls := 0
+	for c.placed != 0 {
 		if c.reap() != 0 {
+			stalls = 0
 			continue
 		}
-		if err := c.submitAndWait(); err != nil {
-			// An enter error does not prove that previously submitted I/O has
-			// stopped. Keep the state and retry rather than completing tickets
-			// whose buffers may still be in use.
-			time.Sleep(time.Millisecond)
+		err := c.submitAndWait()
+		stalls++
+		if stalls >= drainStallLimit {
+			return fmt.Errorf(
+				"iosched: %d io_uring operations stopped reporting completions "+
+					"after %d attempts: %w",
+				c.placed, stalls, err,
+			)
 		}
+		// An enter error does not prove that previously submitted I/O has
+		// stopped, so keep the state and retry rather than completing tickets
+		// whose buffers may still be in use.
+		time.Sleep(drainStallDelay)
 	}
+	return nil
+}
+
+// place records scheduler state for a queued operation. Ringo bounds live
+// operations by the ring depth, so the table grows at most that far; a fake ring
+// in tests may hand out sparser indices.
+func (c *coordinator) place(handle ringHandle, slot ringSlot) {
+	if handle.index >= len(c.slots) {
+		c.slots = append(c.slots, make([]ringSlot, handle.index+1-len(c.slots))...)
+	}
+	slot.handle = handle
+	c.slots[handle.index] = slot
+	c.placed++
 }
 
 func (c *coordinator) reapOne(completion ringCompletion) {
-	slot, ok := c.slots[completion.handle]
-	if !ok {
+	var slot ringSlot
+	if completion.handle.index < len(c.slots) {
+		slot = c.slots[completion.handle.index]
+	}
+	if slot.handle != completion.handle {
 		panic(fmt.Sprintf(
 			"iosched: Ringo returned unknown completion handle with error %v",
 			completion.err,
@@ -773,26 +867,27 @@ func (c *coordinator) reapOne(completion ringCompletion) {
 		}
 	}
 
-	slot.complete(c, &slot, completion.result, err)
-	delete(c.slots, completion.handle)
+	slot.complete(c, slot, completion.result, err)
+	c.slots[completion.handle.index] = ringSlot{}
+	c.placed--
 }
 
-func completeNormal(c *coordinator, slot *ringSlot, n int, err error) {
+func completeNormal(c *coordinator, slot ringSlot, n int, err error) {
 	c.finishOperation(slot.work, slot.op, n, err)
 }
 
-func completeWrite(c *coordinator, slot *ringSlot, n int, err error) {
+func completeWrite(c *coordinator, slot ringSlot, n int, err error) {
 	c.finishWrite(slot.work, n, err, nil)
 }
 
-func recordDurableWrite(c *coordinator, slot *ringSlot, n int, err error) {
+func recordDurableWrite(c *coordinator, slot ringSlot, n int, err error) {
 	completion := &c.pending.Value(slot.work).writeGroup
 	completion.n = n
 	completion.err = err
 	completion.distribute(c, n, err, nil, recordWriteResult)
 }
 
-func completeDurableWrite(c *coordinator, slot *ringSlot, _ int, syncErr error) {
+func completeDurableWrite(c *coordinator, slot ringSlot, _ int, syncErr error) {
 	completion := &c.pending.Value(slot.work).writeGroup
 	c.finishWrite(slot.work, completion.n, completion.err, syncErr)
 }
@@ -860,19 +955,33 @@ func (c *coordinator) finishOperation(handle intrusive.Handle, op *Op, n int, er
 	}
 }
 
+// failRemaining completes every ticket the coordinator still owns with err.
 func (c *coordinator) failRemaining(staged *submission, err error) {
+	c.failWork(staged, err, err)
+}
+
+// failWork completes every ticket the coordinator still owns. Work that never
+// reached the ring fails with unplaced; work whose SQEs were placed but never
+// reported fails with placed, which the caller must treat as an unknown outcome
+// rather than a clean failure. The two differ only when draining gave up,
+// because a successful drain leaves no placed work behind.
+func (c *coordinator) failWork(staged *submission, unplaced, placed error) {
 	for handle, work := range c.pending.All() {
 		if work.ready != 0 {
 			c.ready.Remove(work.ready)
 		}
 		root := work.root
+		reason := unplaced
+		if work.inflight {
+			reason = placed
+		}
 		c.pending.Remove(handle)
-		completeFailed(root, err)
+		completeFailed(root, reason)
 	}
 	for staged != nil {
 		next := staged.staged
 		staged.staged = nil
-		completeFailed(&staged.root, err)
+		completeFailed(&staged.root, unplaced)
 		staged = next
 	}
 }

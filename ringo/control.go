@@ -23,9 +23,16 @@ func encodePollMaskForEndian(mask uint32, bigEndian bool) int32 {
 	return int32(mask)
 }
 
+// ownedTimespec copies spec into the kernel's __kernel_timespec, whose fields
+// are 64-bit on every architecture. syscall.Timespec is 32-bit on 32-bit
+// Linux, so an SQE must never point at one directly.
+func ownedTimespec(spec syscall.Timespec) rawTimespec {
+	return rawTimespec{Sec: int64(spec.Sec), Nsec: int64(spec.Nsec)}
+}
+
 type timeoutOp struct {
 	opBase
-	spec  syscall.Timespec
+	spec  rawTimespec
 	count uint32
 	flags TimeoutFlags
 }
@@ -57,12 +64,12 @@ func (op *timeoutOp) prepare(sqe *rawSQE) {
 // Timeout constructs IORING_OP_TIMEOUT and copies spec.
 // liburing: io_uring_prep_timeout - https://man7.org/linux/man-pages/man3/io_uring_prep_timeout.3.html
 func Timeout(spec syscall.Timespec, count uint32, flags TimeoutFlags) Op {
-	return &timeoutOp{spec: spec, count: count, flags: flags}
+	return &timeoutOp{spec: ownedTimespec(spec), count: count, flags: flags}
 }
 
 type linkTimeoutOp struct {
 	opBase
-	spec  syscall.Timespec
+	spec  rawTimespec
 	flags TimeoutFlags
 }
 
@@ -92,7 +99,7 @@ func (op *linkTimeoutOp) prepare(sqe *rawSQE) {
 // copies spec.
 // liburing: io_uring_prep_link_timeout - https://man7.org/linux/man-pages/man3/io_uring_prep_link_timeout.3.html
 func LinkTimeout(spec syscall.Timespec, flags TimeoutFlags) Op {
-	return &linkTimeoutOp{spec: spec, flags: flags}
+	return &linkTimeoutOp{spec: ownedTimespec(spec), flags: flags}
 }
 
 type timeoutRemoveOp struct {
@@ -124,7 +131,7 @@ func TimeoutRemove(target Handle) Op {
 
 type timeoutUpdateOp struct {
 	opBase
-	spec   syscall.Timespec
+	spec   rawTimespec
 	target Handle
 	flags  TimeoutUpdateFlags
 }
@@ -157,7 +164,9 @@ func TimeoutUpdate(
 	target Handle,
 	flags TimeoutUpdateFlags,
 ) Op {
-	return &timeoutUpdateOp{spec: spec, target: target, flags: flags}
+	return &timeoutUpdateOp{
+		spec: ownedTimespec(spec), target: target, flags: flags,
+	}
 }
 
 type cancelOp struct {

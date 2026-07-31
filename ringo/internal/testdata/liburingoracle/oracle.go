@@ -19,6 +19,15 @@ static void oracle_prep_nop(struct io_uring_sqe *sqe) {
 	io_uring_prep_nop(sqe);
 }
 
+// oracle_prep_nop_linked is a nop carrying the link flag liburing's
+// IOSQE_IO_LINK / IOSQE_IO_HARDLINK name, which is how a chain records the edge
+// to its successor.
+static void oracle_prep_nop_linked(struct io_uring_sqe *sqe, int hard) {
+	clear_sqe(sqe);
+	io_uring_prep_nop(sqe);
+	io_uring_sqe_set_flags(sqe, hard ? IOSQE_IO_HARDLINK : IOSQE_IO_LINK);
+}
+
 static void oracle_prep_read(struct io_uring_sqe *sqe, int fd, void *buf,
 	uint32_t nbytes, uint64_t offset) {
 	clear_sqe(sqe);
@@ -205,6 +214,19 @@ type SQE [64]byte
 func PrepareNop() SQE {
 	var sqe SQE
 	C.oracle_prep_nop((*C.struct_io_uring_sqe)(unsafe.Pointer(&sqe)))
+	return sqe
+}
+
+// PrepareNopLinked returns a nop carrying liburing's soft or hard link flag.
+func PrepareNopLinked(hard bool) SQE {
+	var sqe SQE
+	var hardFlag C.int
+	if hard {
+		hardFlag = 1
+	}
+	C.oracle_prep_nop_linked(
+		(*C.struct_io_uring_sqe)(unsafe.Pointer(&sqe)), hardFlag,
+	)
 	return sqe
 }
 

@@ -6,137 +6,191 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
 	"github.com/miretskiy/dio/internal/intrusive"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
-type fakeBackend struct {
-	capacity uint32
-	sqes     []rawSQE
-	sqHead   int
-	cqes     []rawCQE
-	cqHead   int
+// alignedBytes returns size bytes with 8-byte alignment, which the uint32 and
+// rawCQE pointers bound into ring memory require.
+func alignedBytes(size uintptr) []byte {
+	words := make([]uint64, (size+7)/8)
+	return unsafe.Slice(
+		(*byte)(unsafe.Pointer(unsafe.SliceData(words))), len(words)*8,
+	)
+}
 
-	submitted uint
-	submitErr error
+// newHeapRing builds a real rawRing over heap memory instead of a mapping.
+// bindPointers only needs bytes and a layout, so every queue operation --
+// getSQE, flushSQ, sqSpaceLeft, cqReady, peekCQE, advanceCQ -- runs its
+// production arithmetic here, including masking and wraparound. Only the
+// syscall boundary is stubbed, through rawRing.hooks.
+//
+// The offsets below need not match the kernel's, only be self-consistent, since
+// the code under test reads them from rawParams exactly as io_uring_setup
+// reports them. entries and cqEntries must be powers of two.
+func newHeapRing(entries, cqEntries uint32) *rawRing {
+	params := rawParams{
+		Sq_entries: entries,
+		Cq_entries: cqEntries,
+		Flags:      uint32(rawSetupNoSQArray),
+		Sq_off: rawSQOffsets{
+			Head: 0, Tail: 4, Ring_mask: 8, Ring_entries: 12, Flags: 16,
+		},
+		Cq_off: rawCQOffsets{
+			Head: 20, Tail: 24, Ring_mask: 28, Ring_entries: 32, Cqes: 64,
+		},
+	}
+	cqeSize := unsafe.Sizeof(rawCQE{})
+	ring := &rawRing{fd: -1, flags: rawSetupFlags(params.Flags)}
+	ring.sq.ringMemory = alignedBytes(
+		uintptr(params.Cq_off.Cqes) + uintptr(cqEntries)*cqeSize,
+	)
+	ring.cq.ringMemory = ring.sq.ringMemory
+	ring.sq.sqeSize = unsafe.Sizeof(rawSQE{})
+	ring.sq.sqeMemory = alignedBytes(uintptr(entries) * ring.sq.sqeSize)
+	ring.cq.cqeSize = cqeSize
+	ring.bindPointers(&params)
+
+	*ring.sq.ringMask = entries - 1
+	*ring.sq.ringEntries = entries
+	*ring.cq.ringMask = cqEntries - 1
+	return ring
+}
+
+// testTransport stubs the syscall boundary of a heap-backed rawRing and lets a
+// test post completions the way the kernel does.
+type testTransport struct {
+	raw *rawRing
+
+	submitErrno  syscall.Errno
+	submitErrnos []syscall.Errno
+	submitCalls  int
 
 	registeredBuffers []syscall.Iovec
 	registeredFiles   uint32
 	updatedFileOffset uint32
 	cancel            *rawSyncCancelReg
 	registerOpcode    rawRegisterOpcode
-	registerArgument  unsafe.Pointer
 	registerCount     uint32
 	registerResult    uint
 	registerErrno     syscall.Errno
-	closeFn           func()
-	closed            bool
+
+	closeFn  func()
+	closed   bool
+	unmapped bool
 }
 
-func (fake *fakeBackend) sqCapacity() uint32 {
-	return fake.capacity
-}
-
-func (fake *fakeBackend) sqSpaceLeft() uint32 {
-	return fake.capacity - uint32(len(fake.sqes)-fake.sqHead)
-}
-
-func (fake *fakeBackend) getSQE() *rawSQE {
-	if fake.sqSpaceLeft() == 0 {
-		return nil
-	}
-	fake.sqes = append(fake.sqes, rawSQE{})
-	return &fake.sqes[len(fake.sqes)-1]
-}
-
-func (fake *fakeBackend) submitAndWait(uint32) (uint, error) {
-	submitted := uint(len(fake.sqes) - fake.sqHead)
-	fake.sqHead = len(fake.sqes)
-	if fake.submitted != 0 {
-		submitted = fake.submitted
-	}
-	return submitted, fake.submitErr
-}
-
-func (fake *fakeBackend) cqReady() uint32 {
-	return uint32(len(fake.cqes) - fake.cqHead)
-}
-
-func (fake *fakeBackend) peekCQE() *rawCQE {
-	if fake.cqHead == len(fake.cqes) {
-		return nil
-	}
-	return &fake.cqes[fake.cqHead]
-}
-
-func (fake *fakeBackend) advanceCQ(count uint32) {
-	fake.cqHead += int(count)
-}
-
-func (fake *fakeBackend) registerBuffers(iovecs []syscall.Iovec) (uint, error) {
-	fake.registeredBuffers = append([]syscall.Iovec(nil), iovecs...)
-	return 0, nil
-}
-
-func (fake *fakeBackend) registerFilesSparse(count uint32) (uint, error) {
-	fake.registeredFiles = count
-	return 0, nil
-}
-
-func (fake *fakeBackend) registerSyncCancel(cancel *rawSyncCancelReg) (uint, error) {
-	copy := *cancel
-	fake.cancel = &copy
-	return 0, nil
-}
-
-func (fake *fakeBackend) register(
-	opcode rawRegisterOpcode,
-	argument unsafe.Pointer,
-	count uint32,
+func (transport *testTransport) enter(
+	submitted, _ uint32, _ rawEnterFlags,
 ) (uint, syscall.Errno) {
-	fake.registerOpcode = opcode
-	fake.registerArgument = argument
-	fake.registerCount = count
-	if opcode == rawRegisterFilesUpdate {
-		update := (*rawFilesUpdate)(argument)
-		fake.updatedFileOffset = update.Offset
+	transport.submitCalls++
+	errno := transport.submitErrno
+	if len(transport.submitErrnos) != 0 {
+		errno = transport.submitErrnos[0]
+		transport.submitErrnos = transport.submitErrnos[1:]
 	}
-	return fake.registerResult, fake.registerErrno
+	if errno != 0 {
+		return 0, errno
+	}
+	// Consume the published entries the way the kernel does, so submission
+	// capacity is released and the queues genuinely wrap.
+	head := transport.raw.sq.head
+	atomic.StoreUint32(head, atomic.LoadUint32(head)+submitted)
+	return uint(submitted), 0
 }
 
-func (fake *fakeBackend) queueExit() error {
-	if fake.closeFn != nil {
-		fake.closeFn()
+func (transport *testTransport) register(
+	opcode rawRegisterOpcode, argument unsafe.Pointer, count uint32,
+) (uint, syscall.Errno) {
+	transport.registerOpcode = opcode
+	transport.registerCount = count
+	switch opcode {
+	case rawRegisterFilesUpdate:
+		transport.updatedFileOffset = (*rawFilesUpdate)(argument).Offset
+	case rawRegisterBuffers:
+		transport.registeredBuffers = append(
+			[]syscall.Iovec(nil),
+			unsafe.Slice((*syscall.Iovec)(argument), count)...,
+		)
+	case rawRegisterFiles2:
+		transport.registeredFiles = (*rawRsrcRegister)(argument).Nr
+	case rawRegisterSyncCancel:
+		transport.cancel = new(rawSyncCancelReg)
+		*transport.cancel = *(*rawSyncCancelReg)(argument)
 	}
-	fake.closed = true
-	return nil
+	return transport.registerResult, transport.registerErrno
 }
 
-func (fake *fakeBackend) complete(
-	handle Handle,
-	result int32,
-	flags rawCQEFlags,
+// complete posts a completion for handle exactly as the kernel would: it writes
+// the entry at the masked tail and publishes the new tail.
+func (transport *testTransport) complete(
+	handle Handle, result int32, flags rawCQEFlags,
 ) {
-	fake.cqes = append(fake.cqes, rawCQE{
-		Data:  uint64(handle.slot),
-		Res:   result,
-		Flags: uint32(flags),
-	})
+	transport.completeIdentity(uint64(handle.slot), result, flags)
 }
 
-func newFakeRing(depth int) (*Ring, *fakeBackend) {
-	fake := &fakeBackend{capacity: uint32(depth)}
+// completeIdentity posts a completion carrying an arbitrary user_data, which is
+// how a test reaches identities the kernel would never produce.
+func (transport *testTransport) completeIdentity(
+	userData uint64, result int32, flags rawCQEFlags,
+) {
+	cq := &transport.raw.cq
+	tail := atomic.LoadUint32(cq.tail)
+	entry := (*rawCQE)(unsafe.Add(
+		cq.cqeBase, uintptr(tail&*cq.ringMask)*cq.cqeSize,
+	))
+	*entry = rawCQE{Data: userData, Res: result, Flags: uint32(flags)}
+	atomic.StoreUint32(cq.tail, tail+1)
+}
+
+// sqe returns the submission queue entry the Ring wrote at index.
+func (transport *testTransport) sqe(index int) rawSQE {
+	sq := &transport.raw.sq
+	return *(*rawSQE)(unsafe.Add(
+		unsafe.Pointer(unsafe.SliceData(sq.sqeMemory)),
+		uintptr(uint32(index)&*sq.ringMask)*sq.sqeSize,
+	))
+}
+
+// queued reports how many entries the Ring has written into the submission
+// queue over its lifetime.
+func (transport *testTransport) queued() uint32 {
+	return transport.raw.sq.sqeTail
+}
+
+// reaped reports how many completions the Ring has consumed.
+func (transport *testTransport) reaped() uint32 {
+	return atomic.LoadUint32(transport.raw.cq.head)
+}
+
+func newFakeRing(depth int) (*Ring, *testTransport) {
+	raw := newHeapRing(uint32(depth), uint32(depth)*2)
+	transport := &testTransport{raw: raw}
+	raw.hooks = &ringHooks{
+		enter:    transport.enter,
+		register: transport.register,
+		closeDescriptor: func() error {
+			if transport.closeFn != nil {
+				transport.closeFn()
+			}
+			transport.closed = true
+			return nil
+		},
+		releaseMappings: func() { transport.unmapped = true },
+	}
 	ring := &Ring{
-		backend: fake,
+		backend: raw,
 		id:      nextRingID.Add(1),
 		pending: intrusive.MakeFixedList[pendingSlot](depth),
 	}
-	return ring, fake
+	return ring, transport
 }
 
 func TestSetupOptionsMapToKernelParameters(t *testing.T) {
@@ -179,53 +233,70 @@ func fakeFile(fd uintptr) *os.File {
 	return os.NewFile(fd, "ringo-test")
 }
 
-func TestPushRetainsStableOperationStorage(t *testing.T) {
-	ring, fake := newFakeRing(4)
-	file := fakeFile(12345)
-	handle, err := pushLocalBuffer(ring, file)
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestRawRingQueueArithmetic drives the transport's index math directly, past a
+// full wrap of both queues. A live kernel only reaches this after tens of
+// thousands of operations, so the integration tests never do.
+func TestRawRingQueueArithmetic(t *testing.T) {
+	const entries = 4
+	raw := newHeapRing(entries, entries*2)
+	transport := &testTransport{raw: raw}
+	raw.hooks = &ringHooks{enter: transport.enter}
 
-	growStack(32)
-	runtime.GC()
+	require.Equal(t, uint32(entries), raw.sqCapacity())
+	require.Equal(t, uint32(entries), raw.sqSpaceLeft())
 
-	pending := ring.pending.Value(handle.slot)
-	read := pending.op.(*readOp)
-	buffer := read.buffer
-	if got, want := fake.sqes[0].Addr, uint64(slicePtr(buffer)); got != want {
-		t.Fatalf("encoded buffer address moved: got %#x want %#x", got, want)
-	}
-	if read.fd.file != file || buffer[0] != 42 {
-		t.Fatal("pushed operation did not retain its file and buffer")
-	}
+	// Three laps, so both the submission and completion indices wrap.
+	for lap := range 3 * entries {
+		require.Equal(t, uint32(entries), raw.sqSpaceLeft(), "lap %d", lap)
 
-	open := OpenAt(BorrowedFD(-100), "stable-name", 0, 0)
-	openHandle, err := ring.Push(open)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pushedOpen := ring.pending.Value(openHandle.slot)
-	path := pushedOpen.op.(*openAtOp).path
-	if got, want := fake.sqes[1].Addr, uint64(slicePtr(path)); got != want {
-		t.Fatalf("encoded path address: got %#x want %#x", got, want)
-	}
-	if got := string(path[:len(path)-1]); got != "stable-name" {
-		t.Fatalf("pushed path changed with source Op: %q", got)
+		sqes := make([]*rawSQE, entries)
+		for i := range sqes {
+			sqes[i] = raw.getSQE()
+			require.NotNil(t, sqes[i], "lap %d entry %d", lap, i)
+			sqes[i].User_data = uint64(lap*entries + i)
+		}
+		require.Zero(t, raw.sqSpaceLeft(), "lap %d: full queue reports space", lap)
+		require.Nil(t, raw.getSQE(), "lap %d: full queue handed out an entry", lap)
+
+		// Distinct entries within a lap, and the same storage reused across laps.
+		require.NotEqual(t, sqes[0], sqes[1])
+		require.Equal(t, uintptr(unsafe.Pointer(sqes[0])),
+			uintptr(unsafe.Pointer(&raw.sq.sqeMemory[0])),
+			"lap %d: first entry is not at the ring base", lap)
+
+		submitted, err := raw.submitAndWait(0)
+		require.NoError(t, err)
+		require.Equal(t, uint(entries), submitted, "lap %d", lap)
+
+		for i := range entries {
+			transport.completeIdentity(uint64(lap*entries+i), int32(i), 0)
+		}
+		require.Equal(t, uint32(entries), raw.cqReady(), "lap %d", lap)
+		for i := range entries {
+			cqe := raw.peekCQE()
+			require.NotNil(t, cqe, "lap %d entry %d", lap, i)
+			require.Equal(t, uint64(lap*entries+i), cqe.Data,
+				"lap %d: completion %d resolved to the wrong entry", lap, i)
+			require.Equal(t, int32(i), cqe.Res)
+			raw.advanceCQ(1)
+		}
+		require.Zero(t, raw.cqReady(), "lap %d", lap)
+		require.Nil(t, raw.peekCQE(), "lap %d: drained queue produced an entry", lap)
 	}
 }
 
 func TestPathOperationsUseTypedDirectoryDescriptors(t *testing.T) {
-	ring, fake := newFakeRing(4)
+	ring, _ := newFakeRing(4)
 	directory := fakeFile(12340)
 	handle, err := ring.Push(OpenAt(FileFD(directory), "child", 0, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Encoding is the conformance suite's job; what matters here is that the
+	// Ring retains the directory file the operation named.
 	pushed := ring.pending.Value(handle.slot).op.(*openAtOp)
-	if pushed.dir.file != directory || fake.sqes[0].Fd != int32(directory.Fd()) {
-		t.Fatal("OpenAt did not retain and encode its directory file")
-	}
+	require.Same(t, directory, pushed.dir.file,
+		"OpenAt did not retain its directory file")
 
 	result := new(unix.Statx_t)
 	if _, err := ring.Push(StatxAt(FileFD(directory), "", 0, unix.STATX_SIZE, result)); err == nil {
@@ -252,7 +323,7 @@ func TestPathOperationsUseTypedDirectoryDescriptors(t *testing.T) {
 }
 
 func TestPointerInputsAreCopiedAccordingToSemantics(t *testing.T) {
-	ring, fake := newFakeRing(4)
+	ring, _ := newFakeRing(4)
 
 	spec := syscall.Timespec{Sec: 7, Nsec: 11}
 	timeout, err := ring.Push(Timeout(spec, 1, 0))
@@ -261,14 +332,12 @@ func TestPointerInputsAreCopiedAccordingToSemantics(t *testing.T) {
 	}
 	spec.Sec = 99
 
-	ownedSpec := &ring.pending.Value(timeout.slot).op.(*timeoutOp).spec
-	if got, want := *ownedSpec, (syscall.Timespec{Sec: 7, Nsec: 11}); got != want {
-		t.Fatalf("timeout did not own an input copy: got %+v want %+v", got, want)
-	}
-	if got, want := fake.sqes[0].Addr, uint64(uintptr(unsafe.Pointer(ownedSpec))); got != want {
-		t.Fatalf("timeout address: got %#x want %#x", got, want)
-	}
-
+	// The operation owns a __kernel_timespec copy rather than pointing at the
+	// caller's syscall.Timespec, whose fields are 32-bit on 32-bit Linux.
+	// escape_test covers that the SQE encodes this copy's address.
+	ownedSpec := ring.pending.Value(timeout.slot).op.(*timeoutOp).spec
+	require.Equal(t, rawTimespec{Sec: 7, Nsec: 11}, ownedSpec,
+		"timeout did not own an input copy")
 }
 
 func TestPollMaskEncodingMatchesKernelUnionLayout(t *testing.T) {
@@ -331,12 +400,6 @@ func TestVectorOperationsUseInlineMetadataForCommonSizes(t *testing.T) {
 	}
 }
 
-func pushLocalBuffer(ring *Ring, file *os.File) (Handle, error) {
-	var buffer [32]byte
-	buffer[0] = 42
-	return ring.Push(Read(FileFD(file), buffer[:], 17))
-}
-
 func growStack(depth int) int {
 	var data [128]byte
 	if depth == 0 {
@@ -346,7 +409,7 @@ func growStack(depth int) int {
 }
 
 func TestPushBuildsOwnedIovecs(t *testing.T) {
-	ring, fake := newFakeRing(1)
+	ring, _ := newFakeRing(1)
 	handle, err := pushLocalVectors(ring, fakeFile(12345))
 	if err != nil {
 		t.Fatal(err)
@@ -355,15 +418,13 @@ func TestPushBuildsOwnedIovecs(t *testing.T) {
 
 	pending := ring.pending.Value(handle.slot)
 	write := pending.op.(*writevOp)
-	if len(write.iovecs) != 2 {
-		t.Fatalf("iovecs: got %d want 2", len(write.iovecs))
-	}
-	if got, want := fake.sqes[0].Addr, uint64(slicePtr(write.iovecs)); got != want {
-		t.Fatalf("encoded iovec address: got %#x want %#x", got, want)
-	}
-	if write.iovecs[0].Base != unsafe.SliceData(write.buffers[0]) {
-		t.Fatal("iovec does not point at the retained buffer")
-	}
+	// Empty vectors are skipped, and each iovec must point at the buffer the
+	// operation retained rather than at the caller's original slice header.
+	require.Len(t, write.iovecs, 2)
+	require.Equal(t, unsafe.SliceData(write.buffers[0]), write.iovecs[0].Base,
+		"iovec does not point at the retained buffer")
+	require.Equal(t, unsafe.SliceData(write.buffers[2]), write.iovecs[1].Base,
+		"iovec does not point at the retained buffer")
 }
 
 func pushLocalVectors(ring *Ring, file *os.File) (Handle, error) {
@@ -390,27 +451,28 @@ func TestDrainMutatesInactiveOp(t *testing.T) {
 	}
 }
 
-func TestConsumedOperationMisusePanics(t *testing.T) {
-	ring, fake := newFakeRing(1)
+// TestPushedOperationReuseIsNotDiagnosed pins the ownership contract: reuse is
+// forbidden by the rule, not by a runtime check. Ringo keeps no per-Op state to
+// detect it, so pushing one twice queues two independent operations instead of
+// failing, and Drain never panics.
+func TestPushedOperationReuseIsNotDiagnosed(t *testing.T) {
+	ring, fake := newFakeRing(4)
 	op := Nop()
-	alias := op
-	handle, err := ring.Push(op)
-	if err != nil {
-		t.Fatal(err)
-	}
+	first, err := ring.Push(op)
+	require.NoError(t, err)
+	second, err := ring.Push(op)
+	require.NoError(t, err)
 
-	mustPanic(t, func() { alias.Drain() })
+	require.NotEqual(t, first, second, "reuse produced one identity")
+	require.Equal(t, uint32(2), fake.queued())
+	require.NotEqual(t, fake.sqe(0).User_data, fake.sqe(1).User_data)
 
-	if _, err := ring.Submit(); err != nil {
-		t.Fatal(err)
-	}
-	fake.complete(handle, 0, 0)
-	for range ring.Reap() {
-	}
-	mustPanic(t, func() { alias.Drain() })
-	mustPanic(t, func() {
-		_, _ = ring.Push(alias)
-	})
+	handles, err := ring.PushLinked(op, Then(LinkSoft, op))
+	require.NoError(t, err, "repeated Op in a linked sequence")
+	require.Len(t, handles, 2)
+	require.NotEqual(t, handles[0], handles[1])
+
+	require.NotPanics(t, func() { op.Drain() })
 }
 
 func TestFailedPushDoesNotConsumeOperation(t *testing.T) {
@@ -437,14 +499,6 @@ func TestFailedPushDoesNotConsumeOperation(t *testing.T) {
 	}
 }
 
-func TestPushLinkedRejectsDuplicateOperation(t *testing.T) {
-	ring, _ := newFakeRing(2)
-	op := Nop()
-	mustPanic(t, func() {
-		_, _ = ring.PushLinked(op, Then(LinkSoft, op))
-	})
-}
-
 func TestPushLinkedRejectsInvalidSequenceWithoutMutatingOperations(t *testing.T) {
 	ring, fake := newFakeRing(2)
 	first, second := Nop(), Nop()
@@ -462,7 +516,7 @@ func TestPushLinkedRejectsInvalidSequenceWithoutMutatingOperations(t *testing.T)
 			t.Fatalf("operation %d was modified after rejection: flags=%#x", index, sqe.Flags)
 		}
 	}
-	if ring.pending.Len() != 0 || len(fake.sqes) != 0 {
+	if ring.pending.Len() != 0 || fake.queued() != 0 {
 		t.Fatal("invalid sequence changed ring state")
 	}
 
@@ -471,46 +525,35 @@ func TestPushLinkedRejectsInvalidSequenceWithoutMutatingOperations(t *testing.T)
 	}
 }
 
+// TestReadWriteOperationsReleaseAfterCompletionYield checks the retention
+// boundary: the Ring holds an operation's operands through its completion's
+// iterator step, and drops them only once that step ends.
 func TestReadWriteOperationsReleaseAfterCompletionYield(t *testing.T) {
-	t.Run("read", func(t *testing.T) {
-		ring, fake := newFakeRing(1)
-		operation := Read(BorrowedFD(12345), make([]byte, 32), 0)
-		state := operation.(*readOp)
-		handle, err := ring.Push(operation)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fake.complete(handle, 32, 0)
-		for range ring.Reap() {
-			if state.buffer == nil || state.fd.kind != descriptorBorrowed {
-				t.Fatal("read operation released before its completion was yielded")
-			}
-		}
-		if state.buffer != nil || state.fd != (FD{}) || !state.consumed {
-			t.Fatal("read operation was not completely cleared before pooling")
-		}
-		mustPanic(t, func() { operation.Drain() })
-	})
+	for _, tc := range []struct {
+		name      string
+		construct func(FD, []byte) Op
+	}{
+		{"read", func(fd FD, buf []byte) Op { return Read(fd, buf, 0) }},
+		{"write", func(fd FD, buf []byte) Op { return Write(fd, buf, 0) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ring, fake := newFakeRing(1)
+			handle, err := ring.Push(
+				tc.construct(BorrowedFD(12345), make([]byte, 32)),
+			)
+			require.NoError(t, err)
 
-	t.Run("write", func(t *testing.T) {
-		ring, fake := newFakeRing(1)
-		operation := Write(BorrowedFD(12345), make([]byte, 32), 0)
-		state := operation.(*writeOp)
-		handle, err := ring.Push(operation)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fake.complete(handle, 32, 0)
-		for range ring.Reap() {
-			if state.buffer == nil || state.fd.kind != descriptorBorrowed {
-				t.Fatal("write operation released before its completion was yielded")
+			fake.complete(handle, 32, 0)
+			for range ring.Reap() {
+				_, retained := ring.pending.TryValue(handle.slot)
+				require.True(t, retained,
+					"operands released before the completion was yielded")
 			}
-		}
-		if state.buffer != nil || state.fd != (FD{}) || !state.consumed {
-			t.Fatal("write operation was not completely cleared before pooling")
-		}
-		mustPanic(t, func() { operation.Drain() })
-	})
+			_, retained := ring.pending.TryValue(handle.slot)
+			require.False(t, retained,
+				"operands retained after the final completion")
+		})
+	}
 }
 
 func TestPushLinkedIsAtomicAndEncodesOperationFlags(t *testing.T) {
@@ -524,7 +567,7 @@ func TestPushLinkedIsAtomicAndEncodesOperationFlags(t *testing.T) {
 	); !errors.Is(err, ErrFull) {
 		t.Fatalf("oversized sequence error: %v", err)
 	}
-	if ring.pending.Len() != 0 || len(fake.sqes) != 0 {
+	if ring.pending.Len() != 0 || fake.queued() != 0 {
 		t.Fatal("oversized sequence changed ring state")
 	}
 
@@ -540,34 +583,50 @@ func TestPushLinkedIsAtomicAndEncodesOperationFlags(t *testing.T) {
 	if len(handles) != 4 {
 		t.Fatalf("handles: got %d want 4", len(handles))
 	}
-	if rawSQEFlags(fake.sqes[0].Flags) != rawSqeIOLink {
-		t.Fatalf("soft-link flags: %#x", fake.sqes[0].Flags)
+	if rawSQEFlags(fake.sqe(0).Flags) != rawSqeIOLink {
+		t.Fatalf("soft-link flags: %#x", fake.sqe(0).Flags)
 	}
-	if rawSQEFlags(fake.sqes[1].Flags) != rawSqeIOLink {
-		t.Fatalf("soft-link boundary flags: %#x", fake.sqes[1].Flags)
+	if rawSQEFlags(fake.sqe(1).Flags) != rawSqeIOLink {
+		t.Fatalf("soft-link boundary flags: %#x", fake.sqe(1).Flags)
 	}
-	if rawSQEFlags(fake.sqes[2].Flags) != rawSqeIOHardlink {
-		t.Fatalf("hard-link flags: %#x", fake.sqes[2].Flags)
+	if rawSQEFlags(fake.sqe(2).Flags) != rawSqeIOHardlink {
+		t.Fatalf("hard-link flags: %#x", fake.sqe(2).Flags)
 	}
-	if fake.sqes[3].Flags != 0 {
-		t.Fatalf("last flags: %#x", fake.sqes[3].Flags)
+	if fake.sqe(3).Flags != 0 {
+		t.Fatalf("last flags: %#x", fake.sqe(3).Flags)
 	}
 }
 
+// TestSubmitErrorPreservesOwnership pins that a failed submit does not hand a
+// pushed operation back. The entry stays published, so the kernel may still
+// consume it, and the Ring keeps owning its operands either way.
 func TestSubmitErrorPreservesOwnership(t *testing.T) {
 	ring, fake := newFakeRing(1)
 	handle, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake.submitted = 1
-	fake.submitErr = syscall.EAGAIN
-	submitted, err := ring.Submit()
-	if submitted != 1 || !errors.Is(err, syscall.EAGAIN) {
-		t.Fatalf("submit: progress=%d error=%v", submitted, err)
-	}
-	if _, ok := ring.pending.TryValue(handle.slot); !ok {
-		t.Fatal("submit error released pushed ownership")
+	require.NoError(t, err)
+
+	fake.submitErrno = syscall.EAGAIN
+	_, err = ring.Submit()
+	require.ErrorIs(t, err, syscall.EAGAIN)
+	require.Equal(t, uint32(1), fake.queued(), "failed submit unpublished the entry")
+
+	_, retained := ring.pending.TryValue(handle.slot)
+	require.True(t, retained, "submit error released pushed ownership")
+}
+
+// TestSubmitReportsResourceErrors pins that the kernel's temporary resource
+// conditions stay visible: the caller must reap before entering again, so Ringo
+// cannot retry them on its own. EINTR is the opposite case and is absorbed one
+// layer down, around the io_uring_enter call itself.
+func TestSubmitReportsResourceErrors(t *testing.T) {
+	ring, fake := newFakeRing(2)
+	_, err := ring.Push(Nop())
+	require.NoError(t, err)
+
+	for _, resource := range []syscall.Errno{syscall.EAGAIN, syscall.EBUSY} {
+		fake.submitErrnos = []syscall.Errno{resource}
+		_, err = ring.SubmitAndWait(1)
+		require.ErrorIs(t, err, resource, "resource error was absorbed")
 	}
 }
 
@@ -584,7 +643,7 @@ func TestReapCompletionAndGenerationSafety(t *testing.T) {
 		completions[0].Result != 7 || completions[0].Err != nil {
 		t.Fatalf("completion: %+v", completions)
 	}
-	if ring.pending.Len() != 0 || fake.cqHead != 1 {
+	if ring.pending.Len() != 0 || fake.reaped() != 1 {
 		t.Fatal("final completion did not advance and release")
 	}
 
@@ -595,17 +654,17 @@ func TestReapCompletionAndGenerationSafety(t *testing.T) {
 	if first.slot == second.slot {
 		t.Fatal("slot generation did not advance")
 	}
+	// An identity Reap cannot resolve means Ringo's own finality bookkeeping is
+	// wrong, so it asserts. This is a test binary, so the assertion panics
+	// before the production path drops the entry; that path is unobservable
+	// here because buildutil test mode cannot be turned back off.
 	fake.complete(first, 0, 0)
-	completions = collect(ring.Reap())
-	if len(completions) != 1 || !errors.Is(completions[0].Err, ErrCorruptCompletion) {
-		t.Fatalf("stale completion: %+v", completions)
-	}
-	if _, ok := ring.pending.TryValue(second.slot); !ok {
-		t.Fatal("stale completion released a newer operation")
-	}
-	if _, err := ring.Push(Nop()); !errors.Is(err, ErrCorruptCompletion) {
-		t.Fatalf("ring did not preserve fatal consistency error: %v", err)
-	}
+	require.Panics(t, func() { collect(ring.Reap()) },
+		"unresolvable identity did not trip the assertion")
+
+	// Whichever way the assertion goes, no live operation was released.
+	_, live := ring.pending.TryValue(second.slot)
+	require.True(t, live, "stale completion released a newer operation")
 }
 
 func TestReapRetainsMultishotUntilFinalCompletion(t *testing.T) {
@@ -646,8 +705,8 @@ func TestReapBreakAndPanicAlwaysCleanupYieldedCompletion(t *testing.T) {
 		for range ring.Reap() {
 			break
 		}
-		if fake.cqHead != 1 || ring.pending.Len() != 1 {
-			t.Fatalf("after break: cqHead=%d pending=%d", fake.cqHead, ring.pending.Len())
+		if fake.reaped() != 1 || ring.pending.Len() != 1 {
+			t.Fatalf("after break: cqHead=%d pending=%d", fake.reaped(), ring.pending.Len())
 		}
 		if got := len(collect(ring.Reap())); got != 1 {
 			t.Fatalf("remaining completions: got %d want 1", got)
@@ -669,10 +728,10 @@ func TestReapBreakAndPanicAlwaysCleanupYieldedCompletion(t *testing.T) {
 				panic("body")
 			}
 		}()
-		if fake.cqHead != 1 || ring.pending.Len() != 0 {
+		if fake.reaped() != 1 || ring.pending.Len() != 0 {
 			t.Fatalf(
 				"after panic: cqHead=%d pending=%d",
-				fake.cqHead, ring.pending.Len(),
+				fake.reaped(), ring.pending.Len(),
 			)
 		}
 	})
@@ -708,7 +767,7 @@ func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sqe := fake.sqes[0]
+	sqe := fake.sqe(0)
 	if rawSQEFlags(sqe.Flags)&rawSqeFixedFile == 0 || sqe.Buf_index != 0 ||
 		sqe.Addr != uint64(slicePtr(data[8:24])) {
 		t.Fatalf("fixed/direct SQE: %+v", sqe)
@@ -731,18 +790,15 @@ func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 	if _, err := ring.Submit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := ring.Close(); !errors.Is(err, ErrPending) {
-		t.Fatalf("close retained operation: %v", err)
-	}
-	if ring.files == nil || ring.buffers == nil || len(set.buffers) != 1 {
-		t.Fatal("failed Close released registered resources")
-	}
 	fake.complete(handle, 16, 0)
 	if completions := collect(ring.Reap()); len(completions) != 1 {
 		t.Fatalf("final completions: got %d want 1", len(completions))
 	}
 	if err := ring.Close(); err != nil {
 		t.Fatalf("close idle ring: %v", err)
+	}
+	if len(set.buffers) != 1 {
+		t.Fatal("Close mutated the caller's buffer table")
 	}
 }
 
@@ -806,44 +862,64 @@ func TestFixedFilesUpdate(t *testing.T) {
 	}
 }
 
-func TestCloseRejectsPendingOperations(t *testing.T) {
+// TestCloseRetainsPendingOperations covers the deliberate close: the descriptor
+// always closes, but a Ring that still owns operations keeps them, keeps its
+// mappings, and roots itself, because nothing can report when the kernel has
+// finished with their operands.
+func TestCloseRetainsPendingOperations(t *testing.T) {
+	ring, fake := newFakeRing(1)
+	handle, err := ring.Push(Write(FileFD(fakeFile(12345)), make([]byte, 1), 0))
+	require.NoError(t, err)
+	_, err = ring.Submit()
+	require.NoError(t, err)
+
+	require.ErrorIs(t, ring.Close(), ErrPending, "close with a pending operation")
+	require.True(t, fake.closed, "descriptor was not closed")
+	require.False(t, fake.unmapped, "ring memory was unmapped with work in flight")
+	require.Equal(t, 1, ring.pending.Len(), "pending operand was released")
+	_, rooted := abandoned.Load(ring)
+	require.True(t, rooted, "retained ring was not rooted, so it can be collected")
+	abandoned.Delete(ring)
+
+	// The kernel completing afterwards changes nothing: the Ring is closed.
+	fake.complete(handle, 1, 0)
+	require.Empty(t, collect(ring.Reap()), "closed ring yielded completions")
+	require.NoError(t, ring.Close(), "idempotent Close")
+}
+
+// TestCloseReleasesDrainedRing covers the orderly close: everything reaped, so
+// Close unmaps and drops every reference and roots nothing.
+func TestCloseReleasesDrainedRing(t *testing.T) {
 	ring, fake := newFakeRing(1)
 	set, err := ring.RegisterBuffers(make([]byte, 16))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	handle, err := ring.Push(Write(FileFD(fakeFile(12345)), make([]byte, 1), 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ring.Submit(); err != nil {
-		t.Fatal(err)
-	}
-	if err := ring.Close(); !errors.Is(err, ErrPending) {
-		t.Fatalf("close with pending operation: %v", err)
-	}
-	if fake.closed || ring.pending.Len() != 1 || ring.backend == nil ||
-		ring.buffers == nil || len(set.buffers) != 1 {
-		t.Fatal("failed Close changed ring ownership")
-	}
+	require.NoError(t, err)
+	_, err = ring.Submit()
+	require.NoError(t, err)
 
 	fake.complete(handle, 1, 0)
 	for range ring.Reap() {
 	}
 	fake.closeFn = func() {
-		if ring.pending.Len() != 0 || ring.buffers == nil || len(set.buffers) != 1 {
-			t.Fatal("Close cleared resources before closing the idle ring")
-		}
+		require.NotNil(t, ring.buffers,
+			"Close released resources before closing the descriptor")
 	}
-	if err := ring.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !fake.closed || ring.backend != nil || ring.buffers != nil || len(set.buffers) != 0 {
-		t.Fatal("Close did not release idle ring state")
-	}
-	if err := ring.Close(); err != nil {
-		t.Fatalf("idempotent Close: %v", err)
-	}
+	require.NoError(t, ring.Close())
+	require.True(t, fake.closed)
+	require.True(t, fake.unmapped, "drained ring kept its mappings")
+	require.Nil(t, ring.backend)
+	require.Nil(t, ring.buffers)
+	_, rooted := abandoned.Load(ring)
+	require.False(t, rooted, "drained ring was rooted")
+
+	// Close drops the Ring's own references but leaves the caller's registered
+	// table immutable, so its lookups stay safe to call from any goroutine.
+	require.Len(t, set.buffers, 1, "Close mutated the caller's buffer table")
+	_, err = set.Buffer(0)
+	require.NoError(t, err, "registered-buffer lookup after Close")
+
+	require.NoError(t, ring.Close(), "idempotent Close")
 }
 
 func TestCancelAllUsesBoundedSynchronousCancellation(t *testing.T) {
@@ -876,10 +952,7 @@ func BenchmarkPushSubmitReap(b *testing.B) {
 				b.Fatal(completion.Err)
 			}
 		}
-		fake.sqes = fake.sqes[:0]
-		fake.sqHead = 0
-		fake.cqes = fake.cqes[:0]
-		fake.cqHead = 0
+
 	}
 }
 
@@ -902,10 +975,7 @@ func BenchmarkReadPushSubmitReap(b *testing.B) {
 				b.Fatal(completion.Err)
 			}
 		}
-		fake.sqes = fake.sqes[:0]
-		fake.sqHead = 0
-		fake.cqes = fake.cqes[:0]
-		fake.cqHead = 0
+
 	}
 }
 
@@ -934,16 +1004,6 @@ func BenchmarkDrainModifier(b *testing.B) {
 		op.Drain()
 	}
 	benchmarkOperation = op
-}
-
-func mustPanic(t *testing.T, f func()) {
-	t.Helper()
-	defer func() {
-		if recover() == nil {
-			t.Fatal("operation did not panic")
-		}
-	}()
-	f()
 }
 
 func collect(sequence func(func(Completion) bool)) []Completion {

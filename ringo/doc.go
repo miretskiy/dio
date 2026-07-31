@@ -45,12 +45,12 @@
 //		}
 //	}
 //
-// A successful Push permanently consumes the Op. The caller's right to use the
-// Op does not return after completion; only the Handle remains
+// A successful Push transfers the Op to the Ring permanently. The caller's
+// right to use the Op does not return after completion; only the Handle remains
 // caller-visible. The Ring retains the operation's state until Reap yields its
 // final completion and that iterator step ends. PushLinked performs the same
 // transfer atomically for a complete linked sequence: validation or capacity
-// failure queues and consumes nothing.
+// failure queues and transfers nothing.
 //
 // The request and ownership flow is:
 //
@@ -82,10 +82,14 @@
 // eventually returns ErrFull. Ringo has no background reaper.
 //
 // A submit call may report both progress and an error. That error does not
-// return ownership of pushed operations to the caller. Ring.Close requires
-// every pushed operation to have reached a final completion and been reaped;
-// it returns ErrPending without changing the Ring otherwise. This avoids
-// treating asynchronous kernel ring teardown as an operation-lifetime barrier.
+// return ownership of pushed operations to the caller.
+//
+// Ring.Close always closes the io_uring descriptor and never waits. Reaping
+// every pushed operation first is the orderly close, and the only one that
+// releases everything. Closing with operations still pending is allowed but
+// permanently retains the Ring and their operands, and reports ErrPending:
+// kernel ring teardown is asynchronous and unobservable, so it is not an
+// operation-lifetime barrier, and no later moment is provably safe either.
 //
 // # Operations and memory safety
 //
@@ -131,15 +135,15 @@
 // pin memory, repair a stale integer address, or retain an operand through a
 // later CQE. Ringo uses KeepAlive only where a synchronous syscall requires it.
 //
-// A successful Push or PushLinked consumes each Op permanently. The caller must
-// discard every interface copy of it and instead use its opaque Handle. A
-// call that returns an error consumes no Op. A misuse panic is not an ownership
-// protocol: callers must not reuse batch Ops after recovering from one. Ringo
-// panics when it detects a consumed Op passed to Push or modified with Drain,
-// but that check is only a misuse aid. Ringo may recycle
-// internal Read and Write storage after final release, so an old interface
-// alias can eventually refer to an unrelated operation. The ownership rule,
-// not the panic, is the safety boundary.
+// A successful Push or PushLinked takes ownership of each Op permanently. The
+// caller must discard every interface copy of it and instead use its opaque
+// Handle. A call that returns an error takes no Op.
+//
+// Go cannot express that transfer the way a move-only type would, so the rule
+// is documented rather than enforced: Ringo does not track or diagnose reuse.
+// Constructors may draw an Op from an internal pool, and the Ring may recycle
+// one once it has released its final completion, so a retained alias can come
+// to refer to an unrelated operation. Using a pushed Op again is undefined.
 //
 // Retention keeps referenced memory alive; it does not freeze that memory or
 // revoke the caller's other aliases. These rules apply to every alias of an
@@ -173,13 +177,11 @@
 // later operation's file before the open installs it. New therefore requires
 // this feature for every Ring.
 //
-// PushLinked consumes every referenced Op only after it has validated and
-// reserved the complete sequence. Each element must reference a distinct Op;
-// duplicate or already-consumed Ops panic when detected, with no post-panic
-// reuse guarantee. The variadic []Link backing array is not retained. Ringo has
-// no caller-visible Reset or pooling API. Its private scalar Read and Write
-// pools are released only after the final completion and do not relax the
-// permanent consumption rule.
+// PushLinked takes every referenced Op only after it has validated and reserved
+// the complete sequence, so a failed call leaves the Ring and every Op
+// untouched. Each element must reference a distinct Op. The variadic []Link
+// backing array is not retained. Ringo has no caller-visible Reset or pooling
+// API.
 //
 // # Completion and concurrency rules
 //
@@ -193,12 +195,22 @@
 // it. When the iterator resumes, breaks, or panics, Ringo advances that CQE
 // and releases final operation state.
 //
-// Ring methods do not synchronize with one another. Except for CancelAll's
-// documented shutdown interaction with SubmitAndWait, calls operating on the
-// same Ring must not overlap; callers may provide external serialization.
-// This is a Ringo API constraint, not a limitation of the kernel interface.
-// The Reap iterator exclusively borrows the Ring; calling another Ring method
-// from its loop body is invalid.
+// Ring methods do not synchronize with one another. Calls operating on the same
+// Ring must not overlap; callers may provide external serialization. This is a
+// Ringo API constraint, not a limitation of the kernel interface. The Reap
+// iterator exclusively borrows the Ring; calling another Ring method from its
+// loop body is invalid.
+//
+// CancelAll is the single exception, and it may overlap any other call on the
+// same Ring. That is what lets one goroutine break another out of a blocking
+// SubmitAndWait during shutdown, without which a Ring holding uncancelled work
+// could not be drained at all. It reads only the closed flag and the ring file
+// descriptor, neither of which another method mutates while a Ring is usable.
+//
+// Lookups on FixedFiles and FixedBuffers are not Ring methods and carry no such
+// constraint: both tables are immutable for their whole lifetime, including
+// across Ring.Close, so a submitting goroutine may validate a buffer while
+// another reaps.
 //
 // # File descriptors and registered resources
 //
@@ -227,7 +239,8 @@
 // can release one. FixedFile values continue to name the slot if it is later
 // reused; callers own allocation and reuse policy and must wait for the old
 // file's final operation and close completions before reuse. Files passed to
-// RegisterFiles are retained until Ring.Close.
+// RegisterFiles are retained until Update replaces or clears their slot, or for
+// as long as the table remains reachable.
 //
 // FixedFiles.Update synchronously replaces or clears existing slots. Linux
 // keeps displaced resources alive for requests already using them, so Ringo

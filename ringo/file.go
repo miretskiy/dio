@@ -80,12 +80,6 @@ func (op *readOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-func (op *readOp) release() {
-	// Keep stale aliases consumed while this object is sitting in the pool.
-	*op = readOp{opBase: opBase{consumed: true}}
-	readOpPool.Put(op)
-}
-
 var writeOpPool sync.Pool
 
 type writeOp struct {
@@ -154,9 +148,15 @@ func (op *writeOp) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
+func (op *readOp) release() {
+	// Drop the retained buffer and file before the object waits in the pool.
+	*op = readOp{}
+	readOpPool.Put(op)
+}
+
 func (op *writeOp) release() {
-	// Keep stale aliases consumed while this object is sitting in the pool.
-	*op = writeOp{opBase: opBase{consumed: true}}
+	// Drop the retained buffer and file before the object waits in the pool.
+	*op = writeOp{}
 	writeOpPool.Put(op)
 }
 
@@ -358,7 +358,9 @@ func Readv(fd FD, buffers [][]byte, offset int64, flags int) Op {
 }
 
 // ReadvFixed constructs IORING_OP_READV_FIXED. Every vector must fall within
-// the same selected fixed-buffer slot.
+// the same selected fixed-buffer slot. The opcode requires Linux 6.15, later
+// than the minimum New enforces, so an older kernel fails the operation in its
+// completion; Ring.Probe reports support up front.
 // liburing: io_uring_prep_readv_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_readv_fixed.3.html
 func ReadvFixed(
 	fd FD,
@@ -379,7 +381,9 @@ func Writev(fd FD, buffers [][]byte, offset int64, flags int) Op {
 }
 
 // WritevFixed constructs IORING_OP_WRITEV_FIXED. Every vector must fall
-// within the same selected fixed-buffer slot.
+// within the same selected fixed-buffer slot. The opcode requires Linux 6.15,
+// later than the minimum New enforces, so an older kernel fails the operation
+// in its completion; Ring.Probe reports support up front.
 // liburing: io_uring_prep_writev_fixed - https://man7.org/linux/man-pages/man3/io_uring_prep_writev_fixed.3.html
 func WritevFixed(
 	fd FD,

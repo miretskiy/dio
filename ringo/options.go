@@ -69,9 +69,9 @@ func WithDepth(depth uint32) Option {
 // a throughput and memory-pressure choice rather than a completion-safety
 // requirement: it avoids pushing excess CQEs onto the kernel's overflow list.
 //
-// The requested size must be greater than the SQ depth and may be rounded up
-// to a power of two. It does not increase the number of operations Ringo can
-// own; WithDepth controls that limit.
+// Both sizes are rounded up to a power of two, and Linux rejects a completion
+// queue smaller than the submission queue. The option does not increase the
+// number of operations Ringo can own; WithDepth controls that limit.
 //
 // io_uring: IORING_SETUP_CQSIZE - https://man7.org/linux/man-pages/man7/io_uring_setup_flags.7.html
 func WithCQSize(entries uint32) Option {

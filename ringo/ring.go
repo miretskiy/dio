@@ -8,11 +8,12 @@ import (
 	"iter"
 	"math"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
+	"github.com/miretskiy/dio/internal/buildutil"
 	"github.com/miretskiy/dio/internal/intrusive"
 )
 
@@ -22,36 +23,42 @@ var (
 	ErrFull = errors.New("ringo: ring is full")
 	// ErrClosed reports use of a closed Ring.
 	ErrClosed = errors.New("ringo: ring is closed")
-	// ErrPending reports that Close cannot release a Ring that still owns
-	// operations awaiting final completion reaping.
-	ErrPending = errors.New("ringo: ring has pending operations")
+	// ErrPending reports that Close released a Ring that still owned operations,
+	// so the Ring and their operands are retained for the life of the process.
+	// The Ring is closed either way.
+	ErrPending = errors.New("ringo: ring closed with pending operations")
 	// ErrWrongRing reports a ring-scoped handle or resource used with another
 	// Ring.
 	ErrWrongRing = errors.New("ringo: resource belongs to another ring")
-	// ErrCorruptCompletion reports a CQE whose private lifecycle identity is
-	// unknown or stale.
-	ErrCorruptCompletion = errors.New("ringo: corrupt completion identity")
 )
 
-type ringBackend interface {
-	sqCapacity() uint32
-	sqSpaceLeft() uint32
-	getSQE() *rawSQE
-	submitAndWait(uint32) (uint, error)
-	cqReady() uint32
-	peekCQE() *rawCQE
-	advanceCQ(uint32)
-	registerBuffers([]syscall.Iovec) (uint, error)
-	registerFilesSparse(uint32) (uint, error)
-	registerSyncCancel(*rawSyncCancelReg) (uint, error)
-	register(rawRegisterOpcode, unsafe.Pointer, uint32) (uint, syscall.Errno)
-	queueExit() error
-}
+// abandoned roots every Ring that was closed while it still owned operations,
+// and never releases one. The kernel dereferences a pending operation's
+// operands while its request runs, and closing the descriptor only starts an
+// asynchronous teardown whose completion nothing can observe, so there is no
+// point at which releasing them becomes provably safe. A Ring cannot keep them
+// alive on its own: once Close returns, an unreferenced Ring and everything
+// under it are collectable immediately. Only a root outside the caller's
+// reachability works, so the leak is made explicit here instead.
+var abandoned sync.Map // *Ring -> struct{}
 
 // Handle is an opaque, comparable, ring-local operation identity.
 type Handle struct {
 	ring uint64
 	slot intrusive.Handle
+}
+
+// Index returns a dense index for the operation, in [0, Ring.Capacity()). It
+// lets a caller keep per-operation state in a slice instead of a map, which is
+// the difference between an array index and a hash on every completion.
+//
+// The index names the Ring slot the operation occupies, not the operation, so a
+// later operation reuses it once this one's final completion is reaped. A side
+// table must therefore be written on every push, and should store the Handle
+// alongside its entry so its owner can tell the slot's current occupant from a
+// stale one. Index is meaningless for the zero Handle.
+func (handle Handle) Index() int {
+	return int(uint32(handle.slot)) - 1
 }
 
 // CompletionFlags are the flags supplied with a completion queue entry.
@@ -73,7 +80,8 @@ type Completion struct {
 	Result int
 	// Flags contains the kernel CQE flags.
 	Flags CompletionFlags
-	// Err is the syscall.Errno encoded by a negative CQE result.
+	// Err reports that the operation failed. It is the syscall.Errno encoded by
+	// a negative CQE result.
 	Err error
 }
 
@@ -86,7 +94,7 @@ type pendingSlot struct {
 // operation's final completion is reaped. A Ring must be constructed by New;
 // its zero value is not usable.
 type Ring struct {
-	backend ringBackend
+	backend *rawRing
 	id      uint64
 	pending intrusive.FixedList[pendingSlot]
 
@@ -96,7 +104,6 @@ type Ring struct {
 	eventFD *os.File
 
 	closed bool
-	fatal  error
 }
 
 var nextRingID atomic.Uint64
@@ -186,10 +193,10 @@ func (ring *Ring) FixedFiles() *FixedFiles {
 	return ring.files
 }
 
-// Push queues one SQE without entering the kernel. On success it permanently
-// consumes op; the caller must discard every interface copy and use only the
-// returned Handle. If Push returns an error, the caller retains ownership of
-// op. Detected use of an already-consumed Op panics.
+// Push queues one SQE without entering the kernel. On success it takes
+// ownership of op permanently; the caller must discard every interface copy and
+// use only the returned Handle. If Push returns an error, the caller retains
+// ownership of op. Reusing a pushed Op is forbidden and is not diagnosed.
 // liburing: io_uring_get_sqe - https://man7.org/linux/man-pages/man3/io_uring_get_sqe.3.html
 func (ring *Ring) Push(op Op) (Handle, error) {
 	if op == nil {
@@ -208,7 +215,6 @@ func (ring *Ring) Push(op Op) (Handle, error) {
 }
 
 func (ring *Ring) pushValidated(op Op, link rawSQEFlags) Handle {
-	op.markConsumed()
 	slot := ring.pending.PushBack()
 	handle := Handle{ring: ring.id, slot: slot}
 	pending := ring.pending.Value(slot)
@@ -231,11 +237,10 @@ func (ring *Ring) hasCapacity(count int) bool {
 // required. Every Ring uses IORING_SETUP_SUBMIT_ALL because a linked chain
 // cannot continue across a short submission boundary.
 //
-// On success PushLinked permanently consumes every Op, but it does not retain
-// the variadic Link slice. The caller must discard every Op copy and use only
-// the returned Handles. A returned error queues and consumes nothing.
-// Duplicate or previously consumed operations panic when detected; a misuse
-// panic provides no ownership or rollback guarantee.
+// On success PushLinked takes ownership of every Op permanently, but it does
+// not retain the variadic Link slice. The caller must discard every Op copy and
+// use only the returned Handles. A returned error queues and takes nothing:
+// every element is validated before any of them is transferred.
 // liburing: io_uring_get_sqe - https://man7.org/linux/man-pages/man3/io_uring_get_sqe.3.html
 func (ring *Ring) PushLinked(
 	first Op,
@@ -293,7 +298,8 @@ func (ring *Ring) prepareSQE(sqe *rawSQE, pending *pendingSlot) {
 	sqe.User_data = uint64(pending.handle.slot)
 }
 
-// Submit enters the kernel without waiting for completions.
+// Submit enters the kernel without waiting for completions. It reports the same
+// retryable conditions as SubmitAndWait.
 // liburing: io_uring_submit - https://man7.org/linux/man-pages/man3/io_uring_submit.3.html
 func (ring *Ring) Submit() (submitted int, err error) {
 	return ring.submitAndWait(0)
@@ -307,6 +313,14 @@ func (ring *Ring) Submit() (submitted int, err error) {
 // more completions than can ever arrive blocks inside io_uring_enter until the
 // wait is otherwise satisfied: by those operations completing, by a queued
 // Timeout, by CancelAll, or by a signal. Passing 0 never waits.
+//
+// A submit call may report both progress and an error; that error never returns
+// ownership of a pushed operation to the caller. EAGAIN and EBUSY are the
+// kernel's temporary resource conditions and are passed through: reap the
+// available completions and submit again. Ringo retries EINTR internally,
+// because an interrupted io_uring_enter consumes no SQE and loses no
+// completion, so it carries no information for the caller; interruption of an
+// operation is reported in that operation's completion instead.
 // liburing: io_uring_submit_and_wait - https://man7.org/linux/man-pages/man3/io_uring_submit_and_wait.3.html
 func (ring *Ring) SubmitAndWait(minComplete int) (submitted int, err error) {
 	if minComplete < 0 || uint64(minComplete) > math.MaxUint32 {
@@ -326,32 +340,46 @@ func (ring *Ring) submitAndWait(minComplete uint32) (int, error) {
 // Reap returns a nonblocking iterator over a bounded snapshot of currently
 // available completions. The Ring is exclusively borrowed while the iterator
 // is active. The yielded completion is advanced and its final pending state is
-// released after each iterator step, including break and panic.
+// released after each iterator step, including break and panic. Reap yields
+// nothing for a closed Ring.
+//
+// Every yielded Completion describes one kernel completion queue entry, so
+// Handle always identifies an operation the Ring owns and Err is always that
+// operation's own error. A ring fault is not a completion and is never yielded
+// as one: Reap records it and the next Push or submit returns it.
+//
+// Reap does not enter the kernel, so it cannot move entries off the kernel's
+// overflow list. Only a multishot operation can produce more completions than
+// the Ring has pending slots, because Linux never sizes the completion queue
+// below the submission queue. A caller using multishot operations must
+// therefore keep calling Submit or SubmitAndWait, which enter the kernel on
+// IORING_SQ_CQ_OVERFLOW, rather than reap alone.
 // liburing: io_uring_peek_cqe - https://man7.org/linux/man-pages/man3/io_uring_peek_cqe.3.html
 func (ring *Ring) Reap() iter.Seq[Completion] {
 	return func(yield func(Completion) bool) {
 		if ring.closed {
-			yield(Completion{Err: ErrClosed})
 			return
 		}
 		available := ring.backend.cqReady()
 		for range available {
 			cqe := ring.backend.peekCQE()
-			if cqe == nil {
-				ring.setFatal(errors.New("ringo: completion queue shrank while reaping"))
+			// Only Reap advances the completion head and the kernel only grows
+			// the tail, so the snapshot cannot shrink underneath this loop.
+			if err := buildutil.Assert(cqe != nil); err != nil {
 				return
 			}
 			slotHandle := intrusive.Handle(cqe.Data)
-			pending, ok := ring.pending.TryValue(slotHandle)
-			if !ok {
-				err := fmt.Errorf("%w: user_data=%#x", ErrCorruptCompletion, cqe.Data)
-				ring.setFatal(err)
-				if !ring.yieldCompletion(yield, Completion{
-					Flags: CompletionFlags(cqe.Flags),
-					Err:   err,
-				}, 0, false) {
-					return
-				}
+			pending, resolved := ring.pending.TryValue(slotHandle)
+			// Every SQE carries a generation-tagged identity, so one Ringo
+			// cannot resolve means Ringo released a slot before the kernel's
+			// last CQE for it: its own finality bookkeeping is wrong. Fail
+			// loudly in a test build. In production drop the entry rather than
+			// take a hard dependency on the kernel never producing one; it names
+			// no operation the caller holds, and reporting its raw user_data as
+			// a Handle would resurrect the stale identity the generation tag
+			// exists to reject.
+			if err := buildutil.Assert(resolved); err != nil {
+				ring.backend.advanceCQ(1)
 				continue
 			}
 
@@ -399,24 +427,24 @@ func (ring *Ring) release(handle intrusive.Handle) {
 	operation.release()
 }
 
-func (ring *Ring) setFatal(err error) {
-	if ring.fatal == nil {
-		ring.fatal = err
-	}
-}
-
 func (ring *Ring) ready() error {
 	if ring.closed {
 		return ErrClosed
 	}
-	if ring.fatal != nil {
-		return ring.fatal
-	}
 	return nil
 }
 
-// CancelAll synchronously requests cancellation of every in-flight operation.
-// It may be called concurrently with SubmitAndWait during shutdown.
+// CancelAll synchronously requests cancellation of every in-flight operation,
+// waiting up to timeout for the kernel to finish. Cancellation is best effort:
+// a request the kernel cannot interrupt keeps running, and the call reports
+// ETIME rather than success. Operations that are cancelled report ECANCELED in
+// their own completions, which the caller must still reap.
+//
+// CancelAll is the one Ring method that may overlap another call on the same
+// Ring, which is what lets one goroutine break another out of a blocking
+// SubmitAndWait during shutdown. It reads only the closed flag and the ring
+// file descriptor, neither of which any other method mutates while a Ring is
+// usable.
 // liburing: io_uring_register_sync_cancel - https://man7.org/linux/man-pages/man3/io_uring_register_sync_cancel.3.html
 func (ring *Ring) CancelAll(timeout time.Duration) error {
 	if ring.closed {
@@ -425,44 +453,66 @@ func (ring *Ring) CancelAll(timeout time.Duration) error {
 	if timeout < 0 {
 		return errors.New("ringo: cancellation timeout must be nonnegative")
 	}
+	// struct io_uring_sync_cancel_reg carries a __kernel_timespec, which is
+	// 64-bit on every architecture, unlike syscall.Timespec.
 	spec := syscall.NsecToTimespec(timeout.Nanoseconds())
 	_, err := ring.backend.registerSyncCancel(&rawSyncCancelReg{
 		Flags: uint32(rawAsyncCancelAny | rawAsyncCancelAll),
 		Timeout: rawTimespec{
-			Sec:  spec.Sec,
-			Nsec: spec.Nsec,
+			Sec:  int64(spec.Sec),
+			Nsec: int64(spec.Nsec),
 		},
 	})
 	return err
 }
 
-// Close releases an idle Ring. Every pushed operation must have reached a
-// final completion and been reaped first. If operations remain, Close returns
-// ErrPending without changing the Ring. Close is idempotent after success.
+// Close releases the Ring. It always closes the io_uring descriptor, which asks
+// the kernel to release the context, and never waits. The Ring is unusable
+// afterwards, and Close is idempotent.
+//
+// Reaping every pushed operation to its final completion first is the orderly
+// close: the Ring then also unmaps its ring memory and drops every reference it
+// held, and Close returns nil.
+//
+// Closing with operations still pending is possible but not free. Their
+// buffers, iovecs, and output structures stay visible to the kernel while the
+// requests run, and closing the descriptor does not stop that: io_uring_setup(2)
+// documents that the context's resources are freed asynchronously, and nothing
+// reports when that has finished. So Close cannot release those operands, and
+// it cannot ask the caller to hold them either, because an unreferenced Ring
+// becomes collectable the moment Close returns. Instead the Ring is retained
+// permanently, along with its ring mappings, and Close reports ErrPending with
+// the number of operations involved. That leak is bounded by the Ring's
+// capacity and lasts for the life of the process.
+//
+// Close drops the Ring's own references to its registered tables but does not
+// modify the FixedFiles and FixedBuffers values the caller holds. Those stay
+// immutable for their whole lifetime, so their lookups remain safe to call from
+// any goroutine, and they become collectable once the caller drops them too.
 // liburing: io_uring_queue_exit - https://man7.org/linux/man-pages/man3/io_uring_queue_exit.3.html
 func (ring *Ring) Close() error {
 	if ring.closed {
 		return nil
 	}
-	if ring.pending.Len() != 0 {
-		return ErrPending
-	}
 	ring.closed = true
-	err := ring.backend.queueExit()
-	if ring.buffers != nil {
-		clear(ring.buffers.buffers)
-		ring.buffers.buffers = nil
-		ring.buffers.ring = nil
-		ring.buffers = nil
-	}
-	if ring.files != nil {
-		ring.files.ring = nil
-		clear(ring.files.owners)
-		ring.files.owners = nil
-		ring.files.count = 0
-	}
+	err := ring.backend.closeDescriptor()
+	ring.buffers = nil
 	ring.files = nil
 	ring.eventFD = nil
+
+	if pending := ring.pending.Len(); pending != 0 {
+		// Retain the Ring, its pending operands, and its still-mapped ring
+		// memory. Unmapping is very likely safe, since the kernel owns those
+		// pages and posts through its own reference, but nothing documents it
+		// for a ring with requests outstanding, and this branch is already
+		// leaking.
+		abandoned.Store(ring, struct{}{})
+		return errors.Join(err, fmt.Errorf(
+			"%w: %d operations retained", ErrPending, pending,
+		))
+	}
+
+	ring.backend.releaseMappings()
 	ring.backend = nil
 	return err
 }

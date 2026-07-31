@@ -130,9 +130,9 @@ func (ring *Ring) Probe() (*Probe, error) {
 }
 
 // RegisterFiles installs a nonempty fixed-file table and retains each non-nil
-// file until its slot is replaced, cleared, or the Ring is closed.
-// Registration never changes RLIMIT_NOFILE; an insufficient process limit is
-// returned as the kernel's registration error.
+// file until its slot is replaced or cleared by Update, or for as long as the
+// returned table stays reachable. Registration never changes RLIMIT_NOFILE; an
+// insufficient process limit is returned as the kernel's registration error.
 // liburing: io_uring_register_files - https://man7.org/linux/man-pages/man3/io_uring_register_files.3.html
 func (ring *Ring) RegisterFiles(files ...*os.File) (*FixedFiles, error) {
 	if err := ring.ready(); err != nil {

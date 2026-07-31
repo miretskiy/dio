@@ -156,8 +156,10 @@ func (file FixedFile) validate(ring *Ring) error {
 	return nil
 }
 
-// FixedBuffers is one immutable fixed-buffer table owned by a Ring. Its
-// backing buffers remain retained until Ring.Close.
+// FixedBuffers is one immutable fixed-buffer table owned by a Ring. It stays
+// registered with the kernel until Ring.Close and retains its backing buffers
+// for as long as the table itself is reachable. Because it is never mutated,
+// its lookups are safe to call from any goroutine.
 type FixedBuffers struct {
 	ring    *Ring
 	buffers [][]byte
@@ -238,15 +240,6 @@ func (buffer FixedBuffer) contains(data []byte) bool {
 	base := uintptr(unsafe.Pointer(unsafe.SliceData(registered)))
 	limit := base + uintptr(len(registered))
 	return end >= start && limit >= base && start >= base && end <= limit
-}
-
-// Slice returns a subrange of buffer.
-func (buffer FixedBuffer) Slice(offset, length int) (FixedBuffer, error) {
-	if offset < 0 || length < 0 || offset > len(buffer.data) || length > len(buffer.data)-offset {
-		return FixedBuffer{}, errors.New("ringo: fixed-buffer slice is out of bounds")
-	}
-	buffer.data = buffer.data[offset : offset+length]
-	return buffer, nil
 }
 
 func (buffer FixedBuffer) validate(ring *Ring) error {

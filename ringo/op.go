@@ -18,13 +18,16 @@ const (
 // arguments and knows how to write its kernel submission queue entry.
 //
 // Drain configures an operation before submission. A successful Push or
-// PushLinked consumes the Op permanently; afterward the caller must discard
-// every interface copy and use only its Handle. A push that returns an error
-// leaves ownership with the caller. Ringo panics on detected reuse, but callers
-// must not rely on detection because internal storage may be recycled.
+// PushLinked transfers the Op to the Ring permanently; afterward the caller must
+// discard every interface copy and use only its Handle. A push that returns an
+// error leaves ownership with the caller.
+//
+// Go cannot express that transfer, and Ringo does not police it. Constructors
+// may draw an Op from an internal pool, and the Ring may recycle one after
+// releasing its final completion, so a retained alias can come to refer to an
+// unrelated operation. Reusing a pushed Op is undefined, not diagnosed.
 type Op interface {
 	op()
-	markConsumed()
 	release()
 	opcode() rawOpcode
 	validate(*Ring) error
@@ -55,12 +58,11 @@ func Then(linkType LinkType, next Op) Link {
 	return Link{Type: linkType, Next: next}
 }
 
-// opBase is the only state common to all operations. It carries ownership
-// state, the SQE drain flag, and a constructor error; operation arguments
-// remain in their concrete operation type.
+// opBase is the only state common to all operations. It carries the SQE drain
+// flag and a constructor error; operation arguments remain in their concrete
+// operation type.
 type opBase struct {
 	sqeFlags rawSQEFlags
-	consumed bool
 	invalid  error
 }
 
@@ -71,9 +73,6 @@ func (*opBase) release() {
 }
 
 func (base opBase) validate() error {
-	if base.consumed {
-		panic("ringo: use of consumed operation")
-	}
 	if base.invalid == nil {
 		return nil
 	}
@@ -86,18 +85,9 @@ func (base *opBase) fail(err error) {
 	}
 }
 
-func (base *opBase) markConsumed() {
-	if base.consumed {
-		panic("ringo: use of consumed operation")
-	}
-	base.consumed = true
-}
-
-// Drain marks the operation with IOSQE_IO_DRAIN.
+// Drain marks the operation with IOSQE_IO_DRAIN. It applies to an Op the caller
+// still owns; a pushed Op has already written its SQE.
 func (base *opBase) Drain() {
-	if base.consumed {
-		panic("ringo: use of consumed operation")
-	}
 	base.sqeFlags |= rawSqeIODrain
 }
 

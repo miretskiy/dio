@@ -27,7 +27,7 @@ func sliceLiteralAddressIsStable() bool {
 	if err != nil {
 		panic(err)
 	}
-	before := fake.sqes[0].Addr
+	before := fake.sqe(0).Addr
 	growEscapeTestStack(64)
 	op := ring.pending.Value(handle.slot).op.(*readOp)
 	after := uint64(slicePtr(op.buffer))
@@ -42,7 +42,7 @@ func arraySliceAddressIsStable() bool {
 	if err != nil {
 		panic(err)
 	}
-	before := fake.sqes[0].Addr
+	before := fake.sqe(0).Addr
 	growEscapeTestStack(64)
 	op := ring.pending.Value(handle.slot).op.(*readOp)
 	after := uint64(slicePtr(op.buffer))
@@ -56,7 +56,7 @@ func copiedStructAddressIsStable() bool {
 	if err != nil {
 		panic(err)
 	}
-	before := fake.sqes[0].Addr
+	before := fake.sqe(0).Addr
 	growEscapeTestStack(64)
 	op := ring.pending.Value(handle.slot).op.(*timeoutOp)
 	after := uint64(uintptr(unsafe.Pointer(&op.spec)))
@@ -77,7 +77,7 @@ func retainedOutputAddressIsStable() bool {
 	if err != nil {
 		panic(err)
 	}
-	before := fake.sqes[0].Off
+	before := fake.sqe(0).Off
 	growEscapeTestStack(64)
 	op := ring.pending.Value(handle.slot).op.(*statxOp)
 	after := uint64(uintptr(unsafe.Pointer(op.result)))

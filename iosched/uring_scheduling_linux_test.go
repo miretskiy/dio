@@ -55,9 +55,12 @@ func (f *fakeRingQueue) PushLinked(
 	return handles, nil
 }
 
+// allocateHandle mirrors Ringo by handing out a dense slot index. Tests never
+// recycle one, so the coordinator's table simply grows.
 func (f *fakeRingQueue) allocateHandle() ringHandle {
+	handle := ringHandle{index: int(f.nextHandle)}
 	f.nextHandle++
-	return ringHandle{testID: f.nextHandle}
+	return handle
 }
 
 func (f *fakeRingQueue) SubmitAndWait(int) (int, error) {
@@ -109,7 +112,7 @@ func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 			fixedFiles: make([]ringo.FixedFile, vfiles),
 		},
 		ring:  ring,
-		slots: make(map[ringHandle]ringSlot, depth),
+		slots: make([]ringSlot, depth),
 		files: newFileTable(vfiles),
 	}
 	return c
@@ -119,6 +122,7 @@ func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 // their fake ring produces final completions.
 func (c *coordinator) releaseAllSlots() {
 	clear(c.slots)
+	c.placed = 0
 }
 
 func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
@@ -279,7 +283,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	c := coordinator{
 		sched: s,
 		ring:  ring,
-		slots: make(map[ringHandle]ringSlot, 1),
+		slots: make([]ringSlot, 1),
 		files: newFileTable(1),
 	}
 	cause := c.run()
@@ -316,30 +320,42 @@ func TestResourceErrorReapsAvailableCompletion(t *testing.T) {
 	tickets[0].Wait()
 }
 
-func TestEINTRReturnsToCoordinator(t *testing.T) {
-	ring := &fakeRingQueue{submitErrs: []error{syscall.EINTR, nil}}
-	c := newTestCoordinator(1, 1, ring)
-	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
-	c.placeReady(false)
-	ring.submitAndWaitFn = func(f *fakeRingQueue) {
-		if f.submitCalls == 2 {
-			f.complete(f.handles[0], 1)
-		}
-	}
-	if err := c.submitAndWait(); err != nil {
-		t.Fatal(err)
-	}
-	if ring.submitCalls != 1 {
-		t.Fatalf("submit calls before returning: got %d want 1", ring.submitCalls)
-	}
-	if err := c.submitAndWait(); err != nil {
-		t.Fatal(err)
-	}
-	c.reap()
-	tickets[0].Wait()
+// EINTR is absorbed by Ringo, so the coordinator never sees it. Its retry is
+// covered by ringo.TestSubmitAbsorbsInterruptedEnterButNotResourceErrors.
 
-	if ring.submitCalls != 2 {
-		t.Fatalf("submit calls: got %d want 2", ring.submitCalls)
+// TestDrainGivesUpAndReportsUnknownOutcome covers a ring that stops reporting
+// completions while operations are still placed. The coordinator must stop
+// waiting instead of spinning forever, must not release the placed operations,
+// and must tell whoever holds their tickets that the outcome is unknown.
+func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
+	defer func(limit int, delay time.Duration) {
+		drainStallLimit, drainStallDelay = limit, delay
+	}(drainStallLimit, drainStallDelay)
+	drainStallLimit, drainStallDelay = 4, time.Microsecond
+
+	permanent := errors.New("ring stopped reporting")
+	ring := &fakeRingQueue{}
+	ring.submitAndWaitFn = func(f *fakeRingQueue) {
+		f.submitErrs = append(f.submitErrs, permanent)
+	}
+	c := newTestCoordinator(4, 2, ring)
+	tickets, _ := acceptOps(&c,
+		VReadOp(0, make([]byte, 1), 0),
+		VReadOp(1, make([]byte, 1), 0),
+	)
+	c.placeReady(false)
+	require.Equal(t, 2, c.placed, "operations were not placed")
+
+	err := c.drainSlots()
+	require.ErrorIs(t, err, permanent)
+	require.Equal(t, 2, c.placed,
+		"drain released operations it could not prove had finished")
+	require.Equal(t, drainStallLimit, ring.submitCalls, "drain was not bounded")
+
+	c.failWork(nil, errSchedulerClosed, err)
+	for i, ticket := range tickets {
+		_, waitErr := ticket.Wait()
+		require.ErrorIsf(t, waitErr, permanent, "ticket %d", i)
 	}
 }
 
@@ -418,8 +434,8 @@ func TestCleanupDrainsPlacedCompletionsBeforeFailingUnplacedWork(t *testing.T) {
 	if !errors.Is(err, ringErr) {
 		t.Fatalf("remaining request error: got %v want %v", err, ringErr)
 	}
-	if c.pending.Len() != 0 || len(c.slots) != 0 {
-		t.Fatalf("coordinator retained failed work: pending=%d slots=%d", c.pending.Len(), len(c.slots))
+	if c.pending.Len() != 0 || c.placed != 0 {
+		t.Fatalf("coordinator retained failed work: pending=%d placed=%d", c.pending.Len(), c.placed)
 	}
 }
 
@@ -459,8 +475,8 @@ func TestDrainSlotsWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
 	if _, err := tickets[0].Wait(); !errors.Is(err, errSchedulerClosed) {
 		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
-	if c.pending.Len() != 0 || len(c.slots) != 0 {
-		t.Fatalf("coordinator retained drained work: pending=%d slots=%d", c.pending.Len(), len(c.slots))
+	if c.pending.Len() != 0 || c.placed != 0 {
+		t.Fatalf("coordinator retained drained work: pending=%d placed=%d", c.pending.Len(), c.placed)
 	}
 }
 
@@ -723,14 +739,17 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 
 	var openSlot, otherSlot ringHandle
 	foundOpen, foundOther := false, false
-	for ringHandle, slot := range c.slots {
+	for _, slot := range c.slots {
 		op := slot.op
+		if op == nil {
+			continue
+		}
 		switch {
 		case op.kind() == OpOpenat:
-			openSlot = ringHandle
+			openSlot = slot.handle
 			foundOpen = true
 		case op.kind() == OpRead && op.isVirtual() && op.vfd == 1:
-			otherSlot = ringHandle
+			otherSlot = slot.handle
 			foundOther = true
 		case op.kind() == OpRead && op.isVirtual() && op.vfd == 0:
 			t.Fatal("same-slot read reached the ring before open completed")
@@ -742,8 +761,8 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 	if openSlot == otherSlot {
 		t.Fatalf("initial SQEs reused slot %+v: %+v; ring slots=%+v", openSlot, ring.handles, c.slots)
 	}
-	openRingSlot := c.slots[openSlot]
-	otherRingSlot := c.slots[otherSlot]
+	openRingSlot := c.slots[openSlot.index]
+	otherRingSlot := c.slots[otherSlot.index]
 	if openRingSlot.work != handles[0] || otherRingSlot.work != handles[1] {
 		t.Fatalf("wrong work in slots: open=%d other=%d handles=%v", openRingSlot.work, otherRingSlot.work, handles)
 	}
@@ -762,7 +781,7 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 		t.Fatalf("read not placed after open completion: sqes=%d", len(ring.handles))
 	}
 	last := ring.handles[len(ring.handles)-1]
-	lastOp := c.slots[last].op
+	lastOp := c.slots[last.index].op
 	if lastOp.kind() != OpRead || !lastOp.isVirtual() || lastOp.vfd != 0 {
 		t.Fatalf("last operation = %+v, want same-slot read", lastOp)
 	}
@@ -791,14 +810,19 @@ func TestCoordinatorCloseDrainWithAdversarialCompletions(t *testing.T) {
 	}
 
 	var sameSlot, otherSlot ringHandle
-	for handle, slot := range c.slots {
-		if slot.op.vfd == 0 {
-			sameSlot = handle
-		} else if slot.op.vfd == 1 {
-			otherSlot = handle
+	foundSame, foundOther := false, false
+	for _, slot := range c.slots {
+		if slot.op == nil {
+			continue
+		}
+		switch slot.op.vfd {
+		case 0:
+			sameSlot, foundSame = slot.handle, true
+		case 1:
+			otherSlot, foundOther = slot.handle, true
 		}
 	}
-	if sameSlot == (ringHandle{}) || otherSlot == (ringHandle{}) {
+	if !foundSame || !foundOther {
 		t.Fatalf("missing read SQEs: %+v", ring.handles)
 	}
 
@@ -812,7 +836,7 @@ func TestCoordinatorCloseDrainWithAdversarialCompletions(t *testing.T) {
 	ring.complete(sameSlot, 1)
 	c.reap()
 	c.placeReady(false)
-	if len(ring.handles) != 3 || c.slots[ring.handles[2]].op.kind() != OpClose {
+	if len(ring.handles) != 3 || c.slots[ring.handles[2].index].op.kind() != OpClose {
 		t.Fatalf("close was not placed after the same-slot read: %+v", ring.handles)
 	}
 

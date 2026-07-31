@@ -422,3 +422,28 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 func signedArgument(value int) uint64 {
 	return uint64(int64(value))
 }
+
+// TestLinkedSequenceFlagsMatchLiburing covers the one encoding the per-operation
+// cases cannot reach: PushLinked records each edge as a flag on the *preceding*
+// entry, and the final entry carries none.
+func TestLinkedSequenceFlagsMatchLiburing(t *testing.T) {
+	ring, transport := newFakeRing(4)
+	handles, err := ring.PushLinked(
+		Nop(),
+		Then(LinkSoft, Nop()),
+		Then(LinkHard, Nop()),
+	)
+	require.NoError(t, err)
+	require.Len(t, handles, 3)
+
+	for index, hard := range []bool{false, true} {
+		sqe := transport.sqe(index)
+		sqe.User_data = 0
+		require.Equal(t, liburingoracle.PrepareNopLinked(hard), rawSQEBytes(sqe),
+			"edge %d", index)
+	}
+	last := transport.sqe(2)
+	last.User_data = 0
+	require.Equal(t, liburingoracle.PrepareNop(), rawSQEBytes(last),
+		"final entry carries a link flag")
+}

@@ -37,6 +37,22 @@ type rawCompletionQueue struct {
 	cqeSize    uintptr
 }
 
+// ringHooks stubs the transport's syscall boundary. Production leaves it nil.
+// Tests set it to drive conditions a live kernel cannot be asked for, such as
+// EAGAIN from a submit or a partial registration result.
+//
+// Only syscalls are stubbable. The queue arithmetic below is never replaced:
+// tests run it over heap memory instead of a mapping, so masking, wraparound,
+// and index math are the same code in both.
+type ringHooks struct {
+	enter    func(submitted, waitFor uint32, flags rawEnterFlags) (uint, syscall.Errno)
+	register func(
+		opcode rawRegisterOpcode, argument unsafe.Pointer, count uint32,
+	) (uint, syscall.Errno)
+	closeDescriptor func() error
+	releaseMappings func()
+}
+
 // rawRing is the private Linux transport beneath Ring.
 type rawRing struct {
 	sq       rawSubmissionQueue
@@ -44,6 +60,7 @@ type rawRing struct {
 	flags    rawSetupFlags
 	features rawFeatureFlags
 	fd       int
+	hooks    *ringHooks
 }
 
 func newRaw() *rawRing {
@@ -80,8 +97,7 @@ func (ring *rawRing) queueInit(entries uint32, params rawParams) error {
 	}
 	ring.fd = fd
 	if err := ring.mapMemory(&actual); err != nil {
-		_ = syscall.Close(ring.fd)
-		ring.fd = -1
+		_ = ring.closeDescriptor()
 		return err
 	}
 
@@ -134,7 +150,7 @@ func (ring *rawRing) mapMemory(params *rawParams) error {
 		uintptr(params.Sq_entries)*sqeSize,
 	)
 	if err != nil {
-		ring.unmap()
+		ring.releaseMappings()
 		return err
 	}
 	ring.sq.sqeMemory = sqeMemory
@@ -187,7 +203,40 @@ func (ring *rawRing) bindPointers(params *rawParams) {
 	ring.cq.cqeBase = mappingPointer(ring.cq.ringMemory, params.Cq_off.Cqes)
 }
 
-func (ring *rawRing) unmap() {
+// closeDescriptor closes the io_uring_setup descriptor, which asks the kernel
+// to release the context. io_uring_setup(2) documents that this frees the
+// context's resources but may do so asynchronously, so it is not a barrier for
+// requests still in flight.
+func (ring *rawRing) closeDescriptor() error {
+	if ring.hooks != nil && ring.hooks.closeDescriptor != nil {
+		return ring.hooks.closeDescriptor()
+	}
+	if ring.fd == -1 {
+		return nil
+	}
+	err := syscall.Close(ring.fd)
+	ring.fd = -1
+	return err
+}
+
+// queueExit tears the ring down completely. It is only for a ring that owns no
+// operations, which is why New's failure paths may use it: nothing was ever
+// submitted, so nothing can still reference the mappings.
+func (ring *rawRing) queueExit() error {
+	err := ring.closeDescriptor()
+	ring.releaseMappings()
+	return err
+}
+
+// releaseMappings unmaps the ring memory. Only a caller that knows no request
+// can still reference it may do this: the kernel owns the underlying pages and
+// keeps its own reference, but nothing documents that unmapping is safe while
+// requests are outstanding.
+func (ring *rawRing) releaseMappings() {
+	if ring.hooks != nil && ring.hooks.releaseMappings != nil {
+		ring.hooks.releaseMappings()
+		return
+	}
 	// The submission and completion rings share one mapping (SINGLE_MMAP), so
 	// ring.cq.ringMemory aliases ring.sq.ringMemory and is not unmapped twice.
 	if ring.sq.sqeMemory != nil {
@@ -198,16 +247,6 @@ func (ring *rawRing) unmap() {
 	}
 	ring.sq = rawSubmissionQueue{}
 	ring.cq = rawCompletionQueue{}
-}
-
-func (ring *rawRing) queueExit() error {
-	var err error
-	if ring.fd != -1 {
-		err = syscall.Close(ring.fd)
-		ring.fd = -1
-	}
-	ring.unmap()
-	return err
 }
 
 func (ring *rawRing) sqCapacity() uint32 {
@@ -261,14 +300,30 @@ func (ring *rawRing) submitAndWait(waitFor uint32) (uint, error) {
 	if submitted == 0 && waitFor == 0 && flags == 0 {
 		return 0, nil
 	}
-	return ring.enter(submitted, waitFor, flags)
+	for {
+		consumed, errno := ring.enter(submitted, waitFor, flags)
+		// io_uring returns EINTR only when it consumed no SQE, so the same
+		// submission count stays correct on retry. The interrupted call lost no
+		// completion either, which leaves the caller nothing to act on:
+		// interruption of an operation is reported in that operation's own CQE.
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return 0, errno
+		}
+		return consumed, nil
+	}
 }
 
 func (ring *rawRing) enter(
 	submitted uint32,
 	waitFor uint32,
 	flags rawEnterFlags,
-) (uint, error) {
+) (uint, syscall.Errno) {
+	if ring.hooks != nil && ring.hooks.enter != nil {
+		return ring.hooks.enter(submitted, waitFor, flags)
+	}
 	consumed, _, errno := syscall.Syscall6(
 		unix.SYS_IO_URING_ENTER,
 		uintptr(ring.fd),
@@ -278,10 +333,7 @@ func (ring *rawRing) enter(
 		0,
 		0,
 	)
-	if errno != 0 {
-		return 0, errno
-	}
-	return uint(consumed), nil
+	return uint(consumed), errno
 }
 
 func (ring *rawRing) cqReady() uint32 {
@@ -306,6 +358,9 @@ func (ring *rawRing) register(
 	argument unsafe.Pointer,
 	count uint32,
 ) (uint, syscall.Errno) {
+	if ring.hooks != nil && ring.hooks.register != nil {
+		return ring.hooks.register(opcode, argument, count)
+	}
 	result, _, errno := syscall.Syscall6(
 		unix.SYS_IO_URING_REGISTER,
 		uintptr(ring.fd),
