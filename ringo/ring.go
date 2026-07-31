@@ -345,8 +345,9 @@ func (ring *Ring) submitAndWait(minComplete uint32) (int, error) {
 //
 // Every yielded Completion describes one kernel completion queue entry, so
 // Handle always identifies an operation the Ring owns and Err is always that
-// operation's own error. A ring fault is not a completion and is never yielded
-// as one: Reap records it and the next Push or submit returns it.
+// operation's own error. A CQE whose identity does not resolve is an internal
+// invariant violation: test builds fail loudly, while production discards it
+// rather than inventing a Completion for an operation the Ring does not own.
 //
 // Reap does not enter the kernel, so it cannot move entries off the kernel's
 // overflow list. Only a multishot operation can produce more completions than
@@ -441,10 +442,9 @@ func (ring *Ring) ready() error {
 // their own completions, which the caller must still reap.
 //
 // CancelAll is the one Ring method that may overlap another call on the same
-// Ring, which is what lets one goroutine break another out of a blocking
-// SubmitAndWait during shutdown. It reads only the closed flag and the ring
-// file descriptor, neither of which any other method mutates while a Ring is
-// usable.
+// Ring except Close, which is what lets one goroutine break another out of a
+// blocking SubmitAndWait during shutdown. Close must not begin until CancelAll
+// and every other Ring call have returned.
 // liburing: io_uring_register_sync_cancel - https://man7.org/linux/man-pages/man3/io_uring_register_sync_cancel.3.html
 func (ring *Ring) CancelAll(timeout time.Duration) error {
 	if ring.closed {
@@ -468,7 +468,8 @@ func (ring *Ring) CancelAll(timeout time.Duration) error {
 
 // Close releases the Ring. It always closes the io_uring descriptor, which asks
 // the kernel to release the context, and never waits. The Ring is unusable
-// afterwards, and Close is idempotent.
+// afterwards, and Close is idempotent. Close must not overlap another Ring
+// call, including CancelAll.
 //
 // Reaping every pushed operation to its final completion first is the orderly
 // close: the Ring then also unmaps its ring memory and drops every reference it

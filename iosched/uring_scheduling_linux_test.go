@@ -248,6 +248,20 @@ func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
 	}
 }
 
+func TestShutdownCancellationRetriesUntilCoordinatorStops(t *testing.T) {
+	done := make(chan struct{})
+	attempts := 0
+	cancelUntilCoordinatorDone(done, func(timeout time.Duration) error {
+		require.Equal(t, shutdownCancelTimeout, timeout)
+		attempts++
+		if attempts == 2 {
+			close(done)
+		}
+		return syscall.ETIME
+	})
+	require.Equal(t, 2, attempts)
+}
+
 func TestPlaceChainPreservesMixedLinks(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(3, 1, ring)

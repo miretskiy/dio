@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -92,15 +91,14 @@ type URingScheduler struct {
 	registeredBuffers *ringo.FixedBuffers
 	stagingHead       atomic.Pointer[submission]
 	wakeup            chan struct{}
+	done              chan struct{}
 
 	stop atomic.Pointer[error]
 
 	// drainErr records that the coordinator gave up waiting for placed
-	// operations. It is written before wg.Done and read after wg.Wait, so the
-	// WaitGroup supplies the ordering.
+	// operations. It is written before done closes and read after Close observes
+	// that close, so the channel supplies the ordering.
 	drainErr error
-
-	wg sync.WaitGroup
 }
 
 // NewURingScheduler creates an io_uring-backed scheduler. The kernel must
@@ -145,6 +143,7 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 		ring:       ring,
 		fixedFiles: fixedFiles,
 		wakeup:     make(chan struct{}, 1),
+		done:       make(chan struct{}),
 	}
 	if dmaPool != nil {
 		buffers, err := ring.RegisterBuffers(dmaPool.RawData())
@@ -155,7 +154,6 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 		s.registeredPool = dmaPool
 		s.registeredBuffers = buffers
 	}
-	s.wg.Add(1)
 	go s.loop()
 	return s, nil
 }
@@ -249,15 +247,23 @@ func (s *URingScheduler) closeStaging() *submission {
 	return head
 }
 
-// shutdownCancelTimeout bounds each synchronous cancellation attempt during
-// shutdown. Cancellation is best effort, so exceeding it is not an error.
-const shutdownCancelTimeout = time.Second
+const (
+	// shutdownCancelTimeout bounds each synchronous cancellation attempt during
+	// shutdown. Cancellation is best effort, so exceeding it is not an error.
+	shutdownCancelTimeout = time.Second
+	// A cancellation attempt can race a batch being placed. Retry promptly while
+	// the coordinator can still enter a blocking submission, without spinning if
+	// the kernel reports that there is currently nothing to cancel.
+	shutdownCancelRetryDelay = time.Millisecond
+)
 
 // Close stops the coordinator and releases ring resources. Unplaced work is
 // failed with the scheduler-closed error. Placed work retains its resources
 // until its final completion; Close requests cancellation but may wait for
-// noncancelable in-flight file I/O. Close must be called exactly once. Callers
-// must stop submitting first; racing Close with Submit is not supported.
+// noncancelable in-flight file I/O. Cancellation is retried until the
+// coordinator exits, so work placed after an earlier attempt is not missed.
+// Close must be called exactly once. Callers must stop submitting first; racing
+// Close with Submit is not supported.
 //
 // Close returns an error if the ring stopped reporting completions while
 // operations were still placed. Tickets for that work report the same error,
@@ -267,19 +273,13 @@ const shutdownCancelTimeout = time.Second
 func (s *URingScheduler) Close() error {
 	alreadyClosing := !s.signalShutdown(errSchedulerClosed)
 	if !alreadyClosing {
-		// ANY ignores the match key; ALL cancels every request. Bound the
-		// synchronous cancellation call; Close still waits for the coordinator.
-		// This attempt is what breaks a coordinator out of a blocking
-		// SubmitAndWait; the coordinator cancels again before it drains.
-		_ = s.ring.CancelAll(shutdownCancelTimeout)
-
 		// The coordinator may instead be idle on the userspace doorbell.
 		select {
 		case s.wakeup <- struct{}{}:
 		default:
 		}
 	}
-	s.wg.Wait()
+	cancelUntilCoordinatorDone(s.done, s.ring.CancelAll)
 	// Ringo's Close always releases the ring. If the drain gave up, it retains
 	// the operands of whatever is still in flight and reports ringo.ErrPending,
 	// so the registered DMA slab must outlive this call in that case.
@@ -289,6 +289,32 @@ func (s *URingScheduler) Close() error {
 	s.registeredPool = nil
 	s.registeredBuffers = nil
 	return nil
+}
+
+// cancelUntilCoordinatorDone closes the window in which one cancellation can
+// run just before the coordinator places and submits a new batch. It is a
+// shutdown-only path and does not add synchronization to normal I/O.
+func cancelUntilCoordinatorDone(
+	done <-chan struct{},
+	cancel func(time.Duration) error,
+) {
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		// ANY ignores the match key; ALL cancels every request. The operation is
+		// best effort: a noncancelable request keeps Close waiting for the
+		// coordinator, exactly as documented.
+		_ = cancel(shutdownCancelTimeout)
+		select {
+		case <-done:
+			return
+		case <-time.After(shutdownCancelRetryDelay):
+		}
+	}
 }
 
 func (s *URingScheduler) signalShutdown(err error) bool {
@@ -407,7 +433,7 @@ type coordinator struct {
 }
 
 func (s *URingScheduler) loop() {
-	defer s.wg.Done()
+	defer close(s.done)
 
 	c := coordinator{
 		sched: s,

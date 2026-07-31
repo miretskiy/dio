@@ -201,11 +201,11 @@
 // iterator exclusively borrows the Ring; calling another Ring method from its
 // loop body is invalid.
 //
-// CancelAll is the single exception, and it may overlap any other call on the
-// same Ring. That is what lets one goroutine break another out of a blocking
-// SubmitAndWait during shutdown, without which a Ring holding uncancelled work
-// could not be drained at all. It reads only the closed flag and the ring file
-// descriptor, neither of which another method mutates while a Ring is usable.
+// CancelAll is the single exception, and it may overlap another call on the
+// same Ring except Close. That is what lets one goroutine break another out of
+// a blocking SubmitAndWait during shutdown, without which a Ring holding
+// uncancelled work could not be drained at all. Close must not begin until the
+// cancellation call and every other Ring call have returned.
 //
 // Lookups on FixedFiles and FixedBuffers are not Ring methods and carry no such
 // constraint: both tables are immutable for their whole lifetime, including
