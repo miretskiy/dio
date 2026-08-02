@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
@@ -19,22 +20,18 @@ func newIntegrationRing(t *testing.T, options ...Option) *Ring {
 	ring, err := New(options...)
 	if err == nil {
 		t.Cleanup(func() {
-			if err := ring.Close(); err != nil {
-				t.Errorf("close ring: %v", err)
-			}
+			require.NoError(t, ring.Close(), "close ring")
 		})
 		return ring
 	}
-	if os.Getenv("RINGO_REQUIRE_IO_URING") != "" {
-		t.Fatalf("io_uring is required: %v", err)
-	}
+	require.Falsef(t, os.Getenv("RINGO_REQUIRE_IO_URING") != "", "io_uring is required: %v", err)
 	if errors.Is(err, syscall.ENOSYS) ||
 		errors.Is(err, syscall.EPERM) ||
 		errors.Is(err, syscall.EACCES) ||
 		errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Skipf("io_uring unavailable: %v", err)
 	}
-	t.Fatalf("create io_uring: %v", err)
+	require.NoError(t, err, "create io_uring")
 	return nil
 }
 
@@ -49,12 +46,10 @@ func awaitCompletions(t *testing.T, ring *Ring, count int) map[Handle]Completion
 				errors.Is(err, syscall.EBUSY) {
 				continue
 			}
-			t.Fatalf("submit and wait: %v", err)
+			require.NoError(t, err, "submit and wait")
 		}
 		for completion := range ring.Reap() {
-			if completion.Err != nil {
-				t.Fatalf("completion %v: %v", completion.Handle, completion.Err)
-			}
+			require.Falsef(t, completion.Err != nil, "completion %v: %v", completion.Handle, completion.Err)
 			completions[completion.Handle] = completion
 		}
 	}
@@ -64,13 +59,9 @@ func awaitCompletions(t *testing.T, ring *Ring, count int) map[Handle]Completion
 func TestRingIntegrationReadWriteAndVectoredIO(t *testing.T) {
 	ring := newIntegrationRing(t, WithDepth(8))
 	file, err := os.CreateTemp(t.TempDir(), "ringo-io-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = file.Close() })
-	if err := file.Truncate(4096); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, file.Truncate(4096))
 
 	write := []byte("lifetime-safe")
 	read := make([]byte, len(write))
@@ -79,21 +70,13 @@ func TestRingIntegrationReadWriteAndVectoredIO(t *testing.T) {
 		Then(LinkSoft, Fdatasync(FileFD(file))),
 		Then(LinkSoft, Read(FileFD(file), read, 0)),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.False(t, err != nil, err)
 	growStack(64)
 	runtime.GC()
 	completions := awaitCompletions(t, ring, len(handles))
-	if got := completions[handles[0]].Result; got != len(write) {
-		t.Fatalf("write result: got %d want %d", got, len(write))
-	}
-	if got := completions[handles[2]].Result; got != len(read) {
-		t.Fatalf("read result: got %d want %d", got, len(read))
-	}
-	if string(read) != string(write) {
-		t.Fatalf("read data: got %q want %q", read, write)
-	}
+	require.EqualValues(t, len(write), completions[handles[0]].Result, "write result")
+	require.EqualValues(t, len(read), completions[handles[2]].Result, "read result")
+	require.Falsef(t, string(read) != string(write), "read data: got %q want %q", read, write)
 
 	vectorWrite := [][]byte{[]byte("vector-"), nil, []byte("io")}
 	vectorRead := [][]byte{make([]byte, 7), nil, make([]byte, 2)}
@@ -101,27 +84,17 @@ func TestRingIntegrationReadWriteAndVectoredIO(t *testing.T) {
 		Writev(FileFD(file), vectorWrite, 128, 0),
 		Then(LinkSoft, Readv(FileFD(file), vectorRead, 128, 0)),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.False(t, err != nil, err)
 	completions = awaitCompletions(t, ring, len(handles))
-	if got := completions[handles[0]].Result; got != 9 {
-		t.Fatalf("writev result: got %d want 9", got)
-	}
-	if got := completions[handles[1]].Result; got != 9 {
-		t.Fatalf("readv result: got %d want 9", got)
-	}
-	if got := string(vectorRead[0]) + string(vectorRead[2]); got != "vector-io" {
-		t.Fatalf("readv data: got %q want vector-io", got)
-	}
+	require.EqualValues(t, 9, completions[handles[0]].Result, "writev result")
+	require.EqualValues(t, 9, completions[handles[1]].Result, "readv result")
+	require.EqualValues(t, "vector-io", string(vectorRead[0])+string(vectorRead[2]), "readv data")
 }
 
 func TestRingIntegrationDirectFileLifecycle(t *testing.T) {
 	ring := newIntegrationRing(t, WithDepth(8), WithFixedFiles(1))
 	slot, err := ring.FixedFiles().File(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	path := filepath.Join(t.TempDir(), "direct.dat")
 	write := []byte("direct-file")
 	read := make([]byte, len(write))
@@ -133,13 +106,9 @@ func TestRingIntegrationDirectFileLifecycle(t *testing.T) {
 		slot,
 	)
 	openHandle, err := ring.Push(open)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	openCompletions := awaitCompletions(t, ring, 1)
-	if completion := openCompletions[openHandle]; completion.Err != nil {
-		t.Fatalf("direct open: %v", completion.Err)
-	}
+	require.NoError(t, openCompletions[openHandle].Err, "direct open")
 
 	handles, err := ring.PushLinked(
 		Fallocate(FixedFD(slot), 0, 4096),
@@ -148,141 +117,92 @@ func TestRingIntegrationDirectFileLifecycle(t *testing.T) {
 		Then(LinkHard, Read(FixedFD(slot), read, 0)),
 		Then(LinkHard, CloseDirect(slot)),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.False(t, err != nil, err)
 	runtime.GC()
 	completions := awaitCompletions(t, ring, len(handles))
-	if got := completions[handles[1]].Result; got != len(write) {
-		t.Fatalf("direct write result: got %d want %d", got, len(write))
-	}
-	if got := completions[handles[3]].Result; got != len(read) {
-		t.Fatalf("direct read result: got %d want %d", got, len(read))
-	}
-	if string(read) != string(write) {
-		t.Fatalf("direct read data: got %q want %q", read, write)
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("direct-opened file: %v", err)
-	}
+	require.EqualValues(t, len(write), completions[handles[1]].Result, "direct write result")
+	require.EqualValues(t, len(read), completions[handles[3]].Result, "direct read result")
+	require.Falsef(t, string(read) != string(write), "direct read data: got %q want %q", read, write)
+	_, err = os.Stat(path)
+	require.NoError(t, err, "direct-opened file")
 }
 
 func TestRingIntegrationLinkedDirectOpen(t *testing.T) {
 	ring := newIntegrationRing(t, WithDepth(4), WithFixedFiles(1))
 	slot, err := ring.FixedFiles().File(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	path := filepath.Join(t.TempDir(), "linked-direct.dat")
 	data := []byte("open-and-write")
 	handles, err := ring.PushLinked(
 		OpenAtDirect(AtCWD(), path, unix.O_CREAT|unix.O_RDWR, 0o600, slot),
 		Then(LinkSoft, Write(FixedFD(slot), data, 0)),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.False(t, err != nil, err)
 	completions := awaitCompletions(t, ring, len(handles))
 	for _, handle := range handles {
-		if completion := completions[handle]; completion.Err != nil {
-			t.Fatalf("linked direct operation: %v", completion.Err)
-		}
+		require.NoError(t, completions[handle].Err, "linked direct operation")
 	}
-	if got, err := os.ReadFile(path); err != nil || string(got) != string(data) {
-		t.Fatalf("linked direct file: data=%q err=%v", got, err)
-	}
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err, "linked direct file")
+	require.Equal(t, string(data), string(contents), "linked direct file")
 	closeHandle, err := ring.Push(CloseDirect(slot))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completion := awaitCompletions(t, ring, 1)[closeHandle]; completion.Err != nil {
-		t.Fatalf("close direct file: %v", completion.Err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, awaitCompletions(t, ring, 1)[closeHandle].Err,
+		"close direct file")
 }
 
 func TestRingIntegrationProbeEventFDAndRegisteredFiles(t *testing.T) {
 	ring := newIntegrationRing(t, WithDepth(4))
 
 	probe, err := ring.Probe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !probe.Supports(Nop()) {
-		t.Fatal("kernel probe did not report IORING_OP_NOP")
-	}
+	require.NoError(t, err)
+	require.True(t, probe.Supports(Nop()), "kernel probe did not report IORING_OP_NOP")
 
 	eventFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	eventFile := os.NewFile(uintptr(eventFD), "ringo-eventfd")
 	t.Cleanup(func() { _ = eventFile.Close() })
-	if err := ring.RegisterEventFD(eventFile); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, ring.RegisterEventFD(eventFile))
 	eventHandle, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ring.SubmitAndWait(1); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
+	_, err = ring.SubmitAndWait(1)
+	require.NoError(t, err)
 	var notification [8]byte
-	if count, err := unix.Read(eventFD, notification[:]); err != nil || count != len(notification) {
-		t.Fatalf("read eventfd notification: count=%d err=%v", count, err)
-	}
-	if value := binary.NativeEndian.Uint64(notification[:]); value == 0 {
-		t.Fatal("eventfd notification count is zero")
-	}
+	count, err := unix.Read(eventFD, notification[:])
+	require.NoError(t, err, "read eventfd notification")
+	require.Equal(t, len(notification), count, "read eventfd notification")
+	require.NotZero(t, binary.NativeEndian.Uint64(notification[:]),
+		"eventfd notification count is zero")
 	completions := collect(ring.Reap())
-	if len(completions) != 1 || completions[0].Handle != eventHandle ||
-		completions[0].Err != nil {
-		t.Fatalf("eventfd completion: %+v", completions)
-	}
-	if err := ring.UnregisterEventFD(); err != nil {
-		t.Fatal(err)
-	}
+	require.Len(t, completions, 1, "eventfd completion")
+	require.Equal(t, eventHandle, completions[0].Handle, "eventfd completion")
+	require.NoError(t, completions[0].Err, "eventfd completion")
+	require.NoError(t, ring.UnregisterEventFD())
 
 	file, err := os.CreateTemp(t.TempDir(), "ringo-registered-file-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = file.Close() })
 	files, err := ring.RegisterFiles(file)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	slot, err := files.File(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	data := []byte("registered-file")
 	write, err := ring.Push(Write(FixedFD(slot), data, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := awaitCompletions(t, ring, 1)[write].Result; got != len(data) {
-		t.Fatalf("registered-file write: got %d want %d", got, len(data))
-	}
+	require.NoError(t, err)
+	require.EqualValues(t, len(data), awaitCompletions(t, ring, 1)[write].Result, "registered-file write")
 }
 
 func TestRingIntegrationFixedFilesUpdate(t *testing.T) {
 	ring := newIntegrationRing(t, WithDepth(2), WithFixedFiles(1))
 	files := ring.FixedFiles()
 	slot, err := files.File(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	first, err := os.CreateTemp(t.TempDir(), "ringo-fixed-update-first-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = first.Close() })
 	second, err := os.CreateTemp(t.TempDir(), "ringo-fixed-update-second-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = second.Close() })
 
 	for _, test := range []struct {
@@ -292,27 +212,23 @@ func TestRingIntegrationFixedFilesUpdate(t *testing.T) {
 		{file: first, data: []byte("first")},
 		{file: second, data: []byte("second")},
 	} {
-		if updated, err := files.Update(0, test.file); err != nil || updated != 1 {
-			t.Fatalf("update fixed file: updated=%d err=%v", updated, err)
-		}
+		updated, err := files.Update(0, test.file)
+		require.NoError(t, err, "update fixed file")
+		require.Equal(t, 1, updated, "update fixed file")
 		handle, err := ring.Push(Write(FixedFD(slot), test.data, 0))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := awaitCompletions(t, ring, 1)[handle].Result; got != len(test.data) {
-			t.Fatalf("fixed-file write: got %d want %d", got, len(test.data))
-		}
+		require.NoError(t, err)
+		require.EqualValues(t, len(test.data), awaitCompletions(t, ring, 1)[handle].Result, "fixed-file write")
 	}
 
-	if got, err := os.ReadFile(first.Name()); err != nil || string(got) != "first" {
-		t.Fatalf("first fixed file: data=%q err=%v", got, err)
-	}
-	if got, err := os.ReadFile(second.Name()); err != nil || string(got) != "second" {
-		t.Fatalf("second fixed file: data=%q err=%v", got, err)
-	}
-	if updated, err := files.Update(0, nil); err != nil || updated != 1 {
-		t.Fatalf("clear fixed file: updated=%d err=%v", updated, err)
-	}
+	firstContents, err := os.ReadFile(first.Name())
+	require.NoError(t, err, "first fixed file")
+	require.Equal(t, "first", string(firstContents), "first fixed file")
+	secondContents, err := os.ReadFile(second.Name())
+	require.NoError(t, err, "second fixed file")
+	require.Equal(t, "second", string(secondContents), "second fixed file")
+	updated, err := files.Update(0, nil)
+	require.NoError(t, err, "clear fixed file")
+	require.Equal(t, 1, updated, "clear fixed file")
 }
 
 func TestRingIntegrationMmapBackedFixedBuffer(t *testing.T) {
@@ -323,50 +239,33 @@ func TestRingIntegrationMmapBackedFixedBuffer(t *testing.T) {
 		syscall.PROT_READ|syscall.PROT_WRITE,
 		syscall.MAP_PRIVATE|syscall.MAP_ANON,
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.False(t, err != nil, err)
 	t.Cleanup(func() {
-		if err := syscall.Munmap(memory); err != nil {
-			t.Errorf("unmap registered buffer: %v", err)
-		}
+		require.NoError(t, syscall.Munmap(memory), "unmap registered buffer")
 	})
 
 	// Register the Ring cleanup after the mapping cleanup so it runs first.
 	ring := newIntegrationRing(t, WithDepth(2))
 	copy(memory, "mmap-registered")
 	set, err := ring.RegisterBuffers(memory)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	buffer, err := set.Buffer(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	file, err := os.CreateTemp(t.TempDir(), "ringo-mmap-buffer-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = file.Close() })
 	handle, err := ring.Push(WriteFixed(FileFD(file), buffer, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := awaitCompletions(t, ring, 1)[handle].Result; got != len(memory) {
-		t.Fatalf("mmap registered-buffer write: got %d want %d", got, len(memory))
-	}
+	require.NoError(t, err)
+	require.EqualValues(t, len(memory), awaitCompletions(t, ring, 1)[handle].Result, "mmap registered-buffer write")
 }
 
 func TestRingIntegrationSetupModes(t *testing.T) {
 	assertNop := func(t *testing.T, ring *Ring) {
 		t.Helper()
 		handle, err := ring.Push(Nop())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := awaitCompletions(t, ring, 1)[handle]; !ok {
-			t.Fatal("setup-mode completion is missing")
-		}
+		require.NoError(t, err)
+		_, completed := awaitCompletions(t, ring, 1)[handle]
+		require.True(t, completed, "setup-mode completion is missing")
 	}
 
 	t.Run("queue-layout-and-taskrun", func(t *testing.T) {
@@ -382,14 +281,10 @@ func TestRingIntegrationSetupModes(t *testing.T) {
 	t.Run("submission-queue-polling", func(t *testing.T) {
 		ring := newIntegrationRing(t, WithDepth(2), WithSQPoll())
 		handle, err := ring.Push(Nop())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := ring.Submit(); err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := awaitCompletions(t, ring, 1)[handle]; !ok {
-			t.Fatal("SQPOLL completion is missing")
-		}
+		require.NoError(t, err)
+		_, err = ring.Submit()
+		require.NoError(t, err)
+		_, completed := awaitCompletions(t, ring, 1)[handle]
+		require.True(t, completed, "SQPOLL completion is missing")
 	})
 }

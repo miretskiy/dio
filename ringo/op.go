@@ -22,10 +22,10 @@ const (
 // discard every interface copy and use only its Handle. A push that returns an
 // error leaves ownership with the caller.
 //
-// Go cannot express that transfer, and Ringo does not police it. Constructors
-// may draw an Op from an internal pool, and the Ring may recycle one after
-// releasing its final completion, so a retained alias can come to refer to an
-// unrelated operation. Reusing a pushed Op is undefined, not diagnosed.
+// Go cannot express that transfer, and Ringo does not police it. An operation
+// constructed WithAlloc returns to that OpAlloc once the Ring releases its final
+// completion, so a retained alias can come to refer to an unrelated operation.
+// Reusing a pushed Op is undefined, not diagnosed.
 type Op interface {
 	op()
 	release()
@@ -33,6 +33,27 @@ type Op interface {
 	validate(*Ring) error
 	prepare(*rawSQE)
 	Drain()
+}
+
+// OpAlloc recycles operation objects. Pass one to a constructor with WithAlloc
+// and the object returns to it once the Ring reaps that operation's final
+// completion, ready for the next constructor to reuse. Leave it out and the
+// operation is allocated and left to the garbage collector, so a caller
+// recycles the operations worth recycling and ignores the rest. An operation
+// returns only to the OpAlloc it came from.
+//
+// An OpAlloc is not synchronized. Use one per goroutine that builds and reaps
+// operations; a Ring driven by a single goroutine pairs with a single OpAlloc.
+//
+// It holds at most as many objects of each kind as the Ring can have operations
+// in flight, so it needs no sizing. The zero value is ready to use.
+type OpAlloc struct {
+	freeListAlloc
+}
+
+// WithAlloc draws the operation from alloc rather than allocating it.
+func WithAlloc(alloc *OpAlloc) OpOption {
+	return OpOption{alloc: alloc}
 }
 
 // LinkType selects the failure semantics for a chain queued by PushLinked.
@@ -59,17 +80,15 @@ func Then(linkType LinkType, next Op) Link {
 }
 
 // opBase is the only state common to all operations. It carries the SQE drain
-// flag and a constructor error; operation arguments remain in their concrete
-// operation type.
+// flag, a constructor error, and the OpAlloc release must return the object to;
+// operation arguments remain in their concrete operation type.
 type opBase struct {
 	sqeFlags rawSQEFlags
 	invalid  error
+	alloc    *OpAlloc
 }
 
 func (opBase) op() {
-}
-
-func (*opBase) release() {
 }
 
 func (base opBase) validate() error {
@@ -107,6 +126,17 @@ type nopOp struct {
 	opBase
 }
 
+func (op *nopOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.nops.put(op)
+}
+
+func (op *nopOp) reset() { *op = nopOp{} }
+
 func (op *nopOp) opcode() rawOpcode {
 	return rawOpNop
 }
@@ -122,6 +152,265 @@ func (op *nopOp) prepare(sqe *rawSQE) {
 
 // Nop constructs an operation that performs no I/O.
 // liburing: io_uring_prep_nop - https://man7.org/linux/man-pages/man3/io_uring_prep_nop.3.html
-func Nop() Op {
-	return &nopOp{}
+func Nop(options ...OpOption) Op {
+	alloc := optionAlloc(options)
+	return alloc.newNopOp()
+}
+
+// freeList recycles the objects of one operation type. Its zero value is an
+// empty list whose get allocates.
+type freeList[T any] struct {
+	free []*T
+}
+
+// get returns a zeroed operation, either recycled or newly allocated.
+// Constructors rely on that: they assign only the fields they care about
+// rather than writing a whole struct literal, so anything a previous operation
+// left behind -- a stale buffer, a Drain flag, a constructor error -- must
+// already be gone. release guarantees it by resetting before parking.
+func (list *freeList[T]) get() *T {
+	if count := len(list.free); count != 0 {
+		op := list.free[count-1]
+		list.free[count-1] = nil
+		list.free = list.free[:count-1]
+		return op
+	}
+	return new(T)
+}
+
+func (list *freeList[T]) put(op *T) {
+	list.free = append(list.free, op)
+}
+
+type freeListAlloc struct {
+	nops           freeList[nopOp]
+	reads          freeList[readOp]
+	writes         freeList[writeOp]
+	readvs         freeList[readvOp]
+	writevs        freeList[writevOp]
+	fsyncs         freeList[fsyncOp]
+	fallocates     freeList[fallocateOp]
+	openAts        freeList[openAtOp]
+	openAt2s       freeList[openAt2Op]
+	statxes        freeList[statxOp]
+	ftruncates     freeList[ftruncateOp]
+	closeDirects   freeList[closeDirectOp]
+	closeFDs       freeList[closeFDOp]
+	timeouts       freeList[timeoutOp]
+	linkTimeouts   freeList[linkTimeoutOp]
+	timeoutRemoves freeList[timeoutRemoveOp]
+	timeoutUpdates freeList[timeoutUpdateOp]
+	cancels        freeList[cancelOp]
+	cancelFDs      freeList[cancelFDOp]
+	pollAdds       freeList[pollAddOp]
+	pollRemoves    freeList[pollRemoveOp]
+}
+
+// The constructors below draw one operation from alloc, or allocate when the
+// caller supplied none. A nil receiver is that no-allocator case: the operation
+// records no OpAlloc, so its release leaves it to the garbage collector.
+
+func (alloc *OpAlloc) newNopOp() *nopOp {
+	if alloc == nil {
+		return new(nopOp)
+	}
+	op := alloc.nops.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newReadOp() *readOp {
+	if alloc == nil {
+		return new(readOp)
+	}
+	op := alloc.reads.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newWriteOp() *writeOp {
+	if alloc == nil {
+		return new(writeOp)
+	}
+	op := alloc.writes.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newReadvOp() *readvOp {
+	if alloc == nil {
+		return new(readvOp)
+	}
+	op := alloc.readvs.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newWritevOp() *writevOp {
+	if alloc == nil {
+		return new(writevOp)
+	}
+	op := alloc.writevs.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newFsyncOp() *fsyncOp {
+	if alloc == nil {
+		return new(fsyncOp)
+	}
+	op := alloc.fsyncs.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newFallocateOp() *fallocateOp {
+	if alloc == nil {
+		return new(fallocateOp)
+	}
+	op := alloc.fallocates.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newOpenAtOp() *openAtOp {
+	if alloc == nil {
+		return new(openAtOp)
+	}
+	op := alloc.openAts.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newOpenAt2Op() *openAt2Op {
+	if alloc == nil {
+		return new(openAt2Op)
+	}
+	op := alloc.openAt2s.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newStatxOp() *statxOp {
+	if alloc == nil {
+		return new(statxOp)
+	}
+	op := alloc.statxes.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newFtruncateOp() *ftruncateOp {
+	if alloc == nil {
+		return new(ftruncateOp)
+	}
+	op := alloc.ftruncates.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newCloseDirectOp() *closeDirectOp {
+	if alloc == nil {
+		return new(closeDirectOp)
+	}
+	op := alloc.closeDirects.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newCloseFDOp() *closeFDOp {
+	if alloc == nil {
+		return new(closeFDOp)
+	}
+	op := alloc.closeFDs.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newTimeoutOp() *timeoutOp {
+	if alloc == nil {
+		return new(timeoutOp)
+	}
+	op := alloc.timeouts.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newLinkTimeoutOp() *linkTimeoutOp {
+	if alloc == nil {
+		return new(linkTimeoutOp)
+	}
+	op := alloc.linkTimeouts.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newTimeoutRemoveOp() *timeoutRemoveOp {
+	if alloc == nil {
+		return new(timeoutRemoveOp)
+	}
+	op := alloc.timeoutRemoves.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newTimeoutUpdateOp() *timeoutUpdateOp {
+	if alloc == nil {
+		return new(timeoutUpdateOp)
+	}
+	op := alloc.timeoutUpdates.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newCancelOp() *cancelOp {
+	if alloc == nil {
+		return new(cancelOp)
+	}
+	op := alloc.cancels.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newCancelFDOp() *cancelFDOp {
+	if alloc == nil {
+		return new(cancelFDOp)
+	}
+	op := alloc.cancelFDs.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newPollAddOp() *pollAddOp {
+	if alloc == nil {
+		return new(pollAddOp)
+	}
+	op := alloc.pollAdds.get()
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newPollRemoveOp() *pollRemoveOp {
+	if alloc == nil {
+		return new(pollRemoveOp)
+	}
+	op := alloc.pollRemoves.get()
+	op.alloc = alloc
+	return op
+}
+
+// OpOption configures an operation at construction. It is a plain value, so
+// passing one allocates nothing.
+type OpOption struct {
+	alloc *OpAlloc
+}
+
+func optionAlloc(options []OpOption) *OpAlloc {
+	var alloc *OpAlloc
+	for _, option := range options {
+		if option.alloc != nil {
+			alloc = option.alloc
+		}
+	}
+	return alloc
 }

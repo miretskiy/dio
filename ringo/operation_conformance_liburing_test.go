@@ -1,4 +1,4 @@
-//go:build linux && cgo && liburing_conformance
+//go:build linux && cgo
 
 package ringo
 
@@ -39,8 +39,9 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 	writev := &writevOp{
 		fd: BorrowedFD(fd), iovecs: make([]syscall.Iovec, 2), offset: 17,
 	}
-	openat := newOpenAtOp(BorrowedFD(unix.AT_FDCWD), "file.dat", 0x42, 0o600, nil)
+	openat := newOpenAtOp(nil, BorrowedFD(unix.AT_FDCWD), "file.dat", 0x42, 0o600, nil)
 	openatDirect := newOpenAtOp(
+		nil,
 		BorrowedFD(unix.AT_FDCWD),
 		"file.dat",
 		0x42,
@@ -84,7 +85,7 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 		},
 		{
 			name: "read-fixed",
-			op:   newReadOp(BorrowedFD(fd), buffer, 17, registered, true),
+			op:   newReadOp(nil, BorrowedFD(fd), buffer, 17, registered, true),
 			want: func(rawSQE) liburingoracle.SQE {
 				return liburingoracle.PrepareReadFixed(
 					fd,
@@ -111,7 +112,7 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 		},
 		{
 			name: "write-fixed",
-			op:   newWriteOp(BorrowedFD(fd), buffer, 17, registered, true),
+			op:   newWriteOp(nil, BorrowedFD(fd), buffer, 17, registered, true),
 			want: func(rawSQE) liburingoracle.SQE {
 				return liburingoracle.PrepareWriteFixed(
 					fd,
@@ -356,23 +357,6 @@ func TestOperationPreparationMatchesLiburing(t *testing.T) {
 				return liburingoracle.Prepare(
 					liburingoracle.PrepareClose,
 					fd,
-				)
-			},
-		},
-		{
-			name: "poll-update",
-			op: PollUpdate(
-				handle,
-				unix.POLLIN,
-				PollUpdateMultishot,
-			),
-			want: func(rawSQE) liburingoracle.SQE {
-				return liburingoracle.Prepare(
-					liburingoracle.PreparePollUpdate,
-					handleSlot,
-					handleSlot,
-					unix.POLLIN,
-					uint64(PollUpdateMultishot|pollUpdateEvents),
 				)
 			},
 		},

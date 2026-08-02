@@ -81,15 +81,20 @@
 // not reap, CQ and pending-slot capacity remain occupied and Push
 // eventually returns ErrFull. Ringo has no background reaper.
 //
-// A submit call may report both progress and an error. That error does not
-// return ownership of pushed operations to the caller.
+// A submit call reports either progress or an error, never both:
+// io_uring_enter returns the number of entries it consumed, and only reports a
+// wait error when it consumed none. An error does not return ownership of
+// pushed operations to the caller either way.
 //
 // Ring.Close always closes the io_uring descriptor and never waits. Reaping
 // every pushed operation first is the orderly close, and the only one that
 // releases everything. Closing with operations still pending is allowed but
 // permanently retains the Ring and their operands, and reports ErrPending:
 // kernel ring teardown is asynchronous and unobservable, so it is not an
-// operation-lifetime barrier, and no later moment is provably safe either.
+// operation-lifetime barrier, and no later moment is provably safe either. What
+// one such Close retains is bounded by that Ring's capacity, but nothing is ever
+// released, so a program that repeatedly closes Rings with work in flight
+// accumulates one retention per Ring for the life of the process.
 //
 // # Operations and memory safety
 //
@@ -141,9 +146,13 @@
 //
 // Go cannot express that transfer the way a move-only type would, so the rule
 // is documented rather than enforced: Ringo does not track or diagnose reuse.
-// Constructors may draw an Op from an internal pool, and the Ring may recycle
-// one once it has released its final completion, so a retained alias can come
-// to refer to an unrelated operation. Using a pushed Op again is undefined.
+// An operation constructed WithAlloc returns to that OpAlloc once the Ring has
+// released its final completion, so a retained alias can come to refer to an
+// unrelated operation. Using a pushed Op again is undefined.
+//
+// Ringo keeps no pool of its own. An OpAlloc is caller-owned, opted into per
+// operation, and unsynchronized, so recycling is a decision the caller makes
+// rather than one the library makes on its behalf.
 //
 // Retention keeps referenced memory alive; it does not freeze that memory or
 // revoke the caller's other aliases. These rules apply to every alias of an
@@ -208,9 +217,12 @@
 // cancellation call and every other Ring call have returned.
 //
 // Lookups on FixedFiles and FixedBuffers are not Ring methods and carry no such
-// constraint: both tables are immutable for their whole lifetime, including
-// across Ring.Close, so a submitting goroutine may validate a buffer while
-// another reaps.
+// constraint. Neither lookup mutates anything, and the state they read is fixed
+// for the table's whole lifetime, including across Ring.Close, so a submitting
+// goroutine may validate a buffer while another reaps. FixedFiles.Update is the
+// exception: it issues a registration syscall on the Ring and rewrites the
+// table's retained files, so it must be serialized with Ring calls exactly as
+// though it were one.
 //
 // # File descriptors and registered resources
 //

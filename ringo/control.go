@@ -37,6 +37,17 @@ type timeoutOp struct {
 	flags TimeoutFlags
 }
 
+func (op *timeoutOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.timeouts.put(op)
+}
+
+func (op *timeoutOp) reset() { *op = timeoutOp{} }
+
 func (op *timeoutOp) opcode() rawOpcode { return rawOpTimeout }
 func (op *timeoutOp) validate(*Ring) error {
 	if err := op.opBase.validate(); err != nil {
@@ -63,8 +74,15 @@ func (op *timeoutOp) prepare(sqe *rawSQE) {
 
 // Timeout constructs IORING_OP_TIMEOUT and copies spec.
 // liburing: io_uring_prep_timeout - https://man7.org/linux/man-pages/man3/io_uring_prep_timeout.3.html
-func Timeout(spec syscall.Timespec, count uint32, flags TimeoutFlags) Op {
-	return &timeoutOp{spec: ownedTimespec(spec), count: count, flags: flags}
+func Timeout(
+	spec syscall.Timespec,
+	count uint32,
+	flags TimeoutFlags,
+	options ...OpOption,
+) Op {
+	op := optionAlloc(options).newTimeoutOp()
+	op.spec, op.count, op.flags = ownedTimespec(spec), count, flags
+	return op
 }
 
 type linkTimeoutOp struct {
@@ -72,6 +90,17 @@ type linkTimeoutOp struct {
 	spec  rawTimespec
 	flags TimeoutFlags
 }
+
+func (op *linkTimeoutOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.linkTimeouts.put(op)
+}
+
+func (op *linkTimeoutOp) reset() { *op = linkTimeoutOp{} }
 
 func (op *linkTimeoutOp) opcode() rawOpcode { return rawOpLinkTimeout }
 func (op *linkTimeoutOp) validate(*Ring) error {
@@ -98,14 +127,31 @@ func (op *linkTimeoutOp) prepare(sqe *rawSQE) {
 // LinkTimeout constructs a timeout for the preceding linked request and
 // copies spec.
 // liburing: io_uring_prep_link_timeout - https://man7.org/linux/man-pages/man3/io_uring_prep_link_timeout.3.html
-func LinkTimeout(spec syscall.Timespec, flags TimeoutFlags) Op {
-	return &linkTimeoutOp{spec: ownedTimespec(spec), flags: flags}
+func LinkTimeout(
+	spec syscall.Timespec,
+	flags TimeoutFlags,
+	options ...OpOption,
+) Op {
+	op := optionAlloc(options).newLinkTimeoutOp()
+	op.spec, op.flags = ownedTimespec(spec), flags
+	return op
 }
 
 type timeoutRemoveOp struct {
 	opBase
 	target Handle
 }
+
+func (op *timeoutRemoveOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.timeoutRemoves.put(op)
+}
+
+func (op *timeoutRemoveOp) reset() { *op = timeoutRemoveOp{} }
 
 func (op *timeoutRemoveOp) opcode() rawOpcode { return rawOpTimeoutRemove }
 func (op *timeoutRemoveOp) validate(ring *Ring) error {
@@ -125,8 +171,10 @@ func (op *timeoutRemoveOp) prepare(sqe *rawSQE) {
 
 // TimeoutRemove removes the timeout identified by target.
 // liburing: io_uring_prep_timeout_remove - https://man7.org/linux/man-pages/man3/io_uring_prep_timeout_remove.3.html
-func TimeoutRemove(target Handle) Op {
-	return &timeoutRemoveOp{target: target}
+func TimeoutRemove(target Handle, options ...OpOption) Op {
+	op := optionAlloc(options).newTimeoutRemoveOp()
+	op.target = target
+	return op
 }
 
 type timeoutUpdateOp struct {
@@ -135,6 +183,17 @@ type timeoutUpdateOp struct {
 	target Handle
 	flags  TimeoutUpdateFlags
 }
+
+func (op *timeoutUpdateOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.timeoutUpdates.put(op)
+}
+
+func (op *timeoutUpdateOp) reset() { *op = timeoutUpdateOp{} }
 
 func (op *timeoutUpdateOp) opcode() rawOpcode { return rawOpTimeoutRemove }
 func (op *timeoutUpdateOp) validate(ring *Ring) error {
@@ -163,16 +222,28 @@ func TimeoutUpdate(
 	spec syscall.Timespec,
 	target Handle,
 	flags TimeoutUpdateFlags,
+	options ...OpOption,
 ) Op {
-	return &timeoutUpdateOp{
-		spec: ownedTimespec(spec), target: target, flags: flags,
-	}
+	op := optionAlloc(options).newTimeoutUpdateOp()
+	op.spec, op.target, op.flags = ownedTimespec(spec), target, flags
+	return op
 }
 
 type cancelOp struct {
 	opBase
 	target Handle
 }
+
+func (op *cancelOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.cancels.put(op)
+}
+
+func (op *cancelOp) reset() { *op = cancelOp{} }
 
 func (op *cancelOp) opcode() rawOpcode { return rawOpAsyncCancel }
 func (op *cancelOp) validate(ring *Ring) error {
@@ -192,8 +263,10 @@ func (op *cancelOp) prepare(sqe *rawSQE) {
 
 // Cancel requests cancellation of the operation identified by target.
 // liburing: io_uring_prep_cancel64 - https://man7.org/linux/man-pages/man3/io_uring_prep_cancel64.3.html
-func Cancel(target Handle) Op {
-	return &cancelOp{target: target}
+func Cancel(target Handle, options ...OpOption) Op {
+	op := optionAlloc(options).newCancelOp()
+	op.target = target
+	return op
 }
 
 type cancelFDOp struct {
@@ -201,6 +274,17 @@ type cancelFDOp struct {
 	fd  FD
 	all bool
 }
+
+func (op *cancelFDOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.cancelFDs.put(op)
+}
+
+func (op *cancelFDOp) reset() { *op = cancelFDOp{} }
 
 func (op *cancelFDOp) opcode() rawOpcode { return rawOpAsyncCancel }
 func (op *cancelFDOp) validate(ring *Ring) error {
@@ -224,14 +308,20 @@ func (op *cancelFDOp) prepare(sqe *rawSQE) {
 
 // CancelFD requests cancellation by descriptor rather than by Handle.
 // liburing: io_uring_prep_cancel_fd - https://man7.org/linux/man-pages/man3/io_uring_prep_cancel_fd.3.html
-func CancelFD(fd FD) Op {
-	return &cancelFDOp{fd: fd}
+func CancelFD(fd FD, options ...OpOption) Op {
+	return newCancelFDOp(optionAlloc(options), fd, false)
+}
+
+func newCancelFDOp(alloc *OpAlloc, fd FD, all bool) *cancelFDOp {
+	op := alloc.newCancelFDOp()
+	op.fd, op.all = fd, all
+	return op
 }
 
 // CancelAllFD requests cancellation of every operation using fd.
 // liburing: io_uring_prep_cancel_fd - https://man7.org/linux/man-pages/man3/io_uring_prep_cancel_fd.3.html
-func CancelAllFD(fd FD) Op {
-	return &cancelFDOp{fd: fd, all: true}
+func CancelAllFD(fd FD, options ...OpOption) Op {
+	return newCancelFDOp(optionAlloc(options), fd, true)
 }
 
 type pollAddOp struct {
@@ -240,6 +330,17 @@ type pollAddOp struct {
 	mask      uint32
 	multishot bool
 }
+
+func (op *pollAddOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.pollAdds.put(op)
+}
+
+func (op *pollAddOp) reset() { *op = pollAddOp{} }
 
 func (op *pollAddOp) opcode() rawOpcode { return rawOpPollAdd }
 func (op *pollAddOp) validate(ring *Ring) error {
@@ -266,18 +367,37 @@ func (op *pollAddOp) prepare(sqe *rawSQE) {
 
 // PollAdd starts a poll request for mask.
 // liburing: io_uring_prep_poll_add - https://man7.org/linux/man-pages/man3/io_uring_prep_poll_add.3.html
-func PollAdd(fd FD, mask uint32) Op { return &pollAddOp{fd: fd, mask: mask} }
+func PollAdd(fd FD, mask uint32, options ...OpOption) Op {
+	return newPollAddOp(optionAlloc(options), fd, mask, false)
+}
+
+func newPollAddOp(alloc *OpAlloc, fd FD, mask uint32, multishot bool) *pollAddOp {
+	op := alloc.newPollAddOp()
+	op.fd, op.mask, op.multishot = fd, mask, multishot
+	return op
+}
 
 // PollMultishot starts a multishot poll request.
 // liburing: io_uring_prep_poll_multishot - https://man7.org/linux/man-pages/man3/io_uring_prep_poll_multishot.3.html
-func PollMultishot(fd FD, mask uint32) Op {
-	return &pollAddOp{fd: fd, mask: mask, multishot: true}
+func PollMultishot(fd FD, mask uint32, options ...OpOption) Op {
+	return newPollAddOp(optionAlloc(options), fd, mask, true)
 }
 
 type pollRemoveOp struct {
 	opBase
 	target Handle
 }
+
+func (op *pollRemoveOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.pollRemoves.put(op)
+}
+
+func (op *pollRemoveOp) reset() { *op = pollRemoveOp{} }
 
 func (op *pollRemoveOp) opcode() rawOpcode { return rawOpPollRemove }
 func (op *pollRemoveOp) validate(ring *Ring) error {
@@ -297,43 +417,19 @@ func (op *pollRemoveOp) prepare(sqe *rawSQE) {
 
 // PollRemove removes the poll request identified by target.
 // liburing: io_uring_prep_poll_remove - https://man7.org/linux/man-pages/man3/io_uring_prep_poll_remove.3.html
-func PollRemove(target Handle) Op { return &pollRemoveOp{target: target} }
-
-type pollUpdateOp struct {
-	opBase
-	target Handle
-	mask   uint32
-	flags  PollUpdateFlags
+func PollRemove(target Handle, options ...OpOption) Op {
+	op := optionAlloc(options).newPollRemoveOp()
+	op.target = target
+	return op
 }
 
-func (op *pollUpdateOp) opcode() rawOpcode { return rawOpPollRemove }
-func (op *pollUpdateOp) validate(ring *Ring) error {
-	if err := op.opBase.validate(); err != nil {
-		return err
-	}
-	const allowed = PollUpdateMultishot | PollUpdateLevel
-	if op.flags&^allowed != 0 {
-		return errors.New("ringo: invalid poll-update flags")
-	}
-	return validateHandle(ring, op.target)
-}
-func (op *pollUpdateOp) prepare(sqe *rawSQE) {
-	*sqe = rawSQE{
-		Opcode:   uint8(rawOpPollRemove),
-		Fd:       -1,
-		Off:      uint64(op.target.slot),
-		Addr:     uint64(op.target.slot),
-		Len:      uint32(op.flags | pollUpdateEvents),
-		Rw_flags: encodePollMask(op.mask),
-	}
-	sqe.Flags |= uint8(op.sqeFlags)
-}
-
-// PollUpdate changes the events watched by target.
-// liburing: io_uring_prep_poll_update - https://man7.org/linux/man-pages/man3/io_uring_prep_poll_update.3.html
-func PollUpdate(target Handle, mask uint32, flags PollUpdateFlags) Op {
-	return &pollUpdateOp{target: target, mask: mask, flags: flags}
-}
+// Ringo deliberately does not expose IORING_POLL_UPDATE_EVENTS. Its only
+// Ringo-expressible effect is replacing an in-flight poll's event mask, which
+// PollRemove followed by PollAdd also does; the kernel's other half,
+// IORING_POLL_UPDATE_USER_DATA, would rewrite the identity that makes Handle
+// generation-safe. IORING_POLL_ADD_LEVEL is likewise absent: the UAPI header
+// documents it, but io_poll_add_prep and io_poll_remove_prep both reject it, so
+// no kernel accepts it in either position.
 
 func validateTimeoutFlags(flags, allowed TimeoutFlags) error {
 	if flags&^allowed != 0 {

@@ -205,9 +205,7 @@ func TestSetupOptionsMapToKernelParameters(t *testing.T) {
 		WithFixedFiles(8),
 	}
 	for _, option := range options {
-		if err := option.apply(&config); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, option.apply(&config))
 	}
 	wantFlags := rawSetupSQPoll |
 		rawSetupSQAff |
@@ -219,14 +217,23 @@ func TestSetupOptionsMapToKernelParameters(t *testing.T) {
 		rawSetupCoopTaskrun |
 		rawSetupTaskrunFlag |
 		rawSetupNoSQArray
-	if config.depth != 32 ||
-		config.flags != wantFlags ||
-		config.cqEntries != 64 ||
-		config.sqThreadCPU != 7 ||
-		config.sqThreadIdle != 250 ||
-		config.fixedFiles != 8 {
-		t.Fatalf("unexpected setup configuration: %+v", config)
-	}
+	require.Equal(t, uint32(32), config.depth)
+	require.Equal(t, wantFlags, config.flags)
+	require.Equal(t, uint32(64), config.cqEntries)
+	require.Equal(t, uint32(7), config.sqThreadCPU)
+	require.Equal(t, uint32(250), config.sqThreadIdle)
+	require.Equal(t, uint32(8), config.fixedFiles)
+}
+
+// rejects asserts that ring refuses op for the stated reason and returns the
+// rejection, so a caller can assert on the specific error. A refused push must
+// also hand back no handle.
+func rejects(t *testing.T, ring *Ring, op Op, why string) error {
+	t.Helper()
+	handle, err := ring.Push(op)
+	require.Error(t, err, why)
+	require.Zero(t, handle, why)
+	return err
 }
 
 func fakeFile(fd uintptr) *os.File {
@@ -289,9 +296,7 @@ func TestPathOperationsUseTypedDirectoryDescriptors(t *testing.T) {
 	ring, _ := newFakeRing(4)
 	directory := fakeFile(12340)
 	handle, err := ring.Push(OpenAt(FileFD(directory), "child", 0, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	// Encoding is the conformance suite's job; what matters here is that the
 	// Ring retains the directory file the operation named.
 	pushed := ring.pending.Value(handle.slot).op.(*openAtOp)
@@ -299,27 +304,22 @@ func TestPathOperationsUseTypedDirectoryDescriptors(t *testing.T) {
 		"OpenAt did not retain its directory file")
 
 	result := new(unix.Statx_t)
-	if _, err := ring.Push(StatxAt(FileFD(directory), "", 0, unix.STATX_SIZE, result)); err == nil {
-		t.Fatal("StatxAt accepted an empty path without AT_EMPTY_PATH")
-	}
-	if _, err := ring.Push(
+	rejects(t, ring,
+		StatxAt(FileFD(directory), "", 0, unix.STATX_SIZE, result),
+		"StatxAt accepted an empty path without AT_EMPTY_PATH")
+	_, err = ring.Push(
 		StatxAt(FileFD(directory), "", unix.AT_EMPTY_PATH, unix.STATX_SIZE, result),
-	); err != nil {
-		t.Fatalf("StatxAt rejected AT_EMPTY_PATH: %v", err)
-	}
+	)
+	require.NoError(t, err, "StatxAt rejected AT_EMPTY_PATH")
 
 	ring.files = &FixedFiles{
 		ring: ring, count: 1,
 	}
 	slot, err := ring.files.File(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ring.Push(
+	require.NoError(t, err)
+	rejects(t, ring,
 		OpenAtDirect(FixedFD(slot), "child", 0, 0, slot),
-	); err == nil {
-		t.Fatal("OpenAtDirect accepted one slot as both directory and result")
-	}
+		"OpenAtDirect accepted one slot as both directory and result")
 }
 
 func TestPointerInputsAreCopiedAccordingToSemantics(t *testing.T) {
@@ -327,9 +327,7 @@ func TestPointerInputsAreCopiedAccordingToSemantics(t *testing.T) {
 
 	spec := syscall.Timespec{Sec: 7, Nsec: 11}
 	timeout, err := ring.Push(Timeout(spec, 1, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	spec.Sec = 99
 
 	// The operation owns a __kernel_timespec copy rather than pointing at the
@@ -342,62 +340,42 @@ func TestPointerInputsAreCopiedAccordingToSemantics(t *testing.T) {
 
 func TestPollMaskEncodingMatchesKernelUnionLayout(t *testing.T) {
 	const mask uint32 = 0x12345678
-	if got := uint32(encodePollMaskForEndian(mask, false)); got != mask {
-		t.Fatalf("little-endian poll mask: got %#x want %#x", got, mask)
-	}
-	if got, want := uint32(encodePollMaskForEndian(mask, true)), uint32(0x56781234); got != want {
-		t.Fatalf("big-endian poll mask: got %#x want %#x", got, want)
-	}
+	require.EqualValues(t, mask, uint32(encodePollMaskForEndian(mask, false)), "little-endian poll mask")
+	require.Equal(t, uint32(0x56781234),
+		uint32(encodePollMaskForEndian(mask, true)), "big-endian poll mask")
 }
 
 func TestSemanticFlagsRejectRawDiscriminatorBits(t *testing.T) {
 	ring, _ := newFakeRing(4)
-	if _, err := ring.Push(
+	rejects(t, ring,
 		Timeout(syscall.Timespec{}, 1, TimeoutBoottime|TimeoutRealtime),
-	); err == nil {
-		t.Fatal("Timeout accepted two clock selections")
-	}
+		"Timeout accepted two clock selections")
 
 	target, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ring.Push(
+	require.NoError(t, err)
+	rejects(t, ring,
 		TimeoutUpdate(syscall.Timespec{}, target, TimeoutUpdateFlags(1<<1)),
-	); err == nil {
-		t.Fatal("TimeoutUpdate accepted the kernel's private update bit")
-	}
-	if _, err := ring.Push(
-		PollUpdate(target, unix.POLLIN, PollUpdateFlags(1<<1)),
-	); err == nil {
-		t.Fatal("PollUpdate accepted the kernel's private update-events bit")
-	}
-	if _, err := ring.Push(Fallocate(FileFD(fakeFile(12340)), -1, 1)); err == nil {
-		t.Fatal("Fallocate accepted a negative offset")
-	}
-	if _, err := ring.Push(
+		"TimeoutUpdate accepted the kernel's private update bit")
+	rejects(t, ring,
+		Fallocate(FileFD(fakeFile(12340)), -1, 1),
+		"Fallocate accepted a negative offset")
+	rejects(t, ring,
 		FallocateMode(BorrowedFD(12340), FallocateFlags(1<<20), 0, 1),
-	); err == nil {
-		t.Fatal("FallocateMode accepted unknown mode bits")
-	}
-	if _, err := ring.Push(
+		"FallocateMode accepted unknown mode bits")
+	rejects(t, ring,
 		Readv(BorrowedFD(12340), nil, 0, -1),
-	); err == nil {
-		t.Fatal("Readv accepted negative flags")
-	}
-	if _, err := ring.Push(Ftruncate(BorrowedFD(12340), -1)); err == nil {
-		t.Fatal("Ftruncate accepted a negative length")
-	}
+		"Readv accepted negative flags")
+	rejects(t, ring,
+		Ftruncate(BorrowedFD(12340), -1),
+		"Ftruncate accepted a negative length")
 }
 
 func TestVectorOperationsUseInlineMetadataForCommonSizes(t *testing.T) {
 	vectors := [][]byte{make([]byte, 1), nil, make([]byte, 2)}
 
-	write := newWritevOp(BorrowedFD(1), vectors, 0, 0, FixedBuffer{}, false)
-	if unsafe.SliceData(write.buffers) != &write.inlineBuffers[0] ||
-		unsafe.SliceData(write.iovecs) != &write.inlineIovecs[0] {
-		t.Fatal("small writev allocated metadata outside its operation")
-	}
+	write := newWritevOp(nil, BorrowedFD(1), vectors, 0, 0, FixedBuffer{}, false)
+	require.Same(t, &write.inlineIovecs[0], unsafe.SliceData(write.iovecs),
+		"small writev allocated metadata outside its operation")
 }
 
 func growStack(depth int) int {
@@ -410,29 +388,38 @@ func growStack(depth int) int {
 
 func TestPushBuildsOwnedIovecs(t *testing.T) {
 	ring, _ := newFakeRing(1)
-	handle, err := pushLocalVectors(ring, fakeFile(12345))
-	if err != nil {
-		t.Fatal(err)
-	}
+	handle, first, second := pushLocalVectors(ring, fakeFile(12345))
 	runtime.GC()
 
 	pending := ring.pending.Value(handle.slot)
 	write := pending.op.(*writevOp)
-	// Empty vectors are skipped, and each iovec must point at the buffer the
-	// operation retained rather than at the caller's original slice header.
+	// Empty vectors are skipped, and each iovec must still address the caller's
+	// buffer after the [][]byte that described it has gone out of scope. The
+	// typed Base pointers are the operation's only retention of those buffers.
 	require.Len(t, write.iovecs, 2)
-	require.Equal(t, unsafe.SliceData(write.buffers[0]), write.iovecs[0].Base,
-		"iovec does not point at the retained buffer")
-	require.Equal(t, unsafe.SliceData(write.buffers[2]), write.iovecs[1].Base,
-		"iovec does not point at the retained buffer")
+	require.Same(t, first, write.iovecs[0].Base,
+		"iovec does not address the caller's buffer")
+	require.Same(t, second, write.iovecs[1].Base,
+		"iovec does not address the caller's buffer")
+	require.EqualValues(t, 3, write.iovecs[0].Len)
+	require.EqualValues(t, 5, write.iovecs[1].Len)
 }
 
-func pushLocalVectors(ring *Ring, file *os.File) (Handle, error) {
-	var first [3]byte
-	var second [5]byte
+// pushLocalVectors builds the [][]byte in its own frame and returns only the
+// buffer addresses, so the caller cannot accidentally keep the vector slice
+// alive on the operation's behalf.
+func pushLocalVectors(ring *Ring, file *os.File) (Handle, *byte, *byte) {
+	first := make([]byte, 3)
+	second := make([]byte, 5)
 	first[0] = 1
 	second[0] = 2
-	return ring.Push(Writev(FileFD(file), [][]byte{first[:], nil, second[:]}, 9, 0))
+	handle, err := ring.Push(
+		Writev(FileFD(file), [][]byte{first, nil, second}, 9, 0),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return handle, unsafe.SliceData(first), unsafe.SliceData(second)
 }
 
 func TestDrainMutatesInactiveOp(t *testing.T) {
@@ -442,13 +429,8 @@ func TestDrainMutatesInactiveOp(t *testing.T) {
 	var sqe rawSQE
 	op.Drain()
 	alias.prepare(&sqe)
-	if got := rawSQEFlags(sqe.Flags); got != rawSqeIODrain {
-		t.Fatalf(
-			"Drain flags through alias: got %#x want %#x",
-			got,
-			rawSqeIODrain,
-		)
-	}
+	require.Equal(t, rawSqeIODrain, rawSQEFlags(sqe.Flags),
+		"Drain flags through alias")
 }
 
 // TestPushedOperationReuseIsNotDiagnosed pins the ownership contract: reuse is
@@ -478,51 +460,38 @@ func TestPushedOperationReuseIsNotDiagnosed(t *testing.T) {
 func TestFailedPushDoesNotConsumeOperation(t *testing.T) {
 	ring, fake := newFakeRing(1)
 	first, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 
 	retry := Nop()
-	if _, err := ring.Push(retry); !errors.Is(err, ErrFull) {
-		t.Fatalf("full ring error: %v", err)
-	}
+	require.ErrorIs(t, rejects(t, ring, retry, "full ring"), ErrFull)
 	retry.Drain()
 
-	if _, err := ring.Submit(); err != nil {
-		t.Fatal(err)
-	}
+	_, err = ring.Submit()
+	require.NoError(t, err)
 	fake.complete(first, 0, 0)
 	for range ring.Reap() {
 	}
-	if _, err := ring.Push(retry); err != nil {
-		t.Fatalf("push after failed attempt: %v", err)
-	}
+	_, err = ring.Push(retry)
+	require.NoError(t, err, "push after failed attempt")
 }
 
 func TestPushLinkedRejectsInvalidSequenceWithoutMutatingOperations(t *testing.T) {
 	ring, fake := newFakeRing(2)
 	first, second := Nop(), Nop()
 
-	if _, err := ring.PushLinked(first, Then(LinkType(0xff), second)); err == nil {
-		t.Fatal("invalid link type was accepted")
-	}
-	if _, err := ring.PushLinked(first, Then(LinkSoft, nil)); err == nil {
-		t.Fatal("nil linked operation was accepted")
-	}
+	_, err := ring.PushLinked(first, Then(LinkType(0xff), second))
+	require.Error(t, err, "invalid link type was accepted")
+	_, err = ring.PushLinked(first, Then(LinkSoft, nil))
+	require.Error(t, err, "nil linked operation was accepted")
 	for index, op := range []Op{first, second} {
 		var sqe rawSQE
 		op.prepare(&sqe)
-		if sqe.Flags != 0 {
-			t.Fatalf("operation %d was modified after rejection: flags=%#x", index, sqe.Flags)
-		}
+		require.Falsef(t, sqe.Flags != 0, "operation %d was modified after rejection: flags=%#x", index, sqe.Flags)
 	}
-	if ring.pending.Len() != 0 || fake.queued() != 0 {
-		t.Fatal("invalid sequence changed ring state")
-	}
+	require.False(t, ring.pending.Len() != 0 || fake.queued() != 0, "invalid sequence changed ring state")
 
-	if _, err := ring.PushLinked(first, Then(LinkHard, second)); err != nil {
-		t.Fatalf("operations were consumed by rejected sequence: %v", err)
-	}
+	_, err = ring.PushLinked(first, Then(LinkHard, second))
+	require.NoError(t, err, "operations were consumed by rejected sequence")
 }
 
 // TestReadWriteOperationsReleaseAfterCompletionYield checks the retention
@@ -565,11 +534,9 @@ func TestPushLinkedIsAtomicAndEncodesOperationFlags(t *testing.T) {
 		Then(LinkSoft, Nop()),
 		Then(LinkSoft, Nop()),
 	); !errors.Is(err, ErrFull) {
-		t.Fatalf("oversized sequence error: %v", err)
+		require.ErrorIs(t, err, ErrFull, "oversized sequence error")
 	}
-	if ring.pending.Len() != 0 || fake.queued() != 0 {
-		t.Fatal("oversized sequence changed ring state")
-	}
+	require.False(t, ring.pending.Len() != 0 || fake.queued() != 0, "oversized sequence changed ring state")
 
 	handles, err := ring.PushLinked(
 		Nop(),
@@ -577,24 +544,12 @@ func TestPushLinkedIsAtomicAndEncodesOperationFlags(t *testing.T) {
 		Then(LinkSoft, Nop()),
 		Then(LinkHard, Nop()),
 	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(handles) != 4 {
-		t.Fatalf("handles: got %d want 4", len(handles))
-	}
-	if rawSQEFlags(fake.sqe(0).Flags) != rawSqeIOLink {
-		t.Fatalf("soft-link flags: %#x", fake.sqe(0).Flags)
-	}
-	if rawSQEFlags(fake.sqe(1).Flags) != rawSqeIOLink {
-		t.Fatalf("soft-link boundary flags: %#x", fake.sqe(1).Flags)
-	}
-	if rawSQEFlags(fake.sqe(2).Flags) != rawSqeIOHardlink {
-		t.Fatalf("hard-link flags: %#x", fake.sqe(2).Flags)
-	}
-	if fake.sqe(3).Flags != 0 {
-		t.Fatalf("last flags: %#x", fake.sqe(3).Flags)
-	}
+	require.False(t, err != nil, err)
+	require.Falsef(t, len(handles) != 4, "handles: got %d want 4", len(handles))
+	require.Falsef(t, rawSQEFlags(fake.sqe(0).Flags) != rawSqeIOLink, "soft-link flags: %#x", fake.sqe(0).Flags)
+	require.Falsef(t, rawSQEFlags(fake.sqe(1).Flags) != rawSqeIOLink, "soft-link boundary flags: %#x", fake.sqe(1).Flags)
+	require.Falsef(t, rawSQEFlags(fake.sqe(2).Flags) != rawSqeIOHardlink, "hard-link flags: %#x", fake.sqe(2).Flags)
+	require.Falsef(t, fake.sqe(3).Flags != 0, "last flags: %#x", fake.sqe(3).Flags)
 }
 
 // TestSubmitErrorPreservesOwnership pins that a failed submit does not hand a
@@ -633,27 +588,19 @@ func TestSubmitReportsResourceErrors(t *testing.T) {
 func TestReapCompletionAndGenerationSafety(t *testing.T) {
 	ring, fake := newFakeRing(1)
 	first, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	_, _ = ring.Submit()
 	fake.complete(first, 7, 0)
 	completions := collect(ring.Reap())
-	if len(completions) != 1 || completions[0].Handle != first ||
-		completions[0].Result != 7 || completions[0].Err != nil {
-		t.Fatalf("completion: %+v", completions)
-	}
-	if ring.pending.Len() != 0 || fake.reaped() != 1 {
-		t.Fatal("final completion did not advance and release")
-	}
+	require.Len(t, completions, 1)
+	require.Equal(t, first, completions[0].Handle)
+	require.Equal(t, 7, completions[0].Result)
+	require.NoError(t, completions[0].Err)
+	require.False(t, ring.pending.Len() != 0 || fake.reaped() != 1, "final completion did not advance and release")
 
 	second, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first.slot == second.slot {
-		t.Fatal("slot generation did not advance")
-	}
+	require.NoError(t, err)
+	require.False(t, first.slot == second.slot, "slot generation did not advance")
 	// An identity Reap cannot resolve means Ringo's own finality bookkeeping is
 	// wrong, so it asserts. This is a test binary, so the assertion panics
 	// before the production path drops the entry; that path is unobservable
@@ -670,27 +617,18 @@ func TestReapCompletionAndGenerationSafety(t *testing.T) {
 func TestReapRetainsMultishotUntilFinalCompletion(t *testing.T) {
 	ring, fake := newFakeRing(1)
 	handle, err := ring.Push(Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	_, _ = ring.Submit()
 	fake.complete(handle, 1, rawCQEMore)
 	first := collect(ring.Reap())
-	if len(first) != 1 || !first[0].Flags.More() {
-		t.Fatalf("multishot completion: %+v", first)
-	}
-	if _, ok := ring.pending.TryValue(handle.slot); !ok {
-		t.Fatal("IORING_CQE_F_MORE released the pending slot")
-	}
+	require.Falsef(t, len(first) != 1 || !first[0].Flags.More(), "multishot completion: %+v", first)
+	_, retained := ring.pending.TryValue(handle.slot)
+	require.True(t, retained, "IORING_CQE_F_MORE released the pending slot")
 
 	fake.complete(handle, -int32(syscall.EIO), 0)
 	final := collect(ring.Reap())
-	if len(final) != 1 || !errors.Is(final[0].Err, syscall.EIO) {
-		t.Fatalf("final completion: %+v", final)
-	}
-	if ring.pending.Len() != 0 {
-		t.Fatal("final multishot completion did not release the slot")
-	}
+	require.Falsef(t, len(final) != 1 || !errors.Is(final[0].Err, syscall.EIO), "final completion: %+v", final)
+	require.False(t, ring.pending.Len() != 0, "final multishot completion did not release the slot")
 }
 
 func TestReapBreakAndPanicAlwaysCleanupYieldedCompletion(t *testing.T) {
@@ -705,12 +643,8 @@ func TestReapBreakAndPanicAlwaysCleanupYieldedCompletion(t *testing.T) {
 		for range ring.Reap() {
 			break
 		}
-		if fake.reaped() != 1 || ring.pending.Len() != 1 {
-			t.Fatalf("after break: cqHead=%d pending=%d", fake.reaped(), ring.pending.Len())
-		}
-		if got := len(collect(ring.Reap())); got != 1 {
-			t.Fatalf("remaining completions: got %d want 1", got)
-		}
+		require.Falsef(t, fake.reaped() != 1 || ring.pending.Len() != 1, "after break: cqHead=%d pending=%d", fake.reaped(), ring.pending.Len())
+		require.EqualValues(t, 1, len(collect(ring.Reap())), "remaining completions")
 	})
 
 	t.Run("panic", func(t *testing.T) {
@@ -720,146 +654,97 @@ func TestReapBreakAndPanicAlwaysCleanupYieldedCompletion(t *testing.T) {
 		fake.complete(handle, 0, 0)
 		func() {
 			defer func() {
-				if recover() == nil {
-					t.Fatal("reap body did not panic")
-				}
+				require.False(t, recover() == nil, "reap body did not panic")
 			}()
 			for range ring.Reap() {
 				panic("body")
 			}
 		}()
-		if fake.reaped() != 1 || ring.pending.Len() != 0 {
-			t.Fatalf(
-				"after panic: cqHead=%d pending=%d",
-				fake.reaped(), ring.pending.Len(),
-			)
-		}
+		require.EqualValues(t, 1, fake.reaped(), "after panic")
+		require.Zero(t, ring.pending.Len(), "after panic")
 	})
 }
 
 func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 	ring, fake := newFakeRing(2)
 	t.Cleanup(func() {
-		if err := ring.Close(); err != nil {
-			t.Errorf("close fake ring: %v", err)
-		}
+		require.NoError(t, ring.Close(), "close fake ring")
 	})
 	ring.files = &FixedFiles{ring: ring, count: 2}
 	file, err := ring.files.File(1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	data := make([]byte, 64)
 	set, err := ring.RegisterBuffers(data)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	buffer, err := set.Bind(data[8:24])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fake.registeredBuffers) != 1 ||
-		fake.registeredBuffers[0].Base != unsafe.SliceData(data) {
-		t.Fatal("registration did not use the retained backing buffer")
-	}
+	require.NoError(t, err)
+	require.Len(t, fake.registeredBuffers, 1)
+	require.Same(t, unsafe.SliceData(data), fake.registeredBuffers[0].Base,
+		"registration did not use the retained backing buffer")
 
 	handle, err := ring.Push(ReadFixed(FixedFD(file), buffer, 3))
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	sqe := fake.sqe(0)
-	if rawSQEFlags(sqe.Flags)&rawSqeFixedFile == 0 || sqe.Buf_index != 0 ||
-		sqe.Addr != uint64(slicePtr(data[8:24])) {
-		t.Fatalf("fixed/direct SQE: %+v", sqe)
-	}
-	if _, ok := ring.pending.TryValue(handle.slot); !ok {
-		t.Fatal("fixed operation was not retained")
-	}
+	require.NotZero(t, rawSQEFlags(sqe.Flags)&rawSqeFixedFile, "fixed/direct SQE")
+	require.Zero(t, sqe.Buf_index, "fixed/direct SQE")
+	require.Equal(t, uint64(slicePtr(data[8:24])), sqe.Addr, "fixed/direct SQE")
+	_, retained := ring.pending.TryValue(handle.slot)
+	require.True(t, retained, "fixed operation was not retained")
 
 	other, _ := newFakeRing(1)
-	if _, err := other.Push(Read(FixedFD(file), make([]byte, 1), 0)); !errors.Is(err, ErrWrongRing) {
-		t.Fatalf("foreign fixed file: %v", err)
-	}
-	if _, err := other.Push(ReadFixed(FileFD(fakeFile(12346)), buffer, 0)); !errors.Is(err, ErrWrongRing) {
-		t.Fatalf("foreign registered buffer: %v", err)
-	}
-	if _, err := set.Bind(make([]byte, 1)); err == nil {
-		t.Fatal("Bind accepted an unregistered buffer")
-	}
+	require.ErrorIs(t,
+		rejects(t, other, Read(FixedFD(file), make([]byte, 1), 0), "foreign fixed file"),
+		ErrWrongRing)
+	require.ErrorIs(t,
+		rejects(t, other, ReadFixed(FileFD(fakeFile(12346)), buffer, 0), "foreign registered buffer"),
+		ErrWrongRing)
+	_, err = set.Bind(make([]byte, 1))
+	require.Error(t, err, "Bind accepted an unregistered buffer")
 
-	if _, err := ring.Submit(); err != nil {
-		t.Fatal(err)
-	}
+	_, err = ring.Submit()
+	require.NoError(t, err)
 	fake.complete(handle, 16, 0)
-	if completions := collect(ring.Reap()); len(completions) != 1 {
-		t.Fatalf("final completions: got %d want 1", len(completions))
-	}
-	if err := ring.Close(); err != nil {
-		t.Fatalf("close idle ring: %v", err)
-	}
-	if len(set.buffers) != 1 {
-		t.Fatal("Close mutated the caller's buffer table")
-	}
+	require.Len(t, collect(ring.Reap()), 1, "final completions")
+	require.NoError(t, ring.Close(), "close idle ring")
+	require.False(t, len(set.buffers) != 1, "Close mutated the caller's buffer table")
 }
 
 func TestFixedFilesUpdate(t *testing.T) {
 	ring, fake := newFakeRing(2)
 	files, err := ring.RegisterSparseFiles(3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files.owners) != files.Len() {
-		t.Fatalf("owner slots: got %d want %d", len(files.owners), files.Len())
-	}
+	require.NoError(t, err)
+	require.Falsef(t, len(files.owners) != files.Len(), "owner slots: got %d want %d", len(files.owners), files.Len())
 
 	first := fakeFile(12345)
 	fake.registerResult = 2
 	updated, err := files.Update(1, first, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if updated != 2 ||
-		fake.registerOpcode != rawRegisterFilesUpdate ||
-		fake.updatedFileOffset != 1 ||
-		fake.registerCount != 2 {
-		t.Fatalf(
-			"fixed-file update: updated=%d offset=%d count=%d",
-			updated,
-			fake.updatedFileOffset,
-			fake.registerCount,
-		)
-	}
-	if files.owners[1] != first || files.owners[2] != nil {
-		t.Fatal("fixed-file update did not retain replacement owners")
-	}
+	require.NoError(t, err)
+	require.Equal(t, 2, updated, "fixed-file update")
+	require.Equal(t, rawRegisterFilesUpdate, fake.registerOpcode)
+	require.EqualValues(t, 1, fake.updatedFileOffset)
+	require.EqualValues(t, 2, fake.registerCount)
+	require.False(t, files.owners[1] != first || files.owners[2] != nil, "fixed-file update did not retain replacement owners")
 
-	if updated, err := files.Update(0); err == nil || updated != 0 {
-		t.Fatalf("empty update: updated=%d err=%v", updated, err)
-	}
-	if updated, err := files.Update(3, first); err == nil || updated != 0 {
-		t.Fatalf("out-of-bounds update: updated=%d err=%v", updated, err)
-	}
+	updated, err = files.Update(0)
+	require.Error(t, err, "empty update")
+	require.Zero(t, updated, "empty update")
+	updated, err = files.Update(3, first)
+	require.Error(t, err, "out-of-bounds update")
+	require.Zero(t, updated, "out-of-bounds update")
 
 	second := fakeFile(12346)
 	fake.registerResult = 0
 	fake.registerErrno = syscall.EBADF
-	if updated, err := files.Update(0, second); !errors.Is(err, syscall.EBADF) ||
-		updated != 0 {
-		t.Fatalf("failed update: updated=%d err=%v", updated, err)
-	}
-	if files.owners[0] != nil {
-		t.Fatal("failed update changed retained owners")
-	}
+	updated, err = files.Update(0, second)
+	require.ErrorIs(t, err, syscall.EBADF, "failed update")
+	require.Zero(t, updated, "failed update")
+	require.False(t, files.owners[0] != nil, "failed update changed retained owners")
 
 	fake.registerErrno = 0
 	fake.registerResult = 1
 	updated, err = files.Update(0, second, nil)
-	if err == nil || updated != 1 {
-		t.Fatalf("short update: updated=%d err=%v", updated, err)
-	}
-	if files.owners[0] != second || files.owners[1] != first {
-		t.Fatal("short update did not retain exactly the changed owners")
-	}
+	require.Falsef(t, err == nil || updated != 1, "short update: updated=%d err=%v", updated, err)
+	require.False(t, files.owners[0] != second || files.owners[1] != first, "short update did not retain exactly the changed owners")
 }
 
 // TestCloseRetainsPendingOperations covers the deliberate close: the descriptor
@@ -924,15 +809,13 @@ func TestCloseReleasesDrainedRing(t *testing.T) {
 
 func TestCancelAllUsesBoundedSynchronousCancellation(t *testing.T) {
 	ring, fake := newFakeRing(1)
-	if err := ring.CancelAll(1500 * time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, ring.CancelAll(1500*time.Millisecond))
 	spec := syscall.NsecToTimespec((1500 * time.Millisecond).Nanoseconds())
-	if fake.cancel == nil ||
-		rawCancelFlags(fake.cancel.Flags) != rawAsyncCancelAny|rawAsyncCancelAll ||
-		fake.cancel.Timeout != (rawTimespec{Sec: spec.Sec, Nsec: spec.Nsec}) {
-		t.Fatalf("cancel registration: %+v", fake.cancel)
-	}
+	require.NotNil(t, fake.cancel, "cancel registration")
+	require.Equal(t, rawAsyncCancelAny|rawAsyncCancelAll,
+		rawCancelFlags(fake.cancel.Flags), "cancel registration")
+	require.Equal(t, rawTimespec{Sec: spec.Sec, Nsec: spec.Nsec},
+		fake.cancel.Timeout, "cancel registration")
 }
 
 func BenchmarkPushSubmitReap(b *testing.B) {

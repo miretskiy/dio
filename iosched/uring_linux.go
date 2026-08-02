@@ -427,6 +427,10 @@ type coordinator struct {
 	// links is coordinator-owned scratch for one linked chain. PushLinked does
 	// not retain the slice, so it can be reused across placements.
 	links []ringo.Link
+	// alloc recycles Ringo operation objects. The coordinator goroutine is the
+	// only one that builds operations and the only one that reaps them, which is
+	// exactly the single-goroutine ownership an OpAlloc requires.
+	alloc ringo.OpAlloc
 
 	files        fileTable
 	nextSequence uint64
@@ -727,6 +731,7 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 }
 
 func (c *coordinator) translateOp(op *Op) ringo.Op {
+	recycle := ringo.WithAlloc(&c.alloc)
 	var direct ringo.FixedFile
 	fd := ringo.FileFD(op.f)
 	if op.isVirtual() {
@@ -741,28 +746,28 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 			if err != nil {
 				panic(fmt.Sprintf("iosched: validated fixed buffer became invalid: %v", err))
 			}
-			return ringo.ReadFixed(fd, buffer, op.offset)
+			return ringo.ReadFixed(fd, buffer, op.offset, recycle)
 		}
-		return ringo.Read(fd, op.buf, op.offset)
+		return ringo.Read(fd, op.buf, op.offset, recycle)
 	case OpWrite:
 		if op.isFixed() {
 			buffer, err := c.sched.registeredBuffers.Bind(op.buf)
 			if err != nil {
 				panic(fmt.Sprintf("iosched: validated fixed buffer became invalid: %v", err))
 			}
-			return ringo.WriteFixed(fd, buffer, op.offset)
+			return ringo.WriteFixed(fd, buffer, op.offset, recycle)
 		}
-		return ringo.Write(fd, op.buf, op.offset)
+		return ringo.Write(fd, op.buf, op.offset, recycle)
 	case OpReadv:
-		return ringo.Readv(fd, op.bufs, op.offset, 0)
+		return ringo.Readv(fd, op.bufs, op.offset, 0, recycle)
 	case OpWritev:
-		return ringo.Writev(fd, op.bufs, op.offset, 0)
+		return ringo.Writev(fd, op.bufs, op.offset, 0, recycle)
 	case OpFsync:
-		return ringo.Fsync(fd)
+		return ringo.Fsync(fd, recycle)
 	case OpFdatasync:
-		return ringo.Fdatasync(fd)
+		return ringo.Fdatasync(fd, recycle)
 	case OpFallocate:
-		return ringo.Fallocate(fd, op.offset, op.length)
+		return ringo.Fallocate(fd, op.offset, op.length, recycle)
 	case OpOpenat:
 		path := string(op.path[:len(op.path)-1])
 		if op.isVirtual() {
@@ -772,6 +777,7 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 				op.openFlag,
 				op.mode,
 				direct,
+				recycle,
 			)
 		}
 		return ringo.OpenAt(
@@ -779,12 +785,13 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 			path,
 			op.openFlag,
 			op.mode,
+			recycle,
 		)
 	case OpClose:
 		if op.isVirtual() {
-			return ringo.CloseDirect(direct)
+			return ringo.CloseDirect(direct, recycle)
 		}
-		return ringo.Nop()
+		return ringo.Nop(recycle)
 	default:
 		panic(fmt.Sprintf("iosched: invalid opcode %d", op.opcode))
 	}

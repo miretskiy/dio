@@ -105,7 +105,6 @@ static void oracle_prepare(struct io_uring_sqe *sqe, int kind,
 	case 24: io_uring_prep_poll_add(sqe, a0, a1); break;
 	case 25: io_uring_prep_poll_multishot(sqe, a0, a1); break;
 	case 26: io_uring_prep_poll_remove(sqe, a0); break;
-	case 27: io_uring_prep_poll_update(sqe, a0, a1, a2, a3); break;
 	case 32: io_uring_prep_cancel64(sqe, a0, a1); break;
 	case 33: io_uring_prep_cancel_fd(sqe, a0, a1); break;
 	case 62: io_uring_prep_readv_fixed(sqe, a0, (struct iovec *)(uintptr_t)a1, a2, a3, a4, a5); break;
@@ -341,7 +340,6 @@ const (
 	PreparePollAdd       PrepareKind = 24
 	PreparePollMultishot PrepareKind = 25
 	PreparePollRemove    PrepareKind = 26
-	PreparePollUpdate    PrepareKind = 27
 	PrepareCancel        PrepareKind = 32
 	PrepareCancelFD      PrepareKind = 33
 	PrepareReadvFixed    PrepareKind = 62

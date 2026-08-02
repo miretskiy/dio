@@ -314,8 +314,10 @@ func (ring *Ring) Submit() (submitted int, err error) {
 // wait is otherwise satisfied: by those operations completing, by a queued
 // Timeout, by CancelAll, or by a signal. Passing 0 never waits.
 //
-// A submit call may report both progress and an error; that error never returns
-// ownership of a pushed operation to the caller. EAGAIN and EBUSY are the
+// A submit call reports either progress or an error, never both: io_uring_enter
+// returns what it consumed and reports a wait error only when it consumed
+// nothing. An error never returns ownership of a pushed operation to the
+// caller. EAGAIN and EBUSY are the
 // kernel's temporary resource conditions and are passed through: reap the
 // available completions and submit again. Ringo retries EINTR internally,
 // because an interrupted io_uring_enter consumes no SQE and loses no
@@ -483,8 +485,9 @@ func (ring *Ring) CancelAll(timeout time.Duration) error {
 // it cannot ask the caller to hold them either, because an unreferenced Ring
 // becomes collectable the moment Close returns. Instead the Ring is retained
 // permanently, along with its ring mappings, and Close reports ErrPending with
-// the number of operations involved. That leak is bounded by the Ring's
-// capacity and lasts for the life of the process.
+// the number of operations involved. One such Close retains at most this Ring's
+// capacity, and never releases it, so repeatedly closing Rings with work in
+// flight accumulates a retention per Ring for the life of the process.
 //
 // Close drops the Ring's own references to its registered tables but does not
 // modify the FixedFiles and FixedBuffers values the caller holds. Those stay

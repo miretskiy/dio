@@ -139,22 +139,22 @@ func copyCStringAllowEmpty(value string, allowEmpty bool) ([]byte, error) {
 	return append([]byte(value), 0), nil
 }
 
+// makeIovecs converts vectors into operation-owned iovecs, skipping empty
+// buffers. It does not retain the [][]byte: each iovec.Base is a typed *byte
+// into the buffer it describes, and that is what keeps the buffer reachable
+// through the operation's final completion. The caller still owns vectors, and
+// the operation never reads it again -- validation works from the iovecs.
+// spare is an already-cleared array a recycled operation kept from its previous
+// use, or nil. It is only consulted when the vectors do not fit inline.
 func makeIovecs(
 	vectors [][]byte,
-	inlineVectors *[inlineIovecCount][]byte,
 	inlineIovecs *[inlineIovecCount]syscall.Iovec,
-) ([][]byte, []syscall.Iovec, error) {
+	spare []syscall.Iovec,
+) ([]syscall.Iovec, error) {
 	if len(vectors) > maxIovecs {
-		return nil, nil, errors.New("too many vectors")
+		return nil, errors.New("too many vectors")
 	}
-	var owned [][]byte
-	if len(vectors) <= len(inlineVectors) {
-		owned = inlineVectors[:len(vectors)]
-		copy(owned, vectors)
-	} else {
-		owned = append([][]byte(nil), vectors...)
-	}
-	count := nonemptyBuffers(owned)
+	count := nonemptyBuffers(vectors)
 	var iovecs []syscall.Iovec
 	switch {
 	case count == 0:
@@ -162,10 +162,12 @@ func makeIovecs(
 		// unspecified address unsafe.SliceData yields for a zero-capacity slice.
 	case count <= len(inlineIovecs):
 		iovecs = inlineIovecs[:0:count]
+	case count <= cap(spare):
+		iovecs = spare[:0]
 	default:
 		iovecs = make([]syscall.Iovec, 0, count)
 	}
-	for _, buffer := range owned {
+	for _, buffer := range vectors {
 		if len(buffer) == 0 {
 			continue
 		}
@@ -173,7 +175,7 @@ func makeIovecs(
 		iovec.SetLen(len(buffer))
 		iovecs = append(iovecs, iovec)
 	}
-	return owned, iovecs, nil
+	return iovecs, nil
 }
 
 func nonemptyBuffers(vectors [][]byte) int {

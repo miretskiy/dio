@@ -1,4 +1,4 @@
-//go:build linux && cgo && liburing_conformance
+//go:build linux && cgo
 
 package ringo
 

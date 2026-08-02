@@ -8,6 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
 
@@ -98,14 +99,10 @@ func TestManagedMemoryRemainsStableAcrossStackGrowth(t *testing.T) {
 			}
 		}()
 		stable := <-result
-		if !stable[0] || !stable[1] || !stable[2] || !stable[3] {
-			t.Fatalf(
-				"kernel-visible address moved: literal=%t array=%t copied=%t output=%t",
-				stable[0],
-				stable[1],
-				stable[2],
-				stable[3],
-			)
-		}
+		require.Truef(t,
+			stable[0] && stable[1] && stable[2] && stable[3],
+			"kernel-visible address moved: literal=%t array=%t copied=%t output=%t",
+			stable[0], stable[1], stable[2], stable[3],
+		)
 	}
 }

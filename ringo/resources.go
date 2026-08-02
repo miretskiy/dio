@@ -64,6 +64,10 @@ func (files *FixedFiles) File(index uint32) (FixedFile, error) {
 // replacement clears its slot. The returned count is the number of slots the
 // kernel changed.
 //
+// Update issues a registration syscall on the Ring and rewrites the table's
+// retained files, so unlike the table's lookups it must be serialized with Ring
+// calls exactly as though it were one.
+//
 // Update is synchronous, but it is not an ordering barrier for queued or
 // in-flight I/O. Linux keeps an old registered file alive while requests that
 // already use it complete; callers remain responsible for deciding when a
@@ -229,14 +233,17 @@ type FixedBuffer struct {
 	data  []byte
 }
 
-func (buffer FixedBuffer) contains(data []byte) bool {
-	if buffer.set == nil || int(buffer.index) >= len(buffer.set.buffers) ||
-		len(data) == 0 {
+// containsIovec reports whether one vector of a fixed vectored operation falls
+// inside this registered buffer. It reads the iovec rather than a parallel
+// [][]byte because the iovec is what the operation retains and what the kernel
+// will actually dereference.
+func (buffer FixedBuffer) containsIovec(iovec syscall.Iovec) bool {
+	if buffer.set == nil || int(buffer.index) >= len(buffer.set.buffers) {
 		return false
 	}
 	registered := buffer.set.buffers[buffer.index]
-	start := uintptr(unsafe.Pointer(unsafe.SliceData(data)))
-	end := start + uintptr(len(data))
+	start := uintptr(unsafe.Pointer(iovec.Base))
+	end := start + uintptr(iovec.Len)
 	base := uintptr(unsafe.Pointer(unsafe.SliceData(registered)))
 	limit := base + uintptr(len(registered))
 	return end >= start && limit >= base && start >= base && end <= limit
