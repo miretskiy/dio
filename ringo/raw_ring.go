@@ -372,15 +372,33 @@ func (ring *rawRing) cqReady() uint32 {
 	return atomic.LoadUint32(ring.cq.tail) - atomic.LoadUint32(ring.cq.head)
 }
 
-func (ring *rawRing) peekCQE() *rawCQE {
-	head := atomic.LoadUint32(ring.cq.head)
-	if head == atomic.LoadUint32(ring.cq.tail) {
-		return nil
-	}
-	index := head & *ring.cq.ringMask
+// cqSnapshot returns the first unconsumed completion position and how many
+// entries follow it. Only the reaping side moves the head and only the kernel
+// grows the tail, so the count cannot shrink afterward.
+func (ring *rawRing) cqSnapshot() (head, available uint32) {
+	head = atomic.LoadUint32(ring.cq.head)
+	return head, atomic.LoadUint32(ring.cq.tail) - head
+}
+
+// cqeAt addresses the completion queue entry at position sequence, which the
+// caller must already know is within a snapshot it took.
+func (ring *rawRing) cqeAt(sequence uint32) *rawCQE {
+	index := sequence & *ring.cq.ringMask
 	return (*rawCQE)(unsafe.Add(ring.cq.cqeBase, uintptr(index)*ring.cq.cqeSize))
 }
 
+func (ring *rawRing) peekCQE() *rawCQE {
+	head, available := ring.cqSnapshot()
+	if available == 0 {
+		return nil
+	}
+	return ring.cqeAt(head)
+}
+
+// advanceCQ publishes that count entries have been consumed, which is how the
+// kernel learns their slots are reusable. It stores to memory the kernel reads,
+// so a reaping loop makes this call once for its whole batch rather than once
+// per entry.
 func (ring *rawRing) advanceCQ(count uint32) {
 	atomic.StoreUint32(ring.cq.head, atomic.LoadUint32(ring.cq.head)+count)
 }

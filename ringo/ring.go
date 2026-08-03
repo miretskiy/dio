@@ -357,9 +357,12 @@ func (ring *Ring) submitAndWait(minComplete uint32) (int, error) {
 }
 
 // Reap returns a nonblocking iterator over a bounded snapshot of currently
-// available completions. The Ring is exclusively borrowed while the iterator
-// is active. The yielded completion is advanced and its final pending state is
-// released after each iterator step, including break and panic. Reap yields
+// available completions. The Ring is exclusively borrowed while the iterator is
+// active. A completion's final pending state is released after its own iterator
+// step, including break and panic, so no operation outlives the step that
+// reported it. The entries themselves are published back to the kernel once, as
+// the iterator finishes: that store tells the kernel their slots are reusable,
+// and nothing can observe it sooner while the Ring is borrowed. Reap yields
 // nothing for a closed Ring.
 //
 // Every yielded Completion describes one kernel completion queue entry, so
@@ -380,14 +383,20 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 		if ring.closed {
 			return
 		}
-		available := ring.backend.cqReady()
-		for range available {
-			cqe := ring.backend.peekCQE()
-			// Only Reap advances the completion head and the kernel only grows
-			// the tail, so the snapshot cannot shrink underneath this loop.
-			if err := buildutil.Assert(cqe != nil); err != nil {
-				return
-			}
+		head, available := ring.backend.cqSnapshot()
+		if available == 0 {
+			return
+		}
+		// The head is the kernel's signal that these entries are reusable, so it
+		// is published once for the batch rather than per entry. The defer makes
+		// break and panic publish what the loop actually walked.
+		var consumed uint32
+		defer func() { ring.backend.advanceCQ(consumed) }()
+		for offset := range available {
+			// Only the reaping side moves the head and the kernel only grows the
+			// tail, so every position in the snapshot holds an entry.
+			cqe := ring.backend.cqeAt(head + offset)
+			consumed++
 			slotHandle := intrusive.Handle(cqe.Data)
 			pending, resolved := ring.pending.TryValue(slotHandle)
 			// Every SQE carries a generation-tagged identity, so one Ringo
@@ -399,7 +408,6 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 			// a Handle would resurrect the stale identity the generation tag
 			// exists to reject.
 			if err := buildutil.Assert(resolved); err != nil {
-				ring.backend.advanceCQ(1)
 				continue
 			}
 
@@ -412,26 +420,25 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 			} else {
 				completion.Result = int(cqe.Res)
 			}
-			final := !completion.Flags.More()
-			if !ring.yieldCompletion(yield, completion, slotHandle, final) {
+			if !ring.yieldCompletion(yield, completion, slotHandle) {
 				return
 			}
 		}
 	}
 }
 
+// yieldCompletion hands completion to yield and then releases its slot, on
+// break and panic alike. A multishot operation the kernel kept armed keeps its
+// slot instead: it has more completions to produce.
 func (ring *Ring) yieldCompletion(
 	yield func(Completion) bool,
 	completion Completion,
 	slot intrusive.Handle,
-	final bool,
 ) (more bool) {
-	defer func() {
-		ring.backend.advanceCQ(1)
-		if final {
-			ring.release(slot)
-		}
-	}()
+	if completion.Flags.More() {
+		return yield(completion)
+	}
+	defer ring.release(slot)
 	return yield(completion)
 }
 

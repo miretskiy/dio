@@ -673,6 +673,37 @@ func TestReapRetainsMultishotUntilFinalCompletion(t *testing.T) {
 	require.False(t, ring.pending.Len() != 0, "final multishot completion did not release the slot")
 }
 
+// TestReapPublishesConsumedEntriesOnce pins the two halves of Reap's bookkeeping
+// apart: a pending slot is released as its own step ends, while the completion
+// queue head -- the store that tells the kernel those entries are reusable --
+// moves once, after the iterator is done.
+func TestReapPublishesConsumedEntriesOnce(t *testing.T) {
+	const count = 4
+	ring, fake := newFakeRing(count)
+	handles := make([]Handle, count)
+	for i := range handles {
+		var err error
+		handles[i], err = ring.Push(Nop())
+		require.NoError(t, err)
+	}
+	_, err := ring.Submit()
+	require.NoError(t, err)
+	for _, handle := range handles {
+		fake.complete(handle, 0, 0)
+	}
+
+	seen := 0
+	for range ring.Reap() {
+		seen++
+		require.Zerof(t, fake.reaped(), "head moved during step %d", seen)
+		// This step's own operation is still owned; every earlier one is not.
+		require.Equalf(t, count-seen+1, ring.pending.Len(), "pending at step %d", seen)
+	}
+	require.Equal(t, count, seen, "completions yielded")
+	require.EqualValues(t, count, fake.reaped(), "head did not advance by the batch")
+	require.Zero(t, ring.pending.Len(), "operations retained after the batch")
+}
+
 func TestReapBreakAndPanicAlwaysCleanupYieldedCompletion(t *testing.T) {
 	t.Run("break", func(t *testing.T) {
 		ring, fake := newFakeRing(2)
