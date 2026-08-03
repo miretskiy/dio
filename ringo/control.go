@@ -43,7 +43,7 @@ func (op *timeoutOp) release() {
 		return
 	}
 	op.reset()
-	alloc.timeouts.put(op)
+	alloc.timeouts.put(op, alloc)
 }
 
 func (op *timeoutOp) reset() { *op = timeoutOp{} }
@@ -97,7 +97,7 @@ func (op *linkTimeoutOp) release() {
 		return
 	}
 	op.reset()
-	alloc.linkTimeouts.put(op)
+	alloc.linkTimeouts.put(op, alloc)
 }
 
 func (op *linkTimeoutOp) reset() { *op = linkTimeoutOp{} }
@@ -148,7 +148,7 @@ func (op *timeoutRemoveOp) release() {
 		return
 	}
 	op.reset()
-	alloc.timeoutRemoves.put(op)
+	alloc.timeoutRemoves.put(op, alloc)
 }
 
 func (op *timeoutRemoveOp) reset() { *op = timeoutRemoveOp{} }
@@ -190,7 +190,7 @@ func (op *timeoutUpdateOp) release() {
 		return
 	}
 	op.reset()
-	alloc.timeoutUpdates.put(op)
+	alloc.timeoutUpdates.put(op, alloc)
 }
 
 func (op *timeoutUpdateOp) reset() { *op = timeoutUpdateOp{} }
@@ -240,7 +240,7 @@ func (op *cancelOp) release() {
 		return
 	}
 	op.reset()
-	alloc.cancels.put(op)
+	alloc.cancels.put(op, alloc)
 }
 
 func (op *cancelOp) reset() { *op = cancelOp{} }
@@ -281,7 +281,7 @@ func (op *cancelFDOp) release() {
 		return
 	}
 	op.reset()
-	alloc.cancelFDs.put(op)
+	alloc.cancelFDs.put(op, alloc)
 }
 
 func (op *cancelFDOp) reset() { *op = cancelFDOp{} }
@@ -337,7 +337,7 @@ func (op *pollAddOp) release() {
 		return
 	}
 	op.reset()
-	alloc.pollAdds.put(op)
+	alloc.pollAdds.put(op, alloc)
 }
 
 func (op *pollAddOp) reset() { *op = pollAddOp{} }
@@ -394,7 +394,7 @@ func (op *pollRemoveOp) release() {
 		return
 	}
 	op.reset()
-	alloc.pollRemoves.put(op)
+	alloc.pollRemoves.put(op, alloc)
 }
 
 func (op *pollRemoveOp) reset() { *op = pollRemoveOp{} }

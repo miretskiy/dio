@@ -4,7 +4,6 @@ package iosched
 
 import (
 	"errors"
-	"iter"
 	"os"
 	"sync"
 	"syscall"
@@ -79,17 +78,10 @@ func (f *fakeRingQueue) SubmitAndWait(int) (int, error) {
 	return len(f.handles), nil
 }
 
-func (f *fakeRingQueue) Reap() iter.Seq[ringCompletion] {
-	return func(yield func(ringCompletion) bool) {
-		count := len(f.cqes)
-		for range count {
-			completion := f.cqes[0]
-			f.cqes = f.cqes[1:]
-			if !yield(completion) {
-				return
-			}
-		}
-	}
+func (f *fakeRingQueue) ReapInto(dst []ringCompletion) []ringCompletion {
+	dst = append(dst, f.cqes...)
+	f.cqes = nil
+	return dst
 }
 
 func (f *fakeRingQueue) complete(handle ringHandle, result int32) {
@@ -375,6 +367,60 @@ func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
 		_, waitErr := ticket.Wait()
 		require.ErrorIsf(t, waitErr, permanent, "ticket %d", i)
 	}
+}
+
+// TestDrainOutcomeOverridesEarlierOperationError is the intersection of the two
+// cases above: one operation of a chain reported a failure, another never
+// reported at all, and the drain gave up. The ticket must say the outcome is
+// unknown, because the earlier failure reads as settled and would tell its
+// holder the buffers are free.
+func TestDrainOutcomeOverridesEarlierOperationError(t *testing.T) {
+	defer func(limit int, delay time.Duration) {
+		drainStallLimit, drainStallDelay = limit, delay
+	}(drainStallLimit, drainStallDelay)
+	drainStallLimit, drainStallDelay = 4, time.Microsecond
+
+	permanent := errors.New("ring stopped reporting")
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(4, 2, ring)
+	tickets, handles := acceptOps(c,
+		VReadOp(0, make([]byte, 1), 0).HardLink(VReadOp(1, make([]byte, 1), 0)),
+	)
+	c.placeReady(false)
+	require.Equal(t, 2, c.placed, "operations were not placed")
+
+	completeForTest(c, handles[0], 0, 0, syscall.EIO)
+	ring.submitAndWaitFn = func(f *fakeRingQueue) {
+		f.submitErrs = append(f.submitErrs, permanent)
+	}
+	require.ErrorIs(t, c.drainSlots(), permanent)
+
+	c.failWork(nil, errSchedulerClosed, permanent)
+	_, waitErr := tickets[0].Wait()
+	require.ErrorIs(t, waitErr, permanent)
+	require.NotErrorIs(t, waitErr, syscall.EIO,
+		"an unknown outcome was reported as a settled failure")
+}
+
+// TestDurableWriteCompletesInEitherOrder covers a durable write whose chain the
+// kernel split, which lets the fdatasync report before the write it was linked
+// after. The group must finish on the second completion either way.
+func TestDurableWriteCompletesInEitherOrder(t *testing.T) {
+	ring := &fakeRingQueue{}
+	c := newTestCoordinator(4, 1, ring)
+	tickets, _ := acceptOps(c, VWriteOp(0, make([]byte, 8), 0).Durable())
+	c.placeReady(true)
+	require.Equal(t, 2, c.placed, "durable write was not placed as write plus sync")
+
+	// Sync first, write second: the reverse of what an intact link guarantees.
+	ring.complete(ring.handles[1], 0)
+	ring.complete(ring.handles[0], 8)
+	require.Equal(t, 2, c.reap(), "both completions were not applied")
+
+	n, err := tickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, 8, n)
+	require.Zero(t, c.placed)
 }
 
 func TestResourceErrorsReturnToCoordinator(t *testing.T) {

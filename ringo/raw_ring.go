@@ -264,25 +264,54 @@ func (ring *rawRing) getSQE() *rawSQE {
 	if next-head > *ring.sq.ringEntries {
 		return nil
 	}
-	index := ring.sq.sqeTail & *ring.sq.ringMask
+	sqe := ring.sqeAt(ring.sq.sqeTail)
 	ring.sq.sqeTail = next
+	return sqe
+}
+
+// sqeAt addresses the submission queue entry holding position sequence. Ringo
+// keeps the kernel's index array as the identity permutation when it is present
+// at all, so an entry's position is also its index.
+func (ring *rawRing) sqeAt(sequence uint32) *rawSQE {
+	index := sequence & *ring.sq.ringMask
 	return (*rawSQE)(unsafe.Add(
 		unsafe.Pointer(unsafe.SliceData(ring.sq.sqeMemory)),
 		uintptr(index)*ring.sq.sqeSize,
 	))
 }
 
-func (ring *rawRing) flushSQ() uint32 {
+// flushSQ publishes the queued entries and reports how many the kernel has yet
+// to consume, along with the position it will start consuming from.
+func (ring *rawRing) flushSQ() (submitted, head uint32) {
 	tail := ring.sq.sqeTail
 	if ring.sq.sqeHead != tail {
 		ring.sq.sqeHead = tail
 		atomic.StoreUint32(ring.sq.tail, tail)
 	}
-	return tail - atomic.LoadUint32(ring.sq.head)
+	head = atomic.LoadUint32(ring.sq.head)
+	return tail - head, head
+}
+
+// splitChain reports whether a short submission cut a linked chain: the kernel
+// consumed positions [head, head+consumed), so a chain survived only if the
+// last entry taken did not expect a successor. ErrChainSplit describes when
+// this happens and what it costs.
+//
+// Reading that entry back is safe because the kernel is finished with
+// submission queue memory once io_uring_enter returns and Ringo is its only
+// writer. Neither holds under SQPOLL, where a kernel thread reads the queue
+// asynchronously and the returned count is just the requested one, so the check
+// is skipped there and a cut goes undetected.
+func (ring *rawRing) splitChain(head, consumed uint32) bool {
+	if consumed == 0 || ring.flags&rawSetupSQPoll != 0 {
+		return false
+	}
+	last := ring.sqeAt(head + consumed - 1)
+	return rawSQEFlags(last.Flags)&(rawSqeIOLink|rawSqeIOHardlink) != 0
 }
 
 func (ring *rawRing) submitAndWait(waitFor uint32) (uint, error) {
-	submitted := ring.flushSQ()
+	submitted, head := ring.flushSQ()
 	var flags rawEnterFlags
 	sqFlags := rawSQFlags(atomic.LoadUint32(ring.sq.flags))
 	if waitFor != 0 || sqFlags&(rawSQCQOverflow|rawSQTaskrun) != 0 {
@@ -311,6 +340,9 @@ func (ring *rawRing) submitAndWait(waitFor uint32) (uint, error) {
 		}
 		if errno != 0 {
 			return 0, errno
+		}
+		if uint32(consumed) < submitted && ring.splitChain(head, uint32(consumed)) {
+			return 0, ErrChainSplit
 		}
 		return consumed, nil
 	}

@@ -72,6 +72,9 @@ type testTransport struct {
 	submitErrno  syscall.Errno
 	submitErrnos []syscall.Errno
 	submitCalls  int
+	// consumeAtMost caps how many entries a submission takes, standing in for
+	// the kernel giving up partway through a batch. Zero takes them all.
+	consumeAtMost uint32
 
 	registeredBuffers []syscall.Iovec
 	registeredFiles   uint32
@@ -101,9 +104,13 @@ func (transport *testTransport) enter(
 	}
 	// Consume the published entries the way the kernel does, so submission
 	// capacity is released and the queues genuinely wrap.
+	consumed := submitted
+	if transport.consumeAtMost != 0 && transport.consumeAtMost < consumed {
+		consumed = transport.consumeAtMost
+	}
 	head := transport.raw.sq.head
-	atomic.StoreUint32(head, atomic.LoadUint32(head)+submitted)
-	return uint(submitted), 0
+	atomic.StoreUint32(head, atomic.LoadUint32(head)+consumed)
+	return uint(consumed), 0
 }
 
 func (transport *testTransport) register(
@@ -191,6 +198,41 @@ func newFakeRing(depth int) (*Ring, *testTransport) {
 		pending: intrusive.MakeFixedList[pendingSlot](depth),
 	}
 	return ring, transport
+}
+
+// TestShortSubmissionReportsOnlyASplitChain covers the one short submission
+// IORING_SETUP_SUBMIT_ALL does not prevent: the kernel stops partway through a
+// batch because it cannot allocate a request. Stopping inside a chain is
+// reported, since the remainder will run as a chain of its own; stopping on a
+// chain boundary broke nothing and is left to the next submission.
+func TestShortSubmissionReportsOnlyASplitChain(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		consume   uint32
+		wantSplit bool
+	}{
+		{name: "inside the chain", consume: 2, wantSplit: true},
+		{name: "on the chain boundary", consume: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ring, transport := newFakeRing(8)
+			// A three-operation chain, then unrelated work behind it.
+			_, err := ring.PushLinked(Nop(), Then(LinkSoft, Nop()), Then(LinkHard, Nop()))
+			require.NoError(t, err)
+			_, err = ring.Push(Nop())
+			require.NoError(t, err)
+
+			transport.consumeAtMost = test.consume
+			submitted, err := ring.Submit()
+			if test.wantSplit {
+				require.ErrorIs(t, err, ErrChainSplit)
+				require.Zero(t, submitted, "a split must not also report progress")
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, int(test.consume), submitted)
+		})
+	}
 }
 
 func TestSetupOptionsMapToKernelParameters(t *testing.T) {

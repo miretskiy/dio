@@ -46,12 +46,16 @@ type Op interface {
 // An OpAlloc is safe to use from any goroutine. That matters because the
 // goroutine returning an operation is not necessarily the one that built it:
 // Reap is what releases an operation back to its OpAlloc, and Ring calls only
-// have to be serialized, not confined to one goroutine. Each operation type
-// has its own lock, so recycling a read never contends with recycling a write.
+// have to be serialized, not confined to one goroutine.
 //
 // It holds at most as many objects of each kind as the Ring can have operations
 // in flight, so it needs no sizing. The zero value is ready to use.
 type OpAlloc struct {
+	// mu guards every free list. One lock covers all of them rather than one
+	// per operation type: the only contention available is between a reaping
+	// goroutine and whoever is building the next operation, and a chain long
+	// enough to recycle many types at once does not occur.
+	mu sync.Mutex
 	freeListAlloc
 }
 
@@ -136,7 +140,7 @@ func (op *nopOp) release() {
 		return
 	}
 	op.reset()
-	alloc.nops.put(op)
+	alloc.nops.put(op, alloc)
 }
 
 func (op *nopOp) reset() { *op = nopOp{} }
@@ -164,11 +168,9 @@ func Nop(options ...OpOption) Op {
 // freeList recycles the objects of one operation type. Its zero value is an
 // empty list whose get allocates.
 //
-// The lock lives here rather than on OpAlloc so operation types never contend
-// with one another, and so no constructor or release method has to know that
-// recycling is synchronized at all.
+// The owning OpAlloc supplies whatever mutual exclusion applies, so a freeList
+// has none of its own and is never used without one.
 type freeList[T any] struct {
-	sync.Mutex
 	free []*T
 }
 
@@ -177,25 +179,25 @@ type freeList[T any] struct {
 // rather than writing a whole struct literal, so anything a previous operation
 // left behind -- a stale buffer, a Drain flag, a constructor error -- must
 // already be gone. release guarantees it by resetting before parking.
-func (list *freeList[T]) get() *T {
+func (list *freeList[T]) get(alloc *OpAlloc) *T {
 	var op *T
-	list.Lock()
+	alloc.mu.Lock()
 	if count := len(list.free); count != 0 {
 		op = list.free[count-1]
 		list.free[count-1] = nil
 		list.free = list.free[:count-1]
 	}
-	list.Unlock()
+	alloc.mu.Unlock()
 	if op == nil {
 		return new(T)
 	}
 	return op
 }
 
-func (list *freeList[T]) put(op *T) {
-	list.Lock()
+func (list *freeList[T]) put(op *T, alloc *OpAlloc) {
+	alloc.mu.Lock()
 	list.free = append(list.free, op)
-	list.Unlock()
+	alloc.mu.Unlock()
 }
 
 type freeListAlloc struct {
@@ -230,7 +232,7 @@ func (alloc *OpAlloc) newNopOp() *nopOp {
 	if alloc == nil {
 		return new(nopOp)
 	}
-	op := alloc.nops.get()
+	op := alloc.nops.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -239,7 +241,7 @@ func (alloc *OpAlloc) newReadOp() *readOp {
 	if alloc == nil {
 		return new(readOp)
 	}
-	op := alloc.reads.get()
+	op := alloc.reads.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -248,7 +250,7 @@ func (alloc *OpAlloc) newWriteOp() *writeOp {
 	if alloc == nil {
 		return new(writeOp)
 	}
-	op := alloc.writes.get()
+	op := alloc.writes.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -257,7 +259,7 @@ func (alloc *OpAlloc) newReadvOp() *readvOp {
 	if alloc == nil {
 		return new(readvOp)
 	}
-	op := alloc.readvs.get()
+	op := alloc.readvs.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -266,7 +268,7 @@ func (alloc *OpAlloc) newWritevOp() *writevOp {
 	if alloc == nil {
 		return new(writevOp)
 	}
-	op := alloc.writevs.get()
+	op := alloc.writevs.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -275,7 +277,7 @@ func (alloc *OpAlloc) newFsyncOp() *fsyncOp {
 	if alloc == nil {
 		return new(fsyncOp)
 	}
-	op := alloc.fsyncs.get()
+	op := alloc.fsyncs.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -284,7 +286,7 @@ func (alloc *OpAlloc) newFallocateOp() *fallocateOp {
 	if alloc == nil {
 		return new(fallocateOp)
 	}
-	op := alloc.fallocates.get()
+	op := alloc.fallocates.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -293,7 +295,7 @@ func (alloc *OpAlloc) newOpenAtOp() *openAtOp {
 	if alloc == nil {
 		return new(openAtOp)
 	}
-	op := alloc.openAts.get()
+	op := alloc.openAts.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -302,7 +304,7 @@ func (alloc *OpAlloc) newOpenAt2Op() *openAt2Op {
 	if alloc == nil {
 		return new(openAt2Op)
 	}
-	op := alloc.openAt2s.get()
+	op := alloc.openAt2s.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -311,7 +313,7 @@ func (alloc *OpAlloc) newStatxOp() *statxOp {
 	if alloc == nil {
 		return new(statxOp)
 	}
-	op := alloc.statxes.get()
+	op := alloc.statxes.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -320,7 +322,7 @@ func (alloc *OpAlloc) newFtruncateOp() *ftruncateOp {
 	if alloc == nil {
 		return new(ftruncateOp)
 	}
-	op := alloc.ftruncates.get()
+	op := alloc.ftruncates.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -329,7 +331,7 @@ func (alloc *OpAlloc) newCloseDirectOp() *closeDirectOp {
 	if alloc == nil {
 		return new(closeDirectOp)
 	}
-	op := alloc.closeDirects.get()
+	op := alloc.closeDirects.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -338,7 +340,7 @@ func (alloc *OpAlloc) newCloseFDOp() *closeFDOp {
 	if alloc == nil {
 		return new(closeFDOp)
 	}
-	op := alloc.closeFDs.get()
+	op := alloc.closeFDs.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -347,7 +349,7 @@ func (alloc *OpAlloc) newTimeoutOp() *timeoutOp {
 	if alloc == nil {
 		return new(timeoutOp)
 	}
-	op := alloc.timeouts.get()
+	op := alloc.timeouts.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -356,7 +358,7 @@ func (alloc *OpAlloc) newLinkTimeoutOp() *linkTimeoutOp {
 	if alloc == nil {
 		return new(linkTimeoutOp)
 	}
-	op := alloc.linkTimeouts.get()
+	op := alloc.linkTimeouts.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -365,7 +367,7 @@ func (alloc *OpAlloc) newTimeoutRemoveOp() *timeoutRemoveOp {
 	if alloc == nil {
 		return new(timeoutRemoveOp)
 	}
-	op := alloc.timeoutRemoves.get()
+	op := alloc.timeoutRemoves.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -374,7 +376,7 @@ func (alloc *OpAlloc) newTimeoutUpdateOp() *timeoutUpdateOp {
 	if alloc == nil {
 		return new(timeoutUpdateOp)
 	}
-	op := alloc.timeoutUpdates.get()
+	op := alloc.timeoutUpdates.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -383,7 +385,7 @@ func (alloc *OpAlloc) newCancelOp() *cancelOp {
 	if alloc == nil {
 		return new(cancelOp)
 	}
-	op := alloc.cancels.get()
+	op := alloc.cancels.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -392,7 +394,7 @@ func (alloc *OpAlloc) newCancelFDOp() *cancelFDOp {
 	if alloc == nil {
 		return new(cancelFDOp)
 	}
-	op := alloc.cancelFDs.get()
+	op := alloc.cancelFDs.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -401,7 +403,7 @@ func (alloc *OpAlloc) newPollAddOp() *pollAddOp {
 	if alloc == nil {
 		return new(pollAddOp)
 	}
-	op := alloc.pollAdds.get()
+	op := alloc.pollAdds.get(alloc)
 	op.alloc = alloc
 	return op
 }
@@ -410,7 +412,7 @@ func (alloc *OpAlloc) newPollRemoveOp() *pollRemoveOp {
 	if alloc == nil {
 		return new(pollRemoveOp)
 	}
-	op := alloc.pollRemoves.get()
+	op := alloc.pollRemoves.get(alloc)
 	op.alloc = alloc
 	return op
 }

@@ -43,7 +43,7 @@ func (op *readOp) release() {
 		return
 	}
 	op.reset()
-	alloc.reads.put(op)
+	alloc.reads.put(op, alloc)
 }
 
 func (op *readOp) reset() { *op = readOp{} }
@@ -116,7 +116,7 @@ func (op *writeOp) release() {
 		return
 	}
 	op.reset()
-	alloc.writes.put(op)
+	alloc.writes.put(op, alloc)
 }
 
 func (op *writeOp) reset() { *op = writeOp{} }
@@ -198,7 +198,7 @@ func (op *readvOp) release() {
 		return
 	}
 	op.reset()
-	alloc.readvs.put(op)
+	alloc.readvs.put(op, alloc)
 }
 
 // reset keeps the heap-allocated iovec array, which is the one allocation a
@@ -305,7 +305,7 @@ func (op *writevOp) release() {
 		return
 	}
 	op.reset()
-	alloc.writevs.put(op)
+	alloc.writevs.put(op, alloc)
 }
 
 // reset keeps the heap-allocated iovec array, which is the one allocation a
@@ -470,7 +470,7 @@ func (op *fsyncOp) release() {
 		return
 	}
 	op.reset()
-	alloc.fsyncs.put(op)
+	alloc.fsyncs.put(op, alloc)
 }
 
 func (op *fsyncOp) reset() { *op = fsyncOp{} }
@@ -533,7 +533,7 @@ func (op *fallocateOp) release() {
 		return
 	}
 	op.reset()
-	alloc.fallocates.put(op)
+	alloc.fallocates.put(op, alloc)
 }
 
 func (op *fallocateOp) reset() { *op = fallocateOp{} }
@@ -625,7 +625,7 @@ func (op *openAtOp) release() {
 		return
 	}
 	op.reset()
-	alloc.openAts.put(op)
+	alloc.openAts.put(op, alloc)
 }
 
 func (op *openAtOp) reset() { *op = openAtOp{} }
@@ -729,7 +729,7 @@ func (op *openAt2Op) release() {
 		return
 	}
 	op.reset()
-	alloc.openAt2s.put(op)
+	alloc.openAt2s.put(op, alloc)
 }
 
 func (op *openAt2Op) reset() { *op = openAt2Op{} }
@@ -801,7 +801,7 @@ func (op *statxOp) release() {
 		return
 	}
 	op.reset()
-	alloc.statxes.put(op)
+	alloc.statxes.put(op, alloc)
 }
 
 func (op *statxOp) reset() { *op = statxOp{} }
@@ -871,7 +871,7 @@ func (op *ftruncateOp) release() {
 		return
 	}
 	op.reset()
-	alloc.ftruncates.put(op)
+	alloc.ftruncates.put(op, alloc)
 }
 
 func (op *ftruncateOp) reset() { *op = ftruncateOp{} }
@@ -919,7 +919,7 @@ func (op *closeDirectOp) release() {
 		return
 	}
 	op.reset()
-	alloc.closeDirects.put(op)
+	alloc.closeDirects.put(op, alloc)
 }
 
 func (op *closeDirectOp) reset() { *op = closeDirectOp{} }
@@ -957,7 +957,7 @@ func (op *closeFDOp) release() {
 		return
 	}
 	op.reset()
-	alloc.closeFDs.put(op)
+	alloc.closeFDs.put(op, alloc)
 }
 
 func (op *closeFDOp) reset() { *op = closeFDOp{} }

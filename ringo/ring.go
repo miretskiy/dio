@@ -30,6 +30,20 @@ var (
 	// ErrWrongRing reports a ring-scoped handle or resource used with another
 	// Ring.
 	ErrWrongRing = errors.New("ringo: resource belongs to another ring")
+	// ErrChainSplit reports that io_uring consumed only part of a linked chain.
+	// IORING_SETUP_SUBMIT_ALL keeps submission going past a preparation failure
+	// but not past a failed request allocation, which a process reaches by
+	// hitting a cgroup memory limit, since struct io_kiocb is charged against
+	// it. The kernel runs the prefix it took and reports it as an ordinary short
+	// count, leaving the rest queued for the next submission to take as a new
+	// chain, so the two halves run in either order.
+	//
+	// The same allocation failure having consumed nothing is EAGAIN, which is
+	// retryable. A split is not: the prefix is already running, so resubmitting
+	// only releases the remainder. Both halves still complete, so the caller
+	// keeps reaping, but must treat whatever the chain ordered -- a durable
+	// write, a direct open feeding its successor -- as lost.
+	ErrChainSplit = errors.New("ringo: linked chain split by a short submission")
 )
 
 // abandoned roots every Ring that was closed while it still owned operations,
@@ -234,8 +248,10 @@ func (ring *Ring) hasCapacity(count int) bool {
 
 // PushLinked atomically queues one linked sequence. Each Link describes the
 // edge from the preceding operation to Link.Next. At least one link is
-// required. Every Ring uses IORING_SETUP_SUBMIT_ALL because a linked chain
-// cannot continue across a short submission boundary.
+// required. A chain cannot continue across a short submission boundary, so
+// every Ring uses IORING_SETUP_SUBMIT_ALL to keep the kernel consuming entries
+// past a preparation failure. The one short submission that remains possible is
+// reported as ErrChainSplit.
 //
 // On success PushLinked takes ownership of every Op permanently, but it does
 // not retain the variadic Link slice. The caller must discard every Op copy and
@@ -319,7 +335,8 @@ func (ring *Ring) Submit() (submitted int, err error) {
 // nothing. An error never returns ownership of a pushed operation to the
 // caller. EAGAIN and EBUSY are the
 // kernel's temporary resource conditions and are passed through: reap the
-// available completions and submit again. Ringo retries EINTR internally,
+// available completions and submit again. ErrChainSplit is not one of those
+// and must not be retried away. Ringo retries EINTR internally,
 // because an interrupted io_uring_enter consumes no SQE and loses no
 // completion, so it carries no information for the caller; interruption of an
 // operation is reported in that operation's completion instead.

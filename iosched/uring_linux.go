@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"iter"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -37,6 +36,12 @@ type writeGroupCompletion struct {
 	count    int            // total valid targets
 	n        int            // write result retained until fdatasync
 	err      error          // write error retained until fdatasync
+	syncErr  error          // fdatasync error retained until the write reports
+	// awaiting counts the completions a durable group still owes: the write and
+	// the fdatasync linked after it. An intact link delivers the write's CQE
+	// first, but a chain io_uring split reports them in either order, so the
+	// group finishes on whichever arrives second instead of assuming.
+	awaiting int
 }
 
 type writeResultFn func(*coordinator, intrusive.Handle, int, error)
@@ -333,7 +338,11 @@ type ringQueue interface {
 	Push(ringo.Op) (ringHandle, error)
 	PushLinked(ringo.Op, ringo.Link, ...ringo.Link) ([]ringHandle, error)
 	SubmitAndWait(minComplete int) (submitted int, err error)
-	Reap() iter.Seq[ringCompletion]
+	// ReapInto appends every available completion to dst and returns it. It
+	// hands back a slice rather than an iterator or a callback because neither
+	// can be stack allocated when it crosses an interface, which costs two
+	// allocations on every reap. The caller reuses one buffer instead.
+	ReapInto(dst []ringCompletion) []ringCompletion
 }
 
 // ringHandle pairs Ringo's opaque identity with the dense slot index it exposes.
@@ -386,21 +395,18 @@ func (queue *liveRingQueue) SubmitAndWait(minComplete int) (int, error) {
 	return queue.ring.SubmitAndWait(minComplete)
 }
 
-func (queue *liveRingQueue) Reap() iter.Seq[ringCompletion] {
-	return func(yield func(ringCompletion) bool) {
-		for completion := range queue.ring.Reap() {
-			if !yield(ringCompletion{
-				handle: ringHandle{
-					handle: completion.Handle,
-					index:  completion.Handle.Index(),
-				},
-				result: completion.Result,
-				err:    completion.Err,
-			}) {
-				return
-			}
-		}
+func (queue *liveRingQueue) ReapInto(dst []ringCompletion) []ringCompletion {
+	for completion := range queue.ring.Reap() {
+		dst = append(dst, ringCompletion{
+			handle: ringHandle{
+				handle: completion.Handle,
+				index:  completion.Handle.Index(),
+			},
+			result: completion.Result,
+			err:    completion.Err,
+		})
 	}
+	return dst
 }
 
 type coordinator struct {
@@ -427,9 +433,10 @@ type coordinator struct {
 	// links is coordinator-owned scratch for one linked chain. PushLinked does
 	// not retain the slice, so it can be reused across placements.
 	links []ringo.Link
-	// alloc recycles Ringo operation objects. The coordinator goroutine is the
-	// only one that builds operations and the only one that reaps them, so its
-	// per-type locks are always uncontended.
+	// completions is coordinator-owned scratch for one reap.
+	completions []ringCompletion
+	// alloc recycles Ringo operation objects. Only this goroutine builds them
+	// and only this goroutine reaps them, so its lock is never contended.
 	alloc ringo.OpAlloc
 
 	files        fileTable
@@ -716,6 +723,7 @@ func (c *coordinator) placeWriteGroup(handles []intrusive.Handle, durable bool) 
 		return
 	}
 
+	completion.awaiting = 2
 	sync := prepared.syncOp()
 	ringHandles, err := c.ring.PushLinked(
 		write,
@@ -829,13 +837,16 @@ func (c *coordinator) submitAndWait() (reaped int, err error) {
 	return reaped, err
 }
 
+// reap drains the available completions into the coordinator's buffer before
+// applying them. Ringo releases each operation as it yields the completion, and
+// nothing in reapOne reads Ringo state, so buffering changes nothing but who
+// owns the loop.
 func (c *coordinator) reap() int {
-	count := 0
-	for completion := range c.ring.Reap() {
+	c.completions = c.ring.ReapInto(c.completions[:0])
+	for _, completion := range c.completions {
 		c.reapOne(completion)
-		count++
 	}
-	return count
+	return len(c.completions)
 }
 
 // drainStallLimit bounds how many consecutive drain rounds may reap nothing
@@ -843,6 +854,10 @@ func (c *coordinator) reap() int {
 // until at least one completion is available, so a round that reaps nothing
 // means the ring can no longer report: it has recorded a fault, or entering it
 // keeps failing. Neither clears on its own. Tests lower these.
+//
+// TODO: a stall round only occurs when entering the ring fails, so this is a
+// busy retry against a failing syscall that gives up after about a second.
+// Replace the fixed count and delay with a backoff against a deadline.
 var (
 	drainStallLimit = 1024
 	drainStallDelay = time.Millisecond
@@ -940,11 +955,24 @@ func recordDurableWrite(c *coordinator, slot ringSlot, n int, err error) {
 	completion := &c.pending.Value(slot.work).writeGroup
 	completion.n = n
 	completion.err = err
-	completion.distribute(c, n, err, nil, recordWriteResult)
+	completion.awaiting--
+	if completion.awaiting != 0 {
+		// Record the write's byte count while the group is still here. If the
+		// fdatasync never reports, the ticket's error becomes the drain's
+		// unknown outcome, but the count still says how much reached the kernel.
+		completion.distribute(c, n, err, nil, recordWriteResult)
+		return
+	}
+	c.finishWrite(slot.work, n, err, completion.syncErr)
 }
 
 func completeDurableWrite(c *coordinator, slot ringSlot, _ int, syncErr error) {
 	completion := &c.pending.Value(slot.work).writeGroup
+	completion.syncErr = syncErr
+	completion.awaiting--
+	if completion.awaiting != 0 {
+		return
+	}
 	c.finishWrite(slot.work, completion.n, completion.err, syncErr)
 }
 
@@ -1026,13 +1054,14 @@ func (c *coordinator) failWork(staged *submission, unplaced, placed error) {
 		if work.ready != 0 {
 			c.ready.Remove(work.ready)
 		}
-		root := work.root
-		reason := unplaced
-		if work.inflight {
-			reason = placed
-		}
+		// Remove clears the work item, so its state must be read out first.
+		root, inflight := work.root, work.inflight
 		c.pending.Remove(handle)
-		completeFailed(root, reason)
+		if inflight {
+			completeUnknown(root, placed)
+			continue
+		}
+		completeFailed(root, unplaced)
 	}
 	for staged != nil {
 		next := staged.staged
@@ -1046,5 +1075,15 @@ func completeFailed(root *Op, err error) {
 	if root.err == nil {
 		root.err = err
 	}
+	root.done.Done()
+}
+
+// completeUnknown reports that one of root's operations never told the
+// coordinator what happened to it. Only a drain that gave up reaches this. It
+// replaces any result another operation in the same work recorded, because that
+// result reads as a settled failure, and a settled failure is what tells a
+// caller its buffers are its own again.
+func completeUnknown(root *Op, err error) {
+	root.err = err
 	root.done.Done()
 }
