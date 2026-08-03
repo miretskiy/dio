@@ -102,7 +102,7 @@ func (f *fakeRingQueue) complete(handle ringHandle, result int32) {
 	f.cqes = append(f.cqes, completion)
 }
 
-func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
+func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) *coordinator {
 	c := coordinator{
 		sched: &URingScheduler{
 			config: schedulerConfig{
@@ -115,7 +115,7 @@ func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) coordinator {
 		slots: make([]ringSlot, depth),
 		files: newFileTable(vfiles),
 	}
-	return c
+	return &c
 }
 
 // releaseAllSlots is test-only cleanup for cases that deliberately stop before
@@ -236,7 +236,7 @@ func TestSubmitRejectsInvalidVirtualFileBeforeStaging(t *testing.T) {
 func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(1, 1, ring)
-	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	tickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
 	c.placeReady(false)
 	c.sched.signalShutdown(errSchedulerClosed)
 	ring.complete(ring.handles[0], -int32(syscall.ECANCELED))
@@ -266,7 +266,7 @@ func TestPlaceChainPreservesMixedLinks(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(3, 1, ring)
 	acceptOps(
-		&c,
+		c,
 		VReadOp(0, make([]byte, 1), 0).
 			Link(VReadOp(0, make([]byte, 1), 1)).
 			HardLink(VReadOp(0, make([]byte, 1), 2)),
@@ -323,13 +323,17 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 func TestResourceErrorReapsAvailableCompletion(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(1, 1, ring)
-	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	tickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
 	c.placeReady(false)
 	ring.submitErrs = []error{syscall.EAGAIN}
 	ring.complete(ring.handles[0], 1)
 
-	if err := c.submitAndWait(); err != nil {
-		t.Fatal(err)
+	reaped, err := c.submitAndWait()
+	if !retryableRingError(err) {
+		t.Fatalf("submit error: got %v, want a retryable resource error", err)
+	}
+	if reaped != 1 {
+		t.Fatalf("completions reaped while recovering: got %d want 1", reaped)
 	}
 	tickets[0].Wait()
 }
@@ -353,7 +357,7 @@ func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
 		f.submitErrs = append(f.submitErrs, permanent)
 	}
 	c := newTestCoordinator(4, 2, ring)
-	tickets, _ := acceptOps(&c,
+	tickets, _ := acceptOps(c,
 		VReadOp(0, make([]byte, 1), 0),
 		VReadOp(1, make([]byte, 1), 0),
 	)
@@ -378,11 +382,11 @@ func TestResourceErrorsReturnToCoordinator(t *testing.T) {
 		t.Run(enterErr.Error(), func(t *testing.T) {
 			ring := &fakeRingQueue{submitErrs: []error{enterErr}}
 			c := newTestCoordinator(1, 1, ring)
-			acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+			acceptOps(c, VReadOp(0, make([]byte, 1), 0))
 			c.placeReady(false)
 
-			if err := c.submitAndWait(); err != nil {
-				t.Fatal(err)
+			if _, err := c.submitAndWait(); !retryableRingError(err) {
+				t.Fatalf("submit error: got %v, want a retryable resource error", err)
 			}
 			if ring.submitCalls != 1 {
 				t.Fatalf("submit calls: got %d want 1", ring.submitCalls)
@@ -411,10 +415,10 @@ func completeForTest(c *coordinator, handle intrusive.Handle, index uint32, n in
 func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 	err := errors.New("ring failed")
 	c := newTestCoordinator(2, 1, &fakeRingQueue{})
-	tickets, handles := acceptOps(&c, VReadOp(0, nil, 0).Link(VReadOp(0, nil, 0)))
+	tickets, handles := acceptOps(c, VReadOp(0, nil, 0).Link(VReadOp(0, nil, 0)))
 	ticket := tickets[0]
 
-	completeForTest(&c, handles[0], 0, 1, nil)
+	completeForTest(c, handles[0], 0, 1, nil)
 	c.failRemaining(nil, err)
 	n, gotErr := ticket.Wait()
 
@@ -430,7 +434,7 @@ func TestCleanupDrainsPlacedCompletionsBeforeFailingUnplacedWork(t *testing.T) {
 	ringErr := errors.New("ring failed")
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(1, 2, ring)
-	tickets, _ := acceptOps(&c,
+	tickets, _ := acceptOps(c,
 		VReadOp(0, make([]byte, 1), 0),
 		VReadOp(1, make([]byte, 1), 0),
 	)
@@ -457,7 +461,7 @@ func TestDrainSlotsWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(1, 1, ring)
 	c.sched.signalShutdown(errSchedulerClosed)
-	tickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	tickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
 	c.placeReady(false)
 
 	entered := make(chan struct{})
@@ -496,7 +500,7 @@ func TestDrainSlotsWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
 
 func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
 	c := newTestCoordinator(4, 2, &fakeRingQueue{})
-	_, handles := acceptOps(&c,
+	_, handles := acceptOps(c,
 		VOpenatOp(0, "file", 0, 0, 1),
 		VReadOp(1, make([]byte, 1), 0),
 	)
@@ -506,17 +510,17 @@ func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
 	}
 	waiterCap := cap(c.files.virtual[1].openWaiters)
 	require.NotZero(t, waiterCap)
-	completeForTest(&c, handles[0], 0, 0, nil)
+	completeForTest(c, handles[0], 0, 0, nil)
 	require.Equal(t, waiterCap, cap(c.files.virtual[1].openWaiters))
 	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("read did not become ready at open completion")
 	}
-	completeForTest(&c, handles[1], 0, 1, nil)
+	completeForTest(c, handles[1], 0, 1, nil)
 }
 
 func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
 	c := newTestCoordinator(4, 2, &fakeRingQueue{})
-	_, handles := acceptOps(&c,
+	_, handles := acceptOps(c,
 		VReadOp(1, make([]byte, 1), 0),
 		VCloseOp(1),
 	)
@@ -524,16 +528,16 @@ func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
 	if c.pending.Value(handles[1]).waitCount != 1 {
 		t.Fatal("close did not wait for older read")
 	}
-	completeForTest(&c, handles[0], 0, 1, nil)
+	completeForTest(c, handles[0], 0, 1, nil)
 	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("close did not become ready after read")
 	}
-	completeForTest(&c, handles[1], 0, 0, nil)
+	completeForTest(c, handles[1], 0, 0, nil)
 }
 
 func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	c := newTestCoordinator(4, 1, &fakeRingQueue{})
-	_, handles := acceptOps(&c,
+	_, handles := acceptOps(c,
 		VReadOp(0, make([]byte, 1), 0),
 		VWriteOp(0, make([]byte, 1), 1).Link(
 			VWriteOp(0, make([]byte, 1), 2),
@@ -557,18 +561,18 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 		t.Fatal("work submitted behind a close at the end of a chain was accepted")
 	}
 
-	completeForTest(&c, handles[0], 0, 1, nil)
+	completeForTest(c, handles[0], 0, 1, nil)
 	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("close chain did not become ready after older work completed")
 	}
-	completeForTest(&c, handles[1], 0, 1, nil)
-	completeForTest(&c, handles[1], 1, 1, nil)
-	completeForTest(&c, handles[1], 2, 0, nil)
+	completeForTest(c, handles[1], 0, 1, nil)
+	completeForTest(c, handles[1], 1, 1, nil)
+	completeForTest(c, handles[1], 2, 0, nil)
 }
 
 func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
 	c := newTestCoordinator(4, 1, &fakeRingQueue{})
-	tickets, handles := acceptOps(&c,
+	tickets, handles := acceptOps(c,
 		VCloseOp(0),
 		VReadOp(0, make([]byte, 1), 0),
 	)
@@ -580,12 +584,12 @@ func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
 	if err == nil {
 		t.Fatal("work submitted behind close was accepted")
 	}
-	completeForTest(&c, handles[0], 0, 0, nil)
+	completeForTest(c, handles[0], 0, 0, nil)
 }
 
 func TestDeferredMultiFileWorkIsKnownAtAdmission(t *testing.T) {
 	c := newTestCoordinator(8, 2, &fakeRingQueue{})
-	_, handles := acceptOps(&c,
+	_, handles := acceptOps(c,
 		VOpenatOp(0, "a", 0, 0, 0),
 		VReadOp(0, make([]byte, 1), 0).Link(VWriteOp(1, make([]byte, 1), 0)),
 		VCloseOp(1),
@@ -597,18 +601,18 @@ func TestDeferredMultiFileWorkIsKnownAtAdmission(t *testing.T) {
 	if c.pending.Value(handles[2]).waitCount != 1 {
 		t.Fatal("close overtook older blocked write")
 	}
-	completeForTest(&c, handles[0], 0, 0, nil)
-	completeForTest(&c, handles[1], 0, 1, nil)
+	completeForTest(c, handles[0], 0, 0, nil)
+	completeForTest(c, handles[1], 0, 1, nil)
 	if c.pending.Value(handles[2]).ready != 0 {
 		t.Fatal("close became ready before the linked write completed")
 	}
-	completeForTest(&c, handles[1], 1, 1, nil)
-	completeForTest(&c, handles[2], 0, 0, nil)
+	completeForTest(c, handles[1], 1, 1, nil)
+	completeForTest(c, handles[2], 0, 0, nil)
 }
 
 func TestOpenBarrierWaitsForWholeLinkedChain(t *testing.T) {
 	c := newTestCoordinator(4, 2, &fakeRingQueue{})
-	_, handles := acceptOps(&c,
+	_, handles := acceptOps(c,
 		VOpenatOp(0, "a", 0, 0, 0).Link(
 			VFallocateOp(0, 4096),
 			VReadOp(1, make([]byte, 1), 0),
@@ -616,29 +620,29 @@ func TestOpenBarrierWaitsForWholeLinkedChain(t *testing.T) {
 		VReadOp(0, make([]byte, 1), 0),
 	)
 
-	completeForTest(&c, handles[0], 0, 0, nil)
+	completeForTest(c, handles[0], 0, 0, nil)
 	if c.pending.Value(handles[1]).ready != 0 {
 		t.Fatal("open dependent escaped after only the open completed")
 	}
-	completeForTest(&c, handles[0], 1, 0, nil)
+	completeForTest(c, handles[0], 1, 0, nil)
 	if c.pending.Value(handles[1]).ready != 0 {
 		t.Fatal("open dependent escaped before the whole linked chain completed")
 	}
-	completeForTest(&c, handles[0], 2, 1, nil)
+	completeForTest(c, handles[0], 2, 1, nil)
 	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("open dependent did not become ready with the linked chain")
 	}
-	completeForTest(&c, handles[1], 0, 1, nil)
+	completeForTest(c, handles[1], 0, 1, nil)
 }
 
 func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	c := newTestCoordinator(4, 1, &fakeRingQueue{})
-	_, handles := acceptOps(&c,
+	_, handles := acceptOps(c,
 		VOpenatOp(0, "a", 0, 0, 0),
 		VWriteOp(0, make([]byte, 1), 0),
 	)
 
-	completeForTest(&c, handles[0], 0, 0, syscall.ENOENT)
+	completeForTest(c, handles[0], 0, 0, syscall.ENOENT)
 	if c.pending.Value(handles[1]).ready == 0 {
 		t.Fatal("failed open did not release waiting write")
 	}
@@ -651,7 +655,7 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 		t.Fatal("retry open was accepted while prior slot work remained")
 	}
 
-	completeForTest(&c, handles[1], 0, 0, syscall.EBADF)
+	completeForTest(c, handles[1], 0, 0, syscall.EBADF)
 	finalRoot := VOpenatOp(0, "b", 0, 0, 0)
 	finalRequest, final := newSubmission(finalRoot, int32(finalRoot.opCount()))
 	c.accept(finalRequest)
@@ -659,7 +663,7 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 		t.Fatal("retry open was not accepted after prior slot work completed")
 	}
 	handle, _ := c.pending.Front()
-	completeForTest(&c, handle, 0, 0, nil)
+	completeForTest(c, handle, 0, 0, nil)
 	_, err = final.Wait()
 	if err != nil {
 		t.Fatalf("final open failed: %v", err)
@@ -669,7 +673,7 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 func TestWriteGroupPreservesCountsOnSyncError(t *testing.T) {
 	syncErr := errors.New("fdatasync failed")
 	c := newTestCoordinator(4, 1, &fakeRingQueue{})
-	tickets, handles := acceptOps(&c,
+	tickets, handles := acceptOps(c,
 		VWriteOp(0, make([]byte, 4), 0),
 		VWriteOp(0, make([]byte, 4), 4),
 	)
@@ -697,7 +701,7 @@ func TestDurableWritePreservesCountsOnRingFailureAfterWrite(t *testing.T) {
 	ringErr := errors.New("ring failed")
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(2, 1, ring)
-	tickets, _ := acceptOps(&c,
+	tickets, _ := acceptOps(c,
 		VWriteOp(0, make([]byte, 4), 0).Durable(),
 	)
 	c.placeReady(true)
@@ -733,7 +737,7 @@ func TestFileTableReusesRegularState(t *testing.T) {
 func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(4, 2, ring)
-	tickets, handles := acceptOps(&c,
+	tickets, handles := acceptOps(c,
 		VOpenatOp(0, "file", 0, 0, 0),
 		VReadOp(1, make([]byte, 1), 0),
 	)
@@ -744,7 +748,7 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 
 	// Accept the same-slot read only after the open has already been handed to
 	// the ring. Its SQE still cannot be prepared before the open CQE arrives.
-	readTickets, _ := acceptOps(&c, VReadOp(0, make([]byte, 1), 0))
+	readTickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
 	tickets = append(tickets, readTickets...)
 	c.placeReady(false)
 	if len(ring.handles) != 2 {
@@ -810,13 +814,13 @@ func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
 func TestCoordinatorCloseDrainWithAdversarialCompletions(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(4, 2, ring)
-	tickets, _ := acceptOps(&c,
+	tickets, _ := acceptOps(c,
 		VReadOp(0, make([]byte, 1), 0),
 		VReadOp(1, make([]byte, 1), 0),
 	)
 	c.placeReady(false)
 
-	closeTickets, _ := acceptOps(&c, VCloseOp(0))
+	closeTickets, _ := acceptOps(c, VCloseOp(0))
 	tickets = append(tickets, closeTickets...)
 	c.placeReady(false)
 	if len(ring.handles) != 2 {

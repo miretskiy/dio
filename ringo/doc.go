@@ -150,9 +150,11 @@
 // released its final completion, so a retained alias can come to refer to an
 // unrelated operation. Using a pushed Op again is undefined.
 //
-// Ringo keeps no pool of its own. An OpAlloc is caller-owned, opted into per
-// operation, and unsynchronized, so recycling is a decision the caller makes
-// rather than one the library makes on its behalf.
+// Ringo keeps no pool of its own. An OpAlloc is caller-owned and opted into per
+// operation, so recycling is a decision the caller makes rather than one the
+// library makes on its behalf. It is safe to share across goroutines, because
+// Reap returns operations to it and reaping need not happen on the goroutine
+// that built them.
 //
 // Retention keeps referenced memory alive; it does not freeze that memory or
 // revoke the caller's other aliases. These rules apply to every alias of an
@@ -231,7 +233,10 @@
 //
 //   - FileFD retains an *os.File through final completion so it cannot be
 //     finalized mid-operation. The caller still owns and closes the file.
-//   - FixedFD names a typed slot in this Ring's fixed-file table.
+//   - FixedFD names a typed slot in this Ring's fixed-file table. Linux does
+//     not accept a fixed-file descriptor as the directory argument of OpenAt,
+//     OpenAt2, or StatxAt; those must name their directory with one of the
+//     other two.
 //   - BorrowedFD leaves descriptor lifetime entirely to the caller.
 //
 // Reachability prevents an os.File finalizer from closing a descriptor, but it

@@ -14,7 +14,7 @@ func TestCoordinatorDetectsDurableWrite(t *testing.T) {
 	regular := os.NewFile(100, "regular")
 	durable := func(ops ...Op) bool {
 		c := newTestCoordinator(8, 1, &fakeRingQueue{})
-		_, handles := acceptOps(&c, ops...)
+		_, handles := acceptOps(c, ops...)
 		got := c.durableWrite(handles)
 		c.failRemaining(nil, errors.New("test cleanup"))
 		return got
@@ -32,7 +32,7 @@ func TestCoordinatorDetectsDurableWrite(t *testing.T) {
 func TestPlaceDurableWriteWithLinkedSync(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(2, 1, ring)
-	tickets, handles := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0).Durable())
+	tickets, handles := acceptOps(c, VWriteOp(0, make([]byte, 8), 0).Durable())
 
 	c.placeReady(true)
 	require.Len(t, ring.handles, 2)
@@ -50,7 +50,7 @@ func TestPlaceDurableWriteWithLinkedSync(t *testing.T) {
 func TestPlacePlainWriteWithoutSync(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(2, 1, ring)
-	tickets, _ := acceptOps(&c, VWriteOp(0, make([]byte, 8), 0))
+	tickets, _ := acceptOps(c, VWriteOp(0, make([]byte, 8), 0))
 
 	c.placeReady(true)
 	require.Len(t, ring.handles, 1)

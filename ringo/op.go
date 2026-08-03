@@ -7,6 +7,7 @@ package ringo
 import (
 	"fmt"
 	"math"
+	"sync"
 )
 
 const (
@@ -42,8 +43,11 @@ type Op interface {
 // recycles the operations worth recycling and ignores the rest. An operation
 // returns only to the OpAlloc it came from.
 //
-// An OpAlloc is not synchronized. Use one per goroutine that builds and reaps
-// operations; a Ring driven by a single goroutine pairs with a single OpAlloc.
+// An OpAlloc is safe to use from any goroutine. That matters because the
+// goroutine returning an operation is not necessarily the one that built it:
+// Reap is what releases an operation back to its OpAlloc, and Ring calls only
+// have to be serialized, not confined to one goroutine. Each operation type
+// has its own lock, so recycling a read never contends with recycling a write.
 //
 // It holds at most as many objects of each kind as the Ring can have operations
 // in flight, so it needs no sizing. The zero value is ready to use.
@@ -159,7 +163,12 @@ func Nop(options ...OpOption) Op {
 
 // freeList recycles the objects of one operation type. Its zero value is an
 // empty list whose get allocates.
+//
+// The lock lives here rather than on OpAlloc so operation types never contend
+// with one another, and so no constructor or release method has to know that
+// recycling is synchronized at all.
 type freeList[T any] struct {
+	sync.Mutex
 	free []*T
 }
 
@@ -169,17 +178,24 @@ type freeList[T any] struct {
 // left behind -- a stale buffer, a Drain flag, a constructor error -- must
 // already be gone. release guarantees it by resetting before parking.
 func (list *freeList[T]) get() *T {
+	var op *T
+	list.Lock()
 	if count := len(list.free); count != 0 {
-		op := list.free[count-1]
+		op = list.free[count-1]
 		list.free[count-1] = nil
 		list.free = list.free[:count-1]
-		return op
 	}
-	return new(T)
+	list.Unlock()
+	if op == nil {
+		return new(T)
+	}
+	return op
 }
 
 func (list *freeList[T]) put(op *T) {
+	list.Lock()
 	list.free = append(list.free, op)
+	list.Unlock()
 }
 
 type freeListAlloc struct {

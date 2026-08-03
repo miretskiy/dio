@@ -630,18 +630,27 @@ func (op *openAtOp) release() {
 
 func (op *openAtOp) reset() { *op = openAtOp{} }
 
+// validatePathDirectory validates the directory argument of a path operation.
+// Linux rejects IOSQE_FIXED_FILE for OPENAT, OPENAT2, and STATX, so a
+// fixed-file slot can never name their directory: the kernel fails such an
+// operation with EBADF. Refuse it here instead, where the caller learns which
+// argument is wrong.
+func validatePathDirectory(ring *Ring, dir FD) error {
+	if dir.kind == descriptorDirect {
+		return errors.New("ringo: path operation cannot use a fixed-file directory")
+	}
+	return dir.validate(ring)
+}
+
 func (op *openAtOp) opcode() rawOpcode { return rawOpOpenat }
 func (op *openAtOp) validate(ring *Ring) error {
 	if err := op.opBase.validate(); err != nil {
 		return err
 	}
-	if err := op.dir.validate(ring); err != nil {
+	if err := validatePathDirectory(ring, op.dir); err != nil {
 		return err
 	}
 	if op.direct {
-		if op.dir.kind == descriptorDirect && op.dir.direct == op.target {
-			return errors.New("ringo: open directory and target use the same fixed-file slot")
-		}
 		return op.target.validate(ring)
 	}
 	return nil
@@ -663,7 +672,9 @@ func (op *openAtOp) prepare(sqe *rawSQE) {
 }
 
 // OpenAt constructs IORING_OP_OPENAT relative to dir and copies path. Use
-// AtCWD as dir to open relative to the current working directory.
+// AtCWD as dir to open relative to the current working directory. Linux rejects
+// a fixed-file directory descriptor for this opcode, so a FixedFD dir is
+// refused by Push.
 // liburing: io_uring_prep_openat - https://man7.org/linux/man-pages/man3/io_uring_prep_openat.3.html
 func OpenAt(dir FD, path string, flags int, mode uint32, options ...OpOption) Op {
 	return newOpenAtOp(optionAlloc(options), dir, path, flags, mode, nil)
@@ -671,7 +682,8 @@ func OpenAt(dir FD, path string, flags int, mode uint32, options ...OpOption) Op
 
 // OpenAtDirect opens relative to dir and installs the result in file. New
 // requires IORING_FEAT_LINKED_FILE, so this operation may be linked to a
-// following operation that uses the installed slot.
+// following operation that uses the installed slot. Only the result is fixed:
+// a FixedFD dir is refused by Push, because Linux rejects one for this opcode.
 // liburing: io_uring_prep_openat_direct - https://man7.org/linux/man-pages/man3/io_uring_prep_openat_direct.3.html
 func OpenAtDirect(
 	dir FD,
@@ -727,13 +739,10 @@ func (op *openAt2Op) validate(ring *Ring) error {
 	if err := op.opBase.validate(); err != nil {
 		return err
 	}
-	if err := op.dir.validate(ring); err != nil {
+	if err := validatePathDirectory(ring, op.dir); err != nil {
 		return err
 	}
 	if op.direct {
-		if op.dir.kind == descriptorDirect && op.dir.direct == op.target {
-			return errors.New("ringo: open directory and target use the same fixed-file slot")
-		}
 		return op.target.validate(ring)
 	}
 	return nil
@@ -754,7 +763,9 @@ func (op *openAt2Op) prepare(sqe *rawSQE) {
 	sqe.Flags |= uint8(op.sqeFlags)
 }
 
-// OpenAt2 constructs IORING_OP_OPENAT2 relative to dir and copies how.
+// OpenAt2 constructs IORING_OP_OPENAT2 relative to dir and copies how. Linux
+// rejects a fixed-file directory descriptor for this opcode, so a FixedFD dir
+// is refused by Push.
 // liburing: io_uring_prep_openat2 - https://man7.org/linux/man-pages/man3/io_uring_prep_openat2.3.html
 func OpenAt2(dir FD, path string, how unix.OpenHow, options ...OpOption) Op {
 	return newOpenAt2Op(optionAlloc(options), dir, path, how, nil)
@@ -762,7 +773,8 @@ func OpenAt2(dir FD, path string, how unix.OpenHow, options ...OpOption) Op {
 
 // OpenAt2Direct installs the opened file into a fixed-file slot. New requires
 // IORING_FEAT_LINKED_FILE, so this operation may be linked to a following
-// operation that uses the installed slot.
+// operation that uses the installed slot. Only the result is fixed: a FixedFD
+// dir is refused by Push, because Linux rejects one for this opcode.
 // liburing: io_uring_prep_openat2_direct - https://man7.org/linux/man-pages/man3/io_uring_prep_openat2_direct.3.html
 func OpenAt2Direct(
 	dir FD,
@@ -799,7 +811,7 @@ func (op *statxOp) validate(ring *Ring) error {
 	if err := op.opBase.validate(); err != nil {
 		return err
 	}
-	if err := op.dir.validate(ring); err != nil {
+	if err := validatePathDirectory(ring, op.dir); err != nil {
 		return err
 	}
 	if op.result == nil {
@@ -823,7 +835,9 @@ func (op *statxOp) prepare(sqe *rawSQE) {
 
 // StatxAt constructs IORING_OP_STATX relative to dir and retains result until
 // final completion. Use AtCWD as dir to resolve relative to the current
-// working directory. An empty path is accepted only with AT_EMPTY_PATH.
+// working directory. An empty path is accepted only with AT_EMPTY_PATH. Linux
+// rejects a fixed-file directory descriptor for this opcode, so a FixedFD dir
+// is refused by Push.
 // liburing: io_uring_prep_statx - https://man7.org/linux/man-pages/man3/io_uring_prep_statx.3.html
 func StatxAt(
 	dir FD,

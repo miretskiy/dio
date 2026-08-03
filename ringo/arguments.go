@@ -57,6 +57,14 @@ func BorrowedFD(fd int) FD {
 }
 
 // FixedFD returns a descriptor backed by a ring-scoped fixed-file slot.
+//
+// A fixed-file descriptor is not usable as the directory argument of a path
+// operation. OpenAt, OpenAt2, and StatxAt are prepared with IOSQE_FIXED_FILE,
+// and Linux rejects that flag for those opcodes, so Push refuses one rather
+// than letting the kernel fail it with EBADF. Name the directory with FileFD,
+// BorrowedFD, or AtCWD instead. The restriction applies to the directory
+// argument only: OpenAtDirect and OpenAt2Direct still install their result into
+// a fixed-file slot.
 func FixedFD(file FixedFile) FD {
 	return FD{kind: descriptorDirect, direct: file}
 }

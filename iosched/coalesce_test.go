@@ -41,7 +41,7 @@ func TestCoalescedRun(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newTestCoordinator(8, 2, &fakeRingQueue{})
-			_, handles := acceptOps(&c, tc.ops...)
+			_, handles := acceptOps(c, tc.ops...)
 			front, ok := c.ready.Front()
 			require.True(t, ok)
 			run := c.coalescedRun(front, []intrusive.Handle{handles[0]})
@@ -78,7 +78,7 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(8, 0, ring)
 	f := os.NewFile(100, "a")
-	tickets, handles := acceptOps(&c,
+	tickets, handles := acceptOps(c,
 		WriteOp(f, make([]byte, 4), 0),
 		WriteOp(f, make([]byte, 6), 4),
 		WriteOp(f, make([]byte, 2), 10),
@@ -111,7 +111,7 @@ func TestWriteCompletionSnapshotSurvivesLeaderRemoval(t *testing.T) {
 	for i := range ops {
 		ops[i] = WriteOp(f, make([]byte, 4), int64(i*4))
 	}
-	tickets, handles := acceptOps(&c, ops...)
+	tickets, handles := acceptOps(c, ops...)
 
 	c.placeReady(true)
 	completion := c.pending.Value(handles[0]).writeGroup
@@ -132,7 +132,7 @@ func TestCoalescedShortWriteCompletion(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(8, 0, ring)
 	f := os.NewFile(100, "a")
-	tickets, _ := acceptOps(&c,
+	tickets, _ := acceptOps(c,
 		WriteOp(f, make([]byte, 4), 0),
 		WriteOp(f, make([]byte, 4), 4),
 	)
@@ -153,7 +153,7 @@ func TestSingleShortWriteCompletion(t *testing.T) {
 	ring := &fakeRingQueue{}
 	c := newTestCoordinator(1, 0, ring)
 	f := os.NewFile(100, "a")
-	tickets, _ := acceptOps(&c, WriteOp(f, make([]byte, 4), 0))
+	tickets, _ := acceptOps(c, WriteOp(f, make([]byte, 4), 0))
 	c.placeReady(true)
 	require.Len(t, ring.handles, 1)
 

@@ -428,8 +428,8 @@ type coordinator struct {
 	// not retain the slice, so it can be reused across placements.
 	links []ringo.Link
 	// alloc recycles Ringo operation objects. The coordinator goroutine is the
-	// only one that builds operations and the only one that reaps them, which is
-	// exactly the single-goroutine ownership an OpAlloc requires.
+	// only one that builds operations and the only one that reaps them, so its
+	// per-type locks are always uncontended.
 	alloc ringo.OpAlloc
 
 	files        fileTable
@@ -486,7 +486,7 @@ func (c *coordinator) run() error {
 		}
 
 		if c.placed > 0 {
-			if err := c.submitAndWait(); err != nil {
+			if _, err := c.submitAndWait(); err != nil && !retryableRingError(err) {
 				return fmt.Errorf("iosched: ring error: %w", err)
 			}
 			c.reap()
@@ -797,25 +797,36 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 	}
 }
 
+// retryableRingError reports whether err is one of io_uring_enter's temporary
+// resource conditions, which submitAndWait has already reaped and backed off
+// for by the time it returns one.
+func retryableRingError(err error) bool {
+	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EBUSY)
+}
+
 // submitAndWait submits queued SQEs and asks io_uring to wait for at least one
 // completion. Operation results arrive through CQEs, not as enter errors.
-func (c *coordinator) submitAndWait() error {
-	_, err := c.ring.SubmitAndWait(1)
-	switch {
-	case err == nil:
+//
+// It reports what the kernel said and how many completions it reaped getting
+// there, rather than deciding for its callers which errors matter. A caller
+// that can continue past a temporary resource condition tests the error with
+// retryableRingError; one that needs to know whether the ring is making
+// progress uses the count.
+func (c *coordinator) submitAndWait() (reaped int, err error) {
+	if _, err = c.ring.SubmitAndWait(1); err == nil {
 		// Ringo retries EINTR itself, so it never reaches here.
-		return nil
-	case errors.Is(err, syscall.EAGAIN), errors.Is(err, syscall.EBUSY):
-		// io_uring_enter documents both errors as temporary resource
-		// conditions: reap available completions and retry. If none are ready,
-		// pause before returning to run so repeated failures do not busy-loop.
-		if c.reap() == 0 {
-			time.Sleep(time.Microsecond)
-		}
-		return nil
-	default:
-		return err
+		return 0, nil
 	}
+	if !retryableRingError(err) {
+		return 0, err
+	}
+	// io_uring_enter documents both errors as temporary resource conditions:
+	// reap available completions and retry. If none are ready, pause so
+	// repeated failures do not busy-loop.
+	if reaped = c.reap(); reaped == 0 {
+		time.Sleep(time.Microsecond)
+	}
+	return reaped, err
 }
 
 func (c *coordinator) reap() int {
@@ -853,9 +864,21 @@ func (c *coordinator) drainSlots() error {
 			stalls = 0
 			continue
 		}
-		err := c.submitAndWait()
+		reaped, err := c.submitAndWait()
+		if reaped != 0 {
+			// The ring is still reporting; recovering from a temporary resource
+			// condition is not a stall.
+			stalls = 0
+			continue
+		}
 		stalls++
 		if stalls >= drainStallLimit {
+			if err == nil {
+				// Entering kept succeeding and reaping kept finding nothing,
+				// which SubmitAndWait's minimum completion count should make
+				// impossible. Name it rather than wrap a nil.
+				err = errors.New("ring reported no completions")
+			}
 			return fmt.Errorf(
 				"iosched: %d io_uring operations stopped reporting completions "+
 					"after %d attempts: %w",

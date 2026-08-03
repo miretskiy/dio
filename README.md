@@ -135,11 +135,11 @@ ticket, err := sched.Submit(iosched.ReadOp(f, buf, offset))
 if err != nil {
     return err // not accepted
 }
-ticket.Wait()
-if err := ticket.Error(); err != nil {
+n, err := ticket.Wait()
+if err != nil {
     return err // execution failed
 }
-n := ticket.N()
+_ = n
 ```
 
 `NewDefaultScheduler` chooses io_uring when the running Linux kernel provides
@@ -176,7 +176,7 @@ ticket, err := sched.Submit(op)
 Reads may complete with a short count and no error. Writes are not retried; a
 short write returns its count and `io.ErrShortWrite`, following `io.Writer`
 semantics. A caller that wants retry policy can resubmit the remaining suffix at
-`offset + int64(ticket.N())`.
+`offset + int64(n)`, where `n` is the count `Ticket.Wait` returned.
 
 Standalone writes can request durability directly:
 
@@ -204,7 +204,7 @@ const slot = uint32(0)
 open := iosched.VOpenatOp(
     unix.AT_FDCWD,
     path,
-    unix.O_CREATE|unix.O_RDWR,
+    unix.O_CREAT|unix.O_RDWR,
     0o600,
     slot,
 ).Link(
