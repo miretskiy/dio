@@ -47,11 +47,27 @@ func copyFileRangeEmulated(src, dst *os.File, srcOff, dstOff *int64, length int)
 	var total int
 	for total < length {
 		toRead := min(length-total, len(buf))
-		n, err := src.ReadAt(buf[:toRead], *srcOff)
+		var n int
+		var err error
+		if srcOff != nil {
+			n, err = src.ReadAt(buf[:toRead], *srcOff)
+		} else {
+			n, err = src.Read(buf[:toRead])
+		}
 		if n > 0 {
-			nw, werr := dst.WriteAt(buf[:n], *dstOff)
-			*srcOff += int64(nw)
-			*dstOff += int64(nw)
+			var nw int
+			var werr error
+			if dstOff != nil {
+				nw, werr = dst.WriteAt(buf[:n], *dstOff)
+			} else {
+				nw, werr = dst.Write(buf[:n])
+			}
+			if srcOff != nil {
+				*srcOff += int64(nw)
+			}
+			if dstOff != nil {
+				*dstOff += int64(nw)
+			}
 			total += nw
 			if werr != nil {
 				return total, werr
