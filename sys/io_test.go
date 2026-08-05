@@ -1,6 +1,7 @@
 package sys_test
 
 import (
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -199,6 +200,72 @@ func TestOpenDirect_ReadsContent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, len(payload), n)
 	require.Equal(t, payload, buf)
+}
+
+func TestCopyFileRangeOffsets(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		explicitSrc bool
+		explicitDst bool
+	}{
+		{name: "current source and destination offsets"},
+		{name: "explicit source offset", explicitSrc: true},
+		{name: "explicit destination offset", explicitDst: true},
+		{name: "explicit source and destination offsets", explicitSrc: true, explicitDst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			srcPath := filepath.Join(dir, "src")
+			require.NoError(t, os.WriteFile(srcPath, []byte("0123456789"), 0o600))
+			src, err := os.Open(srcPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, src.Close()) })
+
+			dstPath := filepath.Join(dir, "dst")
+			require.NoError(t, os.WriteFile(dstPath, []byte(".........."), 0o600))
+			dst, err := os.OpenFile(dstPath, os.O_RDWR, 0)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, dst.Close()) })
+
+			_, err = src.Seek(2, io.SeekStart)
+			require.NoError(t, err)
+			_, err = dst.Seek(3, io.SeekStart)
+			require.NoError(t, err)
+			var srcOffset, dstOffset int64 = 2, 3
+			var srcOff, dstOff *int64
+			if tc.explicitSrc {
+				srcOff = &srcOffset
+			}
+			if tc.explicitDst {
+				dstOff = &dstOffset
+			}
+
+			n, err := sys.CopyFileRange(src, dst, srcOff, dstOff, 4)
+			require.NoError(t, err)
+			require.Equal(t, 4, n)
+			require.NoError(t, dst.Sync())
+			got, err := os.ReadFile(dstPath)
+			require.NoError(t, err)
+			require.Equal(t, []byte("...2345..."), got)
+
+			srcPosition, err := src.Seek(0, io.SeekCurrent)
+			require.NoError(t, err)
+			dstPosition, err := dst.Seek(0, io.SeekCurrent)
+			require.NoError(t, err)
+			if tc.explicitSrc {
+				require.Equal(t, int64(6), srcOffset)
+				require.Equal(t, int64(2), srcPosition)
+			} else {
+				require.Equal(t, int64(6), srcPosition)
+			}
+			if tc.explicitDst {
+				require.Equal(t, int64(7), dstOffset)
+				require.Equal(t, int64(3), dstPosition)
+			} else {
+				require.Equal(t, int64(7), dstPosition)
+			}
+		})
+	}
 }
 
 // ─── WriteFile ───────────────────────────────────────────────────────────────

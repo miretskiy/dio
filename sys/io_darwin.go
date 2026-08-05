@@ -217,24 +217,42 @@ func OpenDirect(path string, flags OpenFlag) (*os.File, error) {
 }
 
 // CopyFileRange copies length bytes from srcFile at *srcOff to dstFile at *dstOff.
+// A nil offset uses and advances the corresponding file's current position.
 // Darwin has no copy_file_range(2); falls back to a portable ReadAt/WriteAt loop.
 func CopyFileRange(srcFile, dstFile *os.File, srcOff, dstOff *int64, length int) (int, error) {
 	return copyFileRangeEmulated(srcFile, dstFile, srcOff, dstOff, length)
 }
 
-// copyFileRangeEmulated copies data between files using ReadAt/WriteAt.
-// Used as a fallback on platforms without kernel copy_file_range support.
+// copyFileRangeEmulated copies data between files using ReadAt/WriteAt, or
+// Read/Write when the corresponding offset is nil. Used as a fallback on
+// platforms without kernel copy_file_range support.
 func copyFileRangeEmulated(src, dst *os.File, srcOff, dstOff *int64, length int) (int, error) {
 	const maxChunk = 1 << 20 // 1 MiB
 	buf := make([]byte, min(length, maxChunk))
 	var total int
 	for total < length {
 		toRead := min(length-total, len(buf))
-		n, err := src.ReadAt(buf[:toRead], *srcOff)
+		var n int
+		var err error
+		if srcOff != nil {
+			n, err = src.ReadAt(buf[:toRead], *srcOff)
+		} else {
+			n, err = src.Read(buf[:toRead])
+		}
 		if n > 0 {
-			nw, werr := dst.WriteAt(buf[:n], *dstOff)
-			*srcOff += int64(nw)
-			*dstOff += int64(nw)
+			var nw int
+			var werr error
+			if dstOff != nil {
+				nw, werr = dst.WriteAt(buf[:n], *dstOff)
+			} else {
+				nw, werr = dst.Write(buf[:n])
+			}
+			if srcOff != nil {
+				*srcOff += int64(nw)
+			}
+			if dstOff != nil {
+				*dstOff += int64(nw)
+			}
 			total += nw
 			if werr != nil {
 				return total, werr
