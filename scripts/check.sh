@@ -2,7 +2,7 @@
 
 set -eu
 
-repository=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repository=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repository"
 
 if ! command -v staticcheck >/dev/null 2>&1; then
