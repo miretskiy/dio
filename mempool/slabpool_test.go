@@ -7,8 +7,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/miretskiy/dio/align"
-	"github.com/miretskiy/dio/mempool"
+	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/mempool"
 )
 
 // ── Construction ──────────────────────────────────────────────────────────────

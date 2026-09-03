@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 func newEmptyFile(t *testing.T) *os.File {

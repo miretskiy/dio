@@ -1,4 +1,5 @@
-// Package align provides page-aligned memory primitives for O_DIRECT I/O.
+// Package align allocates page-aligned memory and performs range arithmetic
+// for direct I/O.
 //
 // All O_DIRECT operations (Linux) and F_NOCACHE operations (Darwin) require
 // the buffer address, transfer size, and file offset to be aligned to the

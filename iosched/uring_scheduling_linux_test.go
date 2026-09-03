@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miretskiy/dio/internal/intrusive"
-	"github.com/miretskiy/dio/ringo"
+	"github.com/miretskiy/dio/v2/internal/intrusive"
+	"github.com/miretskiy/dio/v2/ringo"
 	"github.com/stretchr/testify/require"
 )
 

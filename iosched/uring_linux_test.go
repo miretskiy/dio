@@ -14,10 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/align"
-	"github.com/miretskiy/dio/iosched"
-	"github.com/miretskiy/dio/mempool"
-	"github.com/miretskiy/dio/sys"
+	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/iosched"
+	"github.com/miretskiy/dio/v2/mempool"
+	"github.com/miretskiy/dio/v2/sys"
 )
 
 func newURingSched(t *testing.T, opts ...iosched.Option) *iosched.URingScheduler {

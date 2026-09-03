@@ -1,29 +1,91 @@
 # dio
 
-`dio` is a collection of low-level storage primitives for Go: aligned memory,
-fixed-size buffer pools, portable file syscalls, and synchronous or io_uring
-I/O scheduling.
+`dio` provides direct I/O and io_uring building blocks for Go. Its Linux-only
+`ringo` package is a lifetime-safe, policy-free io_uring interface: it exposes
+typed operations while retaining every Go object the kernel can access through
+the final completion. For applications that want scheduling rather than direct
+ring control, `iosched` provides a higher-level operation and ticket API with
+io_uring and synchronous POSIX backends.
+
+The supporting packages provide aligned memory, fixed-size buffer pools,
+portable file operations, and a targeted TLS read-buffer optimization.
 
 The module requires Go 1.25.11 or newer. The `align`, `mempool`, `sys`, and POSIX
 scheduler APIs work on Linux and Darwin. io_uring support is Linux-only.
 
 ```sh
-go get github.com/miretskiy/dio
+go get github.com/miretskiy/dio/v2
 ```
+
+## Choose an I/O layer
+
+- Use [`ringo`](https://pkg.go.dev/github.com/miretskiy/dio/v2/ringo) for direct,
+  low-level io_uring control without raw SQEs, CQEs, `user_data`, or a background
+  goroutine. The caller owns submission, reaping, synchronization, and policy.
+- Use [`iosched`](https://pkg.go.dev/github.com/miretskiy/dio/v2/iosched) for a
+  scheduler that coordinates submissions and exposes completion tickets. It
+  selects io_uring when supported and otherwise falls back to synchronous POSIX
+  I/O.
+
+## Upgrading from v1
+
+Version 2 adds `/v2` to every import path. It replaces the raw `giouring`
+package with `ringo`, whose ownership-oriented API is intentionally not a
+drop-in replacement. Existing `align`, `mempool`, `sys`, `netbuf`, and
+`iosched` imports must also include `/v2`.
 
 ## Packages
 
 | Package | Purpose |
 | --- | --- |
-| `align` | Page-aligned allocation and range arithmetic |
-| `mempool` | Page-aligned fixed-slot and reference-counted buffer pools |
-| `sys` | Portable file allocation, syncing, direct I/O, and hole punching |
-| `iosched` | A common operation/ticket API over POSIX and io_uring |
-| `ringo` | Lifetime-safe low-level io_uring operations and resource ownership |
+| [`ringo`](https://pkg.go.dev/github.com/miretskiy/dio/v2/ringo) | Lifetime-safe low-level io_uring operations and resource ownership |
+| [`iosched`](https://pkg.go.dev/github.com/miretskiy/dio/v2/iosched) | A common operation/ticket API over POSIX and io_uring |
+| [`align`](https://pkg.go.dev/github.com/miretskiy/dio/v2/align) | Page-aligned allocation and range arithmetic |
+| [`mempool`](https://pkg.go.dev/github.com/miretskiy/dio/v2/mempool) | Page-aligned fixed-slot and reference-counted buffer pools |
+| [`sys`](https://pkg.go.dev/github.com/miretskiy/dio/v2/sys) | Portable file allocation, syncing, direct I/O, and hole punching |
+| [`netbuf`](https://pkg.go.dev/github.com/miretskiy/dio/v2/netbuf) | TLS read-buffer pre-sizing for golang/go#47672 |
 
-Most applications should use `iosched`. `ringo` is the lower-level Linux API
-used to implement it; unlike a raw SQE binding, it owns every kernel-visible Go
-object from `Push` through final completion reaping.
+## Ringo: lifetime-safe io_uring
+
+Ringo exposes typed operations without exposing SQEs, CQEs, raw `user_data`, or
+manual completion-queue advancement:
+
+```go
+ring, err := ringo.New(ringo.WithDepth(256))
+if err != nil {
+    return err
+}
+defer ring.Close()
+
+handle, err := ring.Push(ringo.Read(ringo.FileFD(f), buf, offset))
+if err != nil {
+    return err
+}
+_, err = ring.SubmitAndWait(1)
+if err != nil {
+    return err
+}
+for completion := range ring.Reap() {
+    if completion.Handle != handle {
+        continue
+    }
+    return completion.Err
+}
+```
+
+`Push` permanently consumes the Op; discard every copy and use only its
+Handle. Referenced files, buffers, copied paths, and iovecs remain retained
+through the final CQE; multishot completions remain retained while their
+`More` flag is set. Fixed-file and fixed-buffer registrations remain owned
+until `Ring.Close`. `Close` always closes the ring and never waits, but reap
+every pushed operation first: closing with work still pending reports
+`ringo.ErrPending` and permanently retains the ring and those operands, because
+the kernel may still be using them and never reports when it stops.
+Retention does not prevent access through another slice or pointer alias:
+callers must not modify memory the kernel may read or access memory the kernel
+may write while an operation is active. Callers also serialize calls on the
+same ring, avoid explicitly closing retained files, submit pushed work, reap
+completions, and handle short I/O.
 
 ## Aligned memory
 
@@ -218,48 +280,6 @@ ticket, err := sched.Submit(open)
 Wait for a close-containing ticket before reusing its slot. Contiguous,
 standalone writes accepted next to one another may be coalesced into a single
 `writev`; each original submission still receives its own ticket and count.
-
-## Low-level io_uring
-
-Ringo exposes typed operations without exposing SQEs, CQEs, raw `user_data`, or
-manual completion-queue advancement:
-
-```go
-ring, err := ringo.New(ringo.WithDepth(256))
-if err != nil {
-    return err
-}
-defer ring.Close()
-
-handle, err := ring.Push(ringo.Read(ringo.FileFD(f), buf, offset))
-if err != nil {
-    return err
-}
-_, err = ring.SubmitAndWait(1)
-if err != nil {
-    return err
-}
-for completion := range ring.Reap() {
-    if completion.Handle != handle {
-        continue
-    }
-    return completion.Err
-}
-```
-
-`Push` permanently consumes the Op; discard every copy and use only its
-Handle. Referenced files, buffers, copied paths, and iovecs remain retained
-through the final CQE; multishot completions remain retained while their
-`More` flag is set. Fixed-file and fixed-buffer registrations remain owned
-until `Ring.Close`. `Close` always closes the ring and never waits, but reap
-every pushed operation first: closing with work still pending reports
-`ringo.ErrPending` and permanently retains the ring and those operands, because
-the kernel may still be using them and never reports when it stops.
-Retention does not prevent access through another slice or pointer alias:
-callers must not modify memory the kernel may read or access memory the kernel
-may write while an operation is active. Callers also serialize calls on the
-same ring, avoid explicitly closing retained files, submit pushed work, reap
-completions, and handle short I/O.
 
 ## Validation
 

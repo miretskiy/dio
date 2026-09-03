@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/v2/align"
 )
 
 // alignmentError is a detailed error for O_DIRECT alignment constraint violations.

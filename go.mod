@@ -1,4 +1,4 @@
-module github.com/miretskiy/dio
+module github.com/miretskiy/dio/v2
 
 go 1.25.11
 

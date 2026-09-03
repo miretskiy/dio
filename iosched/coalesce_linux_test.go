@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 // BenchmarkWriteCoalescing measures coalescing under parallelism. Each goroutine

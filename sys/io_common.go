@@ -1,4 +1,5 @@
-// Package sys provides OS-level file descriptor primitives for page-cache bypass.
+// Package sys provides portable file operations for direct I/O, allocation,
+// syncing, and hole punching.
 //
 // # KeepAlive mandate
 //
@@ -24,7 +25,7 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/v2/align"
 )
 
 // ErrAlignment is returned when a buffer is not properly aligned for O_DIRECT.

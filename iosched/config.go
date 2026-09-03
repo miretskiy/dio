@@ -1,6 +1,6 @@
 package iosched
 
-import "github.com/miretskiy/dio/mempool"
+import "github.com/miretskiy/dio/v2/mempool"
 
 const defaultRingDepth uint32 = 256
 

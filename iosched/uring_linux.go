@@ -8,10 +8,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miretskiy/dio/internal/buildutil"
-	"github.com/miretskiy/dio/internal/intrusive"
-	"github.com/miretskiy/dio/mempool"
-	"github.com/miretskiy/dio/ringo"
+	"github.com/miretskiy/dio/v2/internal/buildutil"
+	"github.com/miretskiy/dio/v2/internal/intrusive"
+	"github.com/miretskiy/dio/v2/mempool"
+	"github.com/miretskiy/dio/v2/ringo"
 )
 
 // IOUringAvailable reports whether the running kernel provides the io_uring

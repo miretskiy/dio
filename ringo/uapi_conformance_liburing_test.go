@@ -6,7 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/miretskiy/dio/ringo/internal/testdata/liburingoracle"
+	"github.com/miretskiy/dio/v2/ringo/internal/testdata/liburingoracle"
 	"github.com/stretchr/testify/require"
 )
 

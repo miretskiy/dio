@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 func writeTempFile(t *testing.T, size int) (path string, data []byte) {

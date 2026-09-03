@@ -9,7 +9,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/sys"
+	"github.com/miretskiy/dio/v2/sys"
 )
 
 // POSIXScheduler executes each submitted operation synchronously with POSIX

@@ -12,8 +12,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/align"
-	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 const benchStorageRoot = "/instance_storage"

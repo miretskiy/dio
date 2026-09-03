@@ -1,21 +1,22 @@
-// Package mempool provides a fixed-capacity pool of page-aligned mmap buffers
-// with reference-counted lifecycle and token-bucket backpressure.
+// Package mempool provides fixed-capacity, page-aligned mmap buffer pools for
+// storage I/O.
 //
-// # Design
+// # Pools
 //
-// All buffers are pre-allocated and pre-warmed at construction time so the
-// hot path never touches the kernel allocator. The pool stores raw byte
-// slices internally and wraps them in a fresh [MmapBuffer] on each
-// acquisition. This "pool-the-memory, not-the-struct" approach eliminates
-// the ABA problem: a stale *MmapBuffer pointer held by a racing reader
-// remains distinct from the new *MmapBuffer produced by the next Acquire
-// call, even though both point at the same underlying memory.
+// [SlabPool] divides one contiguous allocation into fixed-size slots. Its
+// [SlabPool.Acquire] method is non-blocking, and the complete slab can be
+// registered as one io_uring fixed buffer.
 //
-// # Backpressure
+// [MmapPool] owns a fixed set of individually allocated buffers. Its Acquire
+// method blocks until a buffer is available, providing token-bucket
+// backpressure; [MmapPool.TryAcquire] is the non-blocking variant. Acquired
+// [MmapBuffer] values have a reference-counted lifecycle.
 //
-// [MmapPool.Acquire] blocks until a buffer is available, providing natural
-// token-bucket backpressure. [MmapPool.TryAcquire] is the non-blocking
-// variant for callers that prefer to do other work when the pool is empty.
+// Both pools allocate and pre-warm their memory at construction time so the
+// hot path does not use the kernel allocator. MmapPool stores raw byte slices
+// internally and wraps one in a fresh MmapBuffer on each acquisition. A stale
+// *MmapBuffer held by a racing reader therefore remains distinct from the next
+// MmapBuffer for the same underlying memory.
 package mempool
 
 import (
@@ -26,7 +27,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/v2/align"
 )
 
 // panicOnMisuse controls whether detected API misuse causes a panic.

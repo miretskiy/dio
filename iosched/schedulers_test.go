@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 // schedulerFactory names a scheduler backend and constructs a fresh instance

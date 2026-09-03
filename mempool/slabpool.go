@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/miretskiy/dio/align"
+	"github.com/miretskiy/dio/v2/align"
 )
 
 // Slab geometry constants.

@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/iosched"
+	"github.com/miretskiy/dio/v2/iosched"
 )
 
 // TestURing_VOpenFallocateWriteChain verifies the create-and-first-write fusion

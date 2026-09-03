@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miretskiy/dio/internal/buildutil"
-	"github.com/miretskiy/dio/internal/intrusive"
+	"github.com/miretskiy/dio/v2/internal/buildutil"
+	"github.com/miretskiy/dio/v2/internal/intrusive"
 )
 
 var (

@@ -1,4 +1,5 @@
-// Package iosched provides pluggable I/O scheduling for positioned reads and writes.
+// Package iosched provides a common I/O scheduler over synchronous POSIX and
+// Linux io_uring backends.
 //
 // The primary abstraction is Scheduler. On Linux, URingScheduler submits ops
 // through io_uring. POSIXScheduler implements the same Submit/Ticket lifecycle

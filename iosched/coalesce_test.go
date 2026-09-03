@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/miretskiy/dio/internal/intrusive"
+	"github.com/miretskiy/dio/v2/internal/intrusive"
 	"github.com/stretchr/testify/require"
 )
 
