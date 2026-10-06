@@ -3,12 +3,10 @@
 package iosched
 
 import (
-	"errors"
 	"io"
 	"os"
 	"testing"
 
-	"github.com/miretskiy/dio/v2/internal/intrusive"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,14 +38,10 @@ func TestCoalescedRun(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newTestCoordinator(8, 2, &fakeRingQueue{})
-			_, handles := acceptOps(c, tc.ops...)
-			front, ok := c.ready.Front()
-			require.True(t, ok)
-			run := c.coalescedRun(front, []intrusive.Handle{handles[0]})
-			require.Len(t, run, tc.want)
-
-			c.failRemaining(nil, errors.New("test cleanup"))
+			c := newTestCoordinator(t, 8, 2)
+			acceptOps(c, tc.ops...)
+			require.NotNil(t, c.ready.head)
+			require.Equal(t, tc.want, c.coalescedRun(c.ready.head))
 		})
 	}
 }
@@ -75,9 +69,8 @@ func TestCoalescibleWrite(t *testing.T) {
 }
 
 func TestPlaceReadyCoalescesWrites(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(8, 0, ring)
-	f := os.NewFile(100, "a")
+	c := newTestCoordinator(t, 8, 0)
+	f := testFile(t, 12)
 	tickets, handles := acceptOps(c,
 		WriteOp(f, make([]byte, 4), 0),
 		WriteOp(f, make([]byte, 6), 4),
@@ -85,42 +78,33 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 	)
 
 	c.placeReady(true)
-	require.Len(t, ring.handles, 1)
-	completion := c.pending.Value(handles[0]).writeGroup
-	require.Equal(t, 3, completion.count)
-	last := len(handles) - 1
-	if last < len(completion.inline) {
-		require.Equal(t, handles[last], completion.inline[last].work)
-	} else {
-		require.Equal(t, handles[last], completion.overflow[last-len(completion.inline)].work)
-	}
+	require.Equal(t, 1, c.occupied, "the run was not placed as one write")
+	require.Equal(t, handles, handles[0].coalesced, "the leader does not list the run in writev order")
 
-	c.failRemaining(nil, errors.New("test cleanup"))
-	c.releaseAllSlots()
-	for _, ticket := range tickets {
-		ticket.Wait()
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	for i, want := range []int{4, 6, 2} {
+		n, err := tickets[i].Wait()
+		require.NoError(t, err)
+		require.Equal(t, want, n)
 	}
+	require.Nil(t, handles[0].coalesced, "the completed leader still references its run")
 }
 
-func TestWriteCompletionSnapshotSurvivesLeaderRemoval(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(8, 0, ring)
-	f := os.NewFile(100, "a")
-	inlineTargets := len((writeGroupCompletion{}).inline)
-	ops := make([]Op, inlineTargets+1)
+// TestCoalescedRunCompletesEveryMember checks that finishing the leader, which
+// completes its ticket first, does not cut the rest of the run short.
+func TestCoalescedRunCompletesEveryMember(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	ops := make([]Op, 6)
+	f := testFile(t, len(ops)*4)
 	for i := range ops {
 		ops[i] = WriteOp(f, make([]byte, 4), int64(i*4))
 	}
 	tickets, handles := acceptOps(c, ops...)
 
 	c.placeReady(true)
-	completion := c.pending.Value(handles[0]).writeGroup
-	require.Equal(t, len(ops), completion.count)
-	require.Len(t, completion.overflow, 1)
-	require.Equal(t, handles[inlineTargets], completion.overflow[0].work)
+	require.Len(t, handles[0].coalesced, len(ops))
 
-	ring.complete(ring.handles[0], int32(len(ops)*4))
-	c.reap()
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	for _, ticket := range tickets {
 		n, err := ticket.Wait()
 		require.NoError(t, err)
@@ -128,19 +112,19 @@ func TestWriteCompletionSnapshotSurvivesLeaderRemoval(t *testing.T) {
 	}
 }
 
+// The kernel cannot be made to write short, so the short-write tests deliver
+// the write's completion themselves.
+
 func TestCoalescedShortWriteCompletion(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(8, 0, ring)
+	c := newTestCoordinator(t, 8, 0)
 	f := os.NewFile(100, "a")
-	tickets, _ := acceptOps(c,
+	tickets, handles := acceptOps(c,
 		WriteOp(f, make([]byte, 4), 0),
 		WriteOp(f, make([]byte, 4), 4),
 	)
-	c.placeReady(true)
-	require.Len(t, ring.handles, 1)
+	issueWriteGroupForTest(c, handles...)
 
-	ring.complete(ring.handles[0], 6)
-	c.reap()
+	c.finishWrite(handles[0], 6, nil)
 	n, err := tickets[0].Wait()
 	require.NoError(t, err)
 	require.Equal(t, 4, n)
@@ -150,15 +134,12 @@ func TestCoalescedShortWriteCompletion(t *testing.T) {
 }
 
 func TestSingleShortWriteCompletion(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(1, 0, ring)
+	c := newTestCoordinator(t, 1, 0)
 	f := os.NewFile(100, "a")
-	tickets, _ := acceptOps(c, WriteOp(f, make([]byte, 4), 0))
-	c.placeReady(true)
-	require.Len(t, ring.handles, 1)
+	tickets, handles := acceptOps(c, WriteOp(f, make([]byte, 4), 0))
+	issueWriteGroupForTest(c, handles...)
 
-	ring.complete(ring.handles[0], 2)
-	c.reap()
+	c.finishWrite(handles[0], 2, nil)
 	n, err := tickets[0].Wait()
 	require.ErrorIs(t, err, io.ErrShortWrite)
 	require.Equal(t, 2, n)

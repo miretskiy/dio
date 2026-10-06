@@ -68,9 +68,11 @@ const (
 )
 
 // Durable requests that a standalone write's data be flushed to stable storage
-// before its Ticket completes. The io_uring backend appends fdatasync once per
-// coalesced run; the POSIX backend syncs inline. For a linked chain, include an
-// explicit FdatasyncOp instead. Durable has no effect on non-write operations.
+// before its Ticket completes. The io_uring backend issues an fdatasync once
+// the write completes and shares it among the durable writes on the same file
+// that completed before it was issued; the POSIX backend syncs inline. For a
+// linked chain, include an explicit FdatasyncOp instead. Durable has no effect
+// on non-write operations.
 func (o Op) Durable() Op {
 	o.opFlags |= opDurable
 	return o
@@ -415,6 +417,11 @@ func recordResult(root, op *Op, n int, err error) {
 	if op == root {
 		root.n = n
 	}
+	recordError(root, err)
+}
+
+// recordError keeps the first error reported for root's ticket.
+func recordError(root *Op, err error) {
 	if err != nil && root.err == nil {
 		root.err = err
 	}

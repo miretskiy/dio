@@ -208,7 +208,9 @@ func TestURing_Concurrent(t *testing.T) {
 }
 
 func TestURing_LinkedChainTooLargeIsRejected(t *testing.T) {
-	const ringDepth = 1
+	// One of the two entries is the coordinator's doorbell, so a chain of two
+	// cannot fit.
+	const ringDepth = 2
 	s := newURingSched(t, iosched.WithRingDepth(ringDepth))
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
@@ -216,17 +218,19 @@ func TestURing_LinkedChainTooLargeIsRejected(t *testing.T) {
 	buf := make([]byte, 4096)
 	ticket, err := s.Submit(iosched.ReadOp(f, buf, 0).Link(iosched.ReadOp(f, buf, 0)))
 	require.Equal(t, iosched.Ticket{}, ticket)
-	require.ErrorContains(t, err, "exceeds ring depth")
+	require.ErrorContains(t, err, "exceeds the limit of 1")
 }
 
-func TestURing_DurableWriteTooLargeIsRejected(t *testing.T) {
-	s := newURingSched(t, iosched.WithRingDepth(1))
+func TestURing_DurableWriteFitsBesideDoorbell(t *testing.T) {
+	// A durable write needs one entry at a time: its fdatasync is placed once
+	// the write completes. One of the two entries is the doorbell's.
+	s := newURingSched(t, iosched.WithRingDepth(2))
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
-	ticket, err := s.Submit(iosched.WriteOp(f, make([]byte, 4096), 0).Durable())
-	require.Equal(t, iosched.Ticket{}, ticket)
-	require.ErrorContains(t, err, "requires 2 ring slots")
+	n, err := submitOne(t, s, iosched.WriteOp(f, make([]byte, 4096), 0).Durable())
+	require.NoError(t, err)
+	require.Equal(t, 4096, n)
 }
 
 func TestURing_CloseThenSubmit(t *testing.T) {
@@ -516,4 +520,23 @@ func TestURing_TicketWait(t *testing.T) {
 	_, err = ticket.Wait()
 	require.NoError(t, err)
 	require.Equal(t, data, buf)
+}
+
+func TestURing_ChainLengthIsLimited(t *testing.T) {
+	s := newURingSched(t, iosched.WithRingDepth(64))
+	path, _ := writeUringFile(t, 4096)
+	f := openRW(t, path)
+	buf := make([]byte, 512)
+	reads := func(n int) iosched.Op {
+		rest := make([]iosched.Op, n-1)
+		for i := range rest {
+			rest[i] = iosched.ReadOp(f, buf, 0)
+		}
+		return iosched.ReadOp(f, buf, 0).Link(rest...)
+	}
+
+	_, err := submitOne(t, s, reads(8))
+	require.NoError(t, err)
+	_, err = s.Submit(reads(9))
+	require.ErrorContains(t, err, "linked chain of 9 operations exceeds the limit of 8")
 }

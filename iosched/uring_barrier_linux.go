@@ -7,17 +7,20 @@ import (
 	"os"
 
 	"github.com/miretskiy/dio/v2/internal/buildutil"
-	"github.com/miretskiy/dio/v2/internal/intrusive"
 )
 
 type fileState struct {
 	active int32
 
-	opening     intrusive.Handle
-	openWaiters []intrusive.Handle
+	opening     *submission
+	openWaiters []*submission
 
-	closing        intrusive.Handle
+	closing        *submission
 	closeRemaining int32
+
+	// syncBatch holds the durable writes on the file whose writes have
+	// completed and which wait for an fdatasync not yet placed.
+	syncBatch submissionQueue
 }
 
 type fileTable struct {
@@ -63,7 +66,7 @@ func (f *fileTable) state(op *Op) *fileState {
 }
 
 func (f *fileTable) removeIfEmpty(op *Op, state *fileState) {
-	if state.active != 0 || state.opening != 0 || state.closing != 0 || len(state.openWaiters) != 0 {
+	if state.active != 0 || state.opening != nil || state.closing != nil || len(state.openWaiters) != 0 {
 		return
 	}
 	if op.isVirtual() {
@@ -78,69 +81,94 @@ func isVirtualOpen(op *Op) bool {
 	return op.kind() == OpOpenat && op.isVirtual()
 }
 
-func isFileOperation(op *Op) bool {
-	return op.kind() != OpOpenat && op.kind() != OpClose
+// fileUse is what one submission does to one file.
+type fileUse struct {
+	op    *Op   // the submission's first operation on the file, naming it
+	ops   int32 // operations a lifecycle barrier waits for: all but open and close
+	open  bool  // the submission opens the file into its virtual slot
+	close bool  // the submission closes the slot or drains the file
 }
 
-// admit records the two ordering conditions the scheduler provides: virtual
-// file operations wait for work containing an unfinished open, while DrainOp
-// and VCloseOp wait for older file operations to complete.
-func (c *coordinator) admit(handle intrusive.Handle) error {
-	work := c.pending.Value(handle)
-
-	// Work submitted after close, and an open while prior slot work remains,
-	// have no useful ordering contract. Reject them before changing file state.
-	for op := work.root; op != nil; op = op.linked {
-		state := c.files.lookup(op)
-		if state == nil {
-			continue
-		}
-		if state.closing != 0 {
-			return fmt.Errorf("iosched: operation submitted before file lifecycle barrier completed")
-		}
-		if isVirtualOpen(op) && (state.opening != 0 || state.active != 0) {
-			return fmt.Errorf("iosched: virtual open submitted before prior slot work completed")
-		}
-	}
-
-	// Lifecycle waits are computed before this work's ordinary operations are
-	// counted. A close in a linked chain therefore waits only for outside work;
-	// the kernel link orders operations within the chain.
-	for op := work.root; op != nil; op = op.linked {
+// fileUses appends to uses one fileUse per file work addresses, in the order
+// of each file's first operation. A regular-file open addresses no file yet, so
+// it has none. A durable write's fdatasync counts as an operation on its file.
+func fileUses(work *submission, uses []fileUse) []fileUse {
+	for op := &work.root; op != nil; op = op.linked {
 		if op.kind() == OpOpenat && !op.isVirtual() {
 			continue
 		}
-		state := c.files.state(op)
-		if state.opening != 0 && state.opening != handle {
-			state.openWaiters = append(state.openWaiters, handle)
-			work.waitCount++
+		i := 0
+		for i < len(uses) && !sameFile(uses[i].op, op) {
+			i++
+		}
+		if i == len(uses) {
+			uses = append(uses, fileUse{op: op})
 		}
 		switch {
 		case isVirtualOpen(op):
-			if state.opening == 0 {
-				state.opening = handle
-			}
+			uses[i].open = true
 		case op.kind() == OpClose:
-			if state.closing == handle {
-				continue
-			}
-			state.closing = handle
-			state.closeRemaining = state.active
-			if state.closeRemaining != 0 {
-				work.waitCount++
-			}
+			uses[i].close = true
+		default:
+			uses[i].ops++
 		}
 	}
+	if work.durable {
+		uses[0].ops++
+	}
+	return uses
+}
 
-	for op := work.root; op != nil; op = op.linked {
-		if isFileOperation(op) {
-			c.files.state(op).active++
+// check rejects work whose ordering the scheduler cannot honor: work on a file
+// whose lifecycle barrier was accepted earlier, and a virtual open while earlier
+// work on the slot remains. It only reads file state, so a rejected submission
+// leaves none behind.
+func (f *fileTable) check(uses []fileUse) error {
+	for _, use := range uses {
+		state := f.lookup(use.op)
+		if state == nil {
+			continue
+		}
+		if state.closing != nil {
+			return fmt.Errorf("iosched: operation submitted before file lifecycle barrier completed")
+		}
+		if use.open && (state.opening != nil || state.active != 0) {
+			return fmt.Errorf("iosched: virtual open submitted before prior slot work completed")
 		}
 	}
 	return nil
 }
 
-func (c *coordinator) completedOperation(handle intrusive.Handle, op *Op) {
+// admit records, for work that check accepted, the two orderings the scheduler
+// provides on each file it uses: work waits for an earlier submission's
+// unfinished open, and a close or drain waits for the file's earlier
+// operations.
+func (c *coordinator) admit(work *submission, uses []fileUse) {
+	for _, use := range uses {
+		state := c.files.state(use.op)
+		// check rejected an open while another is unfinished, so an opener is
+		// always an earlier submission.
+		if state.opening != nil {
+			state.openWaiters = append(state.openWaiters, work)
+			work.waitCount++
+		}
+		if use.open {
+			state.opening = work
+		}
+		// The close counts the file's operations before this work's own are
+		// added: the chain's links already order those before the close.
+		if use.close {
+			state.closing = work
+			state.closeRemaining = state.active
+			if state.closeRemaining != 0 {
+				work.waitCount++
+			}
+		}
+		state.active += use.ops
+	}
+}
+
+func (c *coordinator) completedOperation(work *submission, op *Op) {
 	state := c.files.lookup(op)
 	if state == nil {
 		return
@@ -151,8 +179,8 @@ func (c *coordinator) completedOperation(handle intrusive.Handle, op *Op) {
 		// The whole linked work is the open barrier. Its remaining operations
 		// are already ordered after open by io_uring, but unrelated work is not.
 	case op.kind() == OpClose:
-		if state.closing == handle {
-			state.closing = 0
+		if state.closing == work {
+			state.closing = nil
 			state.closeRemaining = 0
 		}
 	default:
@@ -170,20 +198,21 @@ func (c *coordinator) completedOperation(handle intrusive.Handle, op *Op) {
 	c.files.removeIfEmpty(op, state)
 }
 
-func (c *coordinator) completedWork(handle intrusive.Handle, root *Op) {
-	for op := root; op != nil; op = op.linked {
+func (c *coordinator) completedWork(work *submission) {
+	for op := &work.root; op != nil; op = op.linked {
 		if !isVirtualOpen(op) {
 			continue
 		}
 		state := c.files.lookup(op)
-		if state == nil || state.opening != handle {
+		if state == nil || state.opening != work {
 			continue
 		}
-		state.opening = 0
+		state.opening = nil
 		waiters := state.openWaiters
 		state.openWaiters = state.openWaiters[:0]
 		for _, waiter := range waiters {
 			c.releaseWait(waiter)
 		}
+		clear(waiters) // keep no completed work reachable from the table
 	}
 }

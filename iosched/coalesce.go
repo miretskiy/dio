@@ -14,7 +14,9 @@ func (o *Op) coalescibleWrite() bool {
 	return o.kind() == OpWrite && !o.isFixed() && !o.isLinked()
 }
 
-func sameWriteTarget(a, b *Op) bool {
+// sameFile reports whether a and b address the same file: the same virtual
+// slot, or the same *os.File.
+func sameFile(a, b *Op) bool {
 	if a.isVirtual() != b.isVirtual() {
 		return false
 	}

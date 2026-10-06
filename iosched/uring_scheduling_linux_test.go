@@ -5,119 +5,109 @@ package iosched
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/miretskiy/dio/v2/internal/intrusive"
-	"github.com/miretskiy/dio/v2/ringo"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
+	"github.com/miretskiy/dio/v2/ringo"
 )
 
-type fakeRingQueue struct {
-	handles         []ringHandle
-	batches         []int
-	linkChains      [][]ringo.LinkType
-	cqes            []ringCompletion
-	submitErrs      []error
-	submitCalls     int
-	submitAndWaitFn func(*fakeRingQueue)
-	nextHandle      uint64
-}
-
-func (f *fakeRingQueue) Push(ringo.Op) (ringHandle, error) {
-	handle := f.allocateHandle()
-	f.handles = append(f.handles, handle)
-	f.batches = append(f.batches, 1)
-	return handle, nil
-}
-
-func (f *fakeRingQueue) PushLinked(
-	_ ringo.Op,
-	link ringo.Link,
-	other ...ringo.Link,
-) ([]ringHandle, error) {
-	types := make([]ringo.LinkType, len(other)+1)
-	types[0] = link.Type
-	for index := range other {
-		types[index+1] = other[index].Type
+// newTestCoordinator returns a coordinator over a real ring with no
+// coordinator goroutine: the test drives acceptance, placement, submission and
+// reaping itself, and blocking files decide when operations complete. Cleanup
+// cancels and drains whatever is still in flight, fails the remaining tickets
+// and closes the ring.
+func newTestCoordinator(t *testing.T, depth int, vfiles uint32) *coordinator {
+	t.Helper()
+	if !IOUringAvailable {
+		t.Skip("io_uring not available")
 	}
-	f.linkChains = append(f.linkChains, types)
-	count := len(other) + 2
-	handles := make([]ringHandle, count)
-	for i := range handles {
-		handles[i] = f.allocateHandle()
-		f.handles = append(f.handles, handles[i])
+	options := []ringo.Option{ringo.WithDepth(uint32(depth))}
+	if vfiles > 0 {
+		options = append(options, ringo.WithFixedFiles(vfiles))
 	}
-	f.batches = append(f.batches, len(handles))
-	return handles, nil
-}
-
-// allocateHandle mirrors Ringo by handing out a dense slot index. Tests never
-// recycle one, so the coordinator's table simply grows.
-func (f *fakeRingQueue) allocateHandle() ringHandle {
-	handle := ringHandle{index: int(f.nextHandle)}
-	f.nextHandle++
-	return handle
-}
-
-func (f *fakeRingQueue) SubmitAndWait(int) (int, error) {
-	f.submitCalls++
-	if f.submitAndWaitFn != nil {
-		f.submitAndWaitFn(f)
+	ring, err := ringo.New(options...)
+	require.NoError(t, err)
+	fixedFiles := make([]ringo.FixedFile, vfiles)
+	for i := range fixedFiles {
+		fixedFiles[i], err = ring.FixedFiles().File(uint32(i))
+		require.NoError(t, err)
 	}
-	var err error
-	if len(f.submitErrs) > 0 {
-		err = f.submitErrs[0]
-		f.submitErrs = f.submitErrs[1:]
-	}
-	if err != nil {
-		return 0, err
-	}
-	return len(f.handles), nil
-}
-
-func (f *fakeRingQueue) ReapInto(dst []ringCompletion) []ringCompletion {
-	dst = append(dst, f.cqes...)
-	f.cqes = nil
-	return dst
-}
-
-func (f *fakeRingQueue) complete(handle ringHandle, result int32) {
-	completion := ringCompletion{handle: handle}
-	if result < 0 {
-		completion.err = syscall.Errno(-result)
-	} else {
-		completion.result = int(result)
-	}
-	f.cqes = append(f.cqes, completion)
-}
-
-func newTestCoordinator(depth int, vfiles uint32, ring ringQueue) *coordinator {
-	c := coordinator{
-		sched: &URingScheduler{
-			config: schedulerConfig{
-				ringDepth: uint32(depth),
-				vfiles:    vfiles,
-			},
-			fixedFiles: make([]ringo.FixedFile, vfiles),
+	c := newCoordinator(&URingScheduler{
+		config: schedulerConfig{
+			ringDepth: uint32(ring.Capacity()),
+			vfiles:    vfiles,
 		},
-		ring:  ring,
-		slots: make([]ringSlot, depth),
-		files: newFileTable(vfiles),
+		ring:       ring,
+		fixedFiles: fixedFiles,
+		doorbellFD: -1,
+		wakeup:     make(chan struct{}, 1),
+	})
+	t.Cleanup(func() { closeTestCoordinator(t, c) })
+	return c
+}
+
+func closeTestCoordinator(t *testing.T, c *coordinator) {
+	if c.sched.drainErr != nil {
+		// The test abandoned the ring with operations in flight, as a drain
+		// that gives up does; there is nothing left to wait for.
+		return
 	}
-	return &c
+	_ = c.ring.CancelAll(shutdownCancelTimeout)
+	require.NoError(t, c.waitForInflight())
+	c.failRemaining(c.sched.closeStaging(), errSchedulerClosed, errSchedulerClosed)
+	require.NoError(t, c.ring.Close())
 }
 
-// releaseAllSlots is test-only cleanup for cases that deliberately stop before
-// their fake ring produces final completions.
-func (c *coordinator) releaseAllSlots() {
-	clear(c.slots)
-	c.placed = 0
+// submitAndReapUntil hands placed operations to the kernel and applies
+// completions until done reports true. The caller must have arranged for the
+// completions it waits for to arrive.
+func submitAndReapUntil(t *testing.T, c *coordinator, done func() bool) {
+	t.Helper()
+	for !done() {
+		require.NoError(t, c.enter(1))
+		c.reap()
+	}
 }
 
-func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
+// testFile returns a temporary file of size bytes, all zero, open for reading
+// and writing.
+func testFile(t *testing.T, size int) *os.File {
+	t.Helper()
+	f, err := os.Create(filepath.Join(t.TempDir(), "data"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, f.Close()) })
+	require.NoError(t, f.Truncate(int64(size)))
+	return f
+}
+
+// issueForTest marks accepted work issued without placing it, so a test can
+// deliver its completions itself.
+func issueForTest(c *coordinator, work *submission) {
+	if work.state == workReady {
+		c.ready.remove(work)
+	}
+	work.state = workIssued
+}
+
+// issueWriteGroupForTest marks works issued as one coalesced run led by the
+// first, as placeCoalescedRun does, without placing anything. The kernel cannot
+// be made to write short, so the test delivers the run's completion itself.
+func issueWriteGroupForTest(c *coordinator, works ...*submission) {
+	for _, work := range works {
+		issueForTest(c, work)
+	}
+	works[0].coalesced = works
+}
+
+// acceptOps stages ops in order, has c accept them, and returns their tickets
+// and the submissions c accepted, in acceptance order.
+func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []*submission) {
 	tickets := make([]Ticket, len(ops))
 	var head, tail *submission
 	for i := range ops {
@@ -131,11 +121,11 @@ func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []intrusive.Handle) {
 		tail = request
 	}
 	c.accept(head)
-	handles := make([]intrusive.Handle, 0, len(ops))
-	for handle, ok := c.pending.Front(); ok; handle, ok = c.pending.Next(handle) {
-		handles = append(handles, handle)
+	var accepted []*submission
+	for work := c.accepted.head; work != nil; work = c.accepted.next(work) {
+		accepted = append(accepted, work)
 	}
-	return tickets, handles
+	return tickets, accepted
 }
 
 var benchmarkURingRequest *submission
@@ -153,7 +143,7 @@ func BenchmarkURingSubmissionState(b *testing.B) {
 func TestStagingClosePartitionsConcurrentPushes(t *testing.T) {
 	const count = 256
 	stopErr := errors.New("stopped")
-	s := URingScheduler{wakeup: make(chan struct{}, 1)}
+	var s URingScheduler
 	requests := make([]submission, count)
 	accepted := make([]bool, count)
 
@@ -216,7 +206,6 @@ func TestSubmitRejectsInvalidVirtualFileBeforeStaging(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &URingScheduler{
 				config: schedulerConfig{ringDepth: 1, vfiles: tc.vfiles},
-				wakeup: make(chan struct{}, 1),
 			}
 			_, err := s.Submit(tc.op(tc.vfd))
 			require.Error(t, err)
@@ -226,18 +215,17 @@ func TestSubmitRejectsInvalidVirtualFileBeforeStaging(t *testing.T) {
 }
 
 func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(1, 1, ring)
-	tickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
+	c := newTestCoordinator(t, 2, 0)
+	stuck, _ := blockingRead(t)
+	tickets, _ := acceptOps(c, ReadOp(stuck, make([]byte, 8), 0))
 	c.placeReady(false)
+	require.NoError(t, c.enter(0))
 	c.sched.signalShutdown(errSchedulerClosed)
-	ring.complete(ring.handles[0], -int32(syscall.ECANCELED))
-	c.reap()
+	require.NoError(t, c.ring.CancelAll(shutdownCancelTimeout))
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 
 	_, err := tickets[0].Wait()
-	if !errors.Is(err, errSchedulerClosed) {
-		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
-	}
+	require.ErrorIs(t, err, errSchedulerClosed)
 }
 
 func TestShutdownCancellationRetriesUntilCoordinatorStops(t *testing.T) {
@@ -254,31 +242,39 @@ func TestShutdownCancellationRetriesUntilCoordinatorStops(t *testing.T) {
 	require.Equal(t, 2, attempts)
 }
 
-func TestPlaceChainPreservesMixedLinks(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(3, 1, ring)
-	acceptOps(
-		c,
-		VReadOp(0, make([]byte, 1), 0).
-			Link(VReadOp(0, make([]byte, 1), 1)).
-			HardLink(VReadOp(0, make([]byte, 1), 2)),
-	)
-	c.placeReady(false)
+// TestChainKeepsEachLinkType checks that every edge of a chain reaches the
+// kernel with its own link type, by failing a read in the middle and watching
+// which writes after it land: Link cancels the rest of the chain, HardLink
+// carries on. Each chain mixes both types, so swapped edges change the result.
+func TestChainKeepsEachLinkType(t *testing.T) {
+	s := newURingForDoorbellTest(t, WithRingDepth(8))
+	defer func() { require.NoError(t, s.Close()) }()
+	f := testFile(t, 4)
+	writeOnly, err := os.OpenFile(f.Name(), os.O_WRONLY, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, writeOnly.Close()) }()
+	failingRead := ReadOp(writeOnly, make([]byte, 1), 0) // EBADF
 
-	require.Equal(t, []int{3}, ring.batches)
-	require.Equal(
-		t,
-		[][]ringo.LinkType{{ringo.LinkSoft, ringo.LinkHard}},
-		ring.linkChains,
-	)
+	for _, chain := range []Op{
+		// Link, then HardLink: A lands, the read fails, B still runs.
+		WriteOp(f, []byte("A"), 0).Link(failingRead).HardLink(WriteOp(f, []byte("B"), 1)),
+		// HardLink, then Link: the read fails, C still runs, and so does D.
+		failingRead.HardLink(WriteOp(f, []byte("C"), 2)).Link(WriteOp(f, []byte("D"), 3)),
+	} {
+		ticket, err := s.Submit(chain)
+		require.NoError(t, err)
+		_, err = waitTicket(t, ticket, 5*time.Second)
+		require.ErrorIs(t, err, syscall.EBADF)
+	}
+	got := make([]byte, 4)
+	_, err = f.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, "ABCD", string(got))
 }
 
 func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
-	ring := &fakeRingQueue{}
-	s := &URingScheduler{
-		config: schedulerConfig{ringDepth: 1, vfiles: 1},
-		wakeup: make(chan struct{}, 1),
-	}
+	c := newTestCoordinator(t, 2, 1)
+	s := c.sched
 	op := VReadOp(0, make([]byte, 1), 0)
 	request, ticket := newSubmission(op, 1)
 	if !s.tryPush(request) {
@@ -286,52 +282,23 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	}
 	s.signalShutdown(errSchedulerClosed)
 
-	c := coordinator{
-		sched: s,
-		ring:  ring,
-		slots: make([]ringSlot, 1),
-		files: newFileTable(1),
-	}
 	cause := c.run()
 	if !errors.Is(cause, errSchedulerClosed) {
 		t.Fatalf("run error: got %v want %v", cause, errSchedulerClosed)
 	}
-	staged := reverseSubmissions(s.closeStaging())
-	c.drainSlots()
-	c.failRemaining(staged, cause)
+	staged := s.closeStaging()
+	require.NoError(t, c.waitForInflight())
+	c.failRemaining(staged, cause, cause)
 
 	_, err := ticket.Wait()
 	if !errors.Is(err, errSchedulerClosed) {
 		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
-	if len(ring.handles) != 0 || ring.submitCalls != 0 {
-		t.Fatalf("shutdown placed work: sqes=%d submit calls=%d", len(ring.handles), ring.submitCalls)
-	}
+	require.Zero(t, c.occupied, "shutdown placed work")
 	if s.tryPush(new(submission)) {
 		t.Fatal("submission succeeded after close")
 	}
 }
-
-func TestResourceErrorReapsAvailableCompletion(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(1, 1, ring)
-	tickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
-	c.placeReady(false)
-	ring.submitErrs = []error{syscall.EAGAIN}
-	ring.complete(ring.handles[0], 1)
-
-	reaped, err := c.submitAndWait()
-	if !retryableRingError(err) {
-		t.Fatalf("submit error: got %v, want a retryable resource error", err)
-	}
-	if reaped != 1 {
-		t.Fatalf("completions reaped while recovering: got %d want 1", reaped)
-	}
-	tickets[0].Wait()
-}
-
-// EINTR is absorbed by Ringo, so the coordinator never sees it. Its retry is
-// covered by ringo.TestSubmitAbsorbsInterruptedEnterButNotResourceErrors.
 
 // TestDrainGivesUpAndReportsUnknownOutcome covers a ring that stops reporting
 // completions while operations are still placed. The coordinator must stop
@@ -343,29 +310,30 @@ func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
 	}(drainStallLimit, drainStallDelay)
 	drainStallLimit, drainStallDelay = 4, time.Microsecond
 
-	permanent := errors.New("ring stopped reporting")
-	ring := &fakeRingQueue{}
-	ring.submitAndWaitFn = func(f *fakeRingQueue) {
-		f.submitErrs = append(f.submitErrs, permanent)
-	}
-	c := newTestCoordinator(4, 2, ring)
+	c := newTestCoordinator(t, 4, 0)
+	first, _ := blockingRead(t)
+	second, _ := blockingRead(t)
 	tickets, _ := acceptOps(c,
-		VReadOp(0, make([]byte, 1), 0),
-		VReadOp(1, make([]byte, 1), 0),
+		ReadOp(first, make([]byte, 8), 0),
+		ReadOp(second, make([]byte, 8), 0),
 	)
 	c.placeReady(false)
-	require.Equal(t, 2, c.placed, "operations were not placed")
+	require.NoError(t, c.enter(0))
+	require.Equal(t, 2, c.occupied, "operations were not placed")
 
-	err := c.drainSlots()
-	require.ErrorIs(t, err, permanent)
-	require.Equal(t, 2, c.placed,
+	// Closing the ring under the coordinator leaves it with operations in
+	// flight that can never be reaped: the ring has stopped reporting.
+	require.ErrorIs(t, c.ring.Close(), ringo.ErrPending)
+	err := c.waitForInflight()
+	require.ErrorIs(t, err, ringo.ErrClosed)
+	c.sched.drainErr = err
+	require.Equal(t, 2, c.occupied,
 		"drain released operations it could not prove had finished")
-	require.Equal(t, drainStallLimit, ring.submitCalls, "drain was not bounded")
 
-	c.failWork(nil, errSchedulerClosed, err)
+	c.failRemaining(nil, errSchedulerClosed, err)
 	for i, ticket := range tickets {
 		_, waitErr := ticket.Wait()
-		require.ErrorIsf(t, waitErr, permanent, "ticket %d", i)
+		require.ErrorIsf(t, waitErr, ringo.ErrClosed, "ticket %d", i)
 	}
 }
 
@@ -380,92 +348,49 @@ func TestDrainOutcomeOverridesEarlierOperationError(t *testing.T) {
 	}(drainStallLimit, drainStallDelay)
 	drainStallLimit, drainStallDelay = 4, time.Microsecond
 
-	permanent := errors.New("ring stopped reporting")
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(4, 2, ring)
-	tickets, handles := acceptOps(c,
-		VReadOp(0, make([]byte, 1), 0).HardLink(VReadOp(1, make([]byte, 1), 0)),
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 1)
+	writeOnly, err := os.OpenFile(f.Name(), os.O_WRONLY, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, writeOnly.Close()) }()
+	stuck, _ := blockingRead(t)
+	tickets, _ := acceptOps(c,
+		ReadOp(writeOnly, make([]byte, 1), 0).HardLink(ReadOp(stuck, make([]byte, 8), 0)),
 	)
 	c.placeReady(false)
-	require.Equal(t, 2, c.placed, "operations were not placed")
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 1 }) // the EBADF read
 
-	completeForTest(c, handles[0], 0, 0, syscall.EIO)
-	ring.submitAndWaitFn = func(f *fakeRingQueue) {
-		f.submitErrs = append(f.submitErrs, permanent)
-	}
-	require.ErrorIs(t, c.drainSlots(), permanent)
+	require.ErrorIs(t, c.ring.Close(), ringo.ErrPending)
+	drainErr := c.waitForInflight()
+	require.ErrorIs(t, drainErr, ringo.ErrClosed)
+	c.sched.drainErr = drainErr
 
-	c.failWork(nil, errSchedulerClosed, permanent)
+	c.failRemaining(nil, errSchedulerClosed, drainErr)
 	_, waitErr := tickets[0].Wait()
-	require.ErrorIs(t, waitErr, permanent)
-	require.NotErrorIs(t, waitErr, syscall.EIO,
+	require.ErrorIs(t, waitErr, ringo.ErrClosed)
+	require.NotErrorIs(t, waitErr, syscall.EBADF,
 		"an unknown outcome was reported as a settled failure")
 }
 
-// TestDurableWriteCompletesInEitherOrder covers a durable write whose chain the
-// kernel split, which lets the fdatasync report before the write it was linked
-// after. The group must finish on the second completion either way.
-func TestDurableWriteCompletesInEitherOrder(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(4, 1, ring)
-	tickets, _ := acceptOps(c, VWriteOp(0, make([]byte, 8), 0).Durable())
-	c.placeReady(true)
-	require.Equal(t, 2, c.placed, "durable write was not placed as write plus sync")
-
-	// Sync first, write second: the reverse of what an intact link guarantees.
-	ring.complete(ring.handles[1], 0)
-	ring.complete(ring.handles[0], 8)
-	require.Equal(t, 2, c.reap(), "both completions were not applied")
-
-	n, err := tickets[0].Wait()
-	require.NoError(t, err)
-	require.Equal(t, 8, n)
-	require.Zero(t, c.placed)
-}
-
-func TestResourceErrorsReturnToCoordinator(t *testing.T) {
-	for _, enterErr := range []error{syscall.EAGAIN, syscall.EBUSY} {
-		t.Run(enterErr.Error(), func(t *testing.T) {
-			ring := &fakeRingQueue{submitErrs: []error{enterErr}}
-			c := newTestCoordinator(1, 1, ring)
-			acceptOps(c, VReadOp(0, make([]byte, 1), 0))
-			c.placeReady(false)
-
-			if _, err := c.submitAndWait(); !retryableRingError(err) {
-				t.Fatalf("submit error: got %v, want a retryable resource error", err)
-			}
-			if ring.submitCalls != 1 {
-				t.Fatalf("submit calls: got %d want 1", ring.submitCalls)
-			}
-
-			c.failRemaining(nil, errors.New("test cleanup"))
-			c.releaseAllSlots()
-		})
-	}
-}
-
-func completeForTest(c *coordinator, handle intrusive.Handle, index uint32, n int, err error) {
-	work := c.pending.Value(handle)
-	if work.ready != 0 {
-		c.ready.Remove(work.ready)
-		work.ready = 0
-		work.inflight = true
-	}
-	op := work.root
+// completeForTest delivers the completion of work's index'th operation without
+// placing it.
+func completeForTest(c *coordinator, work *submission, index uint32, n int, err error) {
+	issueForTest(c, work)
+	op := &work.root
 	for i := uint32(0); i < index; i++ {
 		op = op.linked
 	}
-	c.finishOperation(handle, op, n, err)
+	c.finishOperation(work, op, n, err)
 }
 
 func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 	err := errors.New("ring failed")
-	c := newTestCoordinator(2, 1, &fakeRingQueue{})
+	c := newTestCoordinator(t, 2, 1)
 	tickets, handles := acceptOps(c, VReadOp(0, nil, 0).Link(VReadOp(0, nil, 0)))
 	ticket := tickets[0]
 
 	completeForTest(c, handles[0], 0, 1, nil)
-	c.failRemaining(nil, err)
+	c.failRemaining(nil, err, err)
 	n, gotErr := ticket.Wait()
 
 	if n != 1 {
@@ -478,17 +403,18 @@ func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 
 func TestCleanupDrainsPlacedCompletionsBeforeFailingUnplacedWork(t *testing.T) {
 	ringErr := errors.New("ring failed")
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(1, 2, ring)
+	c := newTestCoordinator(t, 1, 0)
+	f := testFile(t, 1)
 	tickets, _ := acceptOps(c,
-		VReadOp(0, make([]byte, 1), 0),
-		VReadOp(1, make([]byte, 1), 0),
+		ReadOp(f, make([]byte, 1), 0),
+		ReadOp(f, make([]byte, 1), 0),
 	)
 	c.placeReady(false)
-	ring.complete(ring.handles[0], 1)
+	require.Equal(t, 1, c.occupied, "the second read should not fit")
+	require.NoError(t, c.enter(0))
 
-	c.drainSlots()
-	c.failRemaining(nil, ringErr)
+	require.NoError(t, c.waitForInflight())
+	c.failRemaining(nil, ringErr, ringErr)
 
 	n, err := tickets[0].Wait()
 	if n != 1 || err != nil {
@@ -498,91 +424,82 @@ func TestCleanupDrainsPlacedCompletionsBeforeFailingUnplacedWork(t *testing.T) {
 	if !errors.Is(err, ringErr) {
 		t.Fatalf("remaining request error: got %v want %v", err, ringErr)
 	}
-	if c.pending.Len() != 0 || c.placed != 0 {
-		t.Fatalf("coordinator retained failed work: pending=%d placed=%d", c.pending.Len(), c.placed)
+	if c.accepted.len != 0 || c.occupied != 0 {
+		t.Fatalf("coordinator retained failed work: pending=%d placed=%d", c.accepted.len, c.occupied)
 	}
 }
 
-func TestDrainSlotsWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(1, 1, ring)
+func TestDrainWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
+	c := newTestCoordinator(t, 2, 0)
 	c.sched.signalShutdown(errSchedulerClosed)
-	tickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
+	stuck, _ := blockingRead(t)
+	tickets, _ := acceptOps(c, ReadOp(stuck, make([]byte, 8), 0))
 	c.placeReady(false)
+	require.NoError(t, c.enter(0))
 
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	ring.submitAndWaitFn = func(f *fakeRingQueue) {
-		close(entered)
-		<-release
-		f.complete(f.handles[0], -int32(syscall.ECANCELED))
-	}
-	drained := make(chan struct{})
-	go func() {
-		c.drainSlots()
-		close(drained)
-	}()
-
-	<-entered
+	drained := make(chan error, 1)
+	go func() { drained <- c.waitForInflight() }()
 	select {
 	case <-drained:
 		t.Fatal("drain returned before the final completion")
-	default:
+	case <-time.After(20 * time.Millisecond):
 	}
 
-	close(release)
+	// CancelAll is the one Ring call that may overlap the drain's wait.
+	require.NoError(t, c.ring.CancelAll(shutdownCancelTimeout))
 	select {
-	case <-drained:
-	case <-time.After(time.Second):
+	case err := <-drained:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
 		t.Fatal("drain did not return after the final completion")
 	}
 	if _, err := tickets[0].Wait(); !errors.Is(err, errSchedulerClosed) {
 		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
 	}
-	if c.pending.Len() != 0 || c.placed != 0 {
-		t.Fatalf("coordinator retained drained work: pending=%d placed=%d", c.pending.Len(), c.placed)
+	if c.accepted.len != 0 || c.occupied != 0 {
+		t.Fatalf("coordinator retained drained work: pending=%d placed=%d", c.accepted.len, c.occupied)
 	}
 }
 
 func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
-	c := newTestCoordinator(4, 2, &fakeRingQueue{})
+	c := newTestCoordinator(t, 4, 2)
 	_, handles := acceptOps(c,
 		VOpenatOp(0, "file", 0, 0, 1),
 		VReadOp(1, make([]byte, 1), 0),
 	)
 
-	if c.pending.Value(handles[1]).waitCount != 1 || c.pending.Value(handles[1]).ready != 0 {
+	if handles[1].waitCount != 1 || handles[1].state == workReady {
 		t.Fatal("read did not wait for open")
 	}
 	waiterCap := cap(c.files.virtual[1].openWaiters)
 	require.NotZero(t, waiterCap)
 	completeForTest(c, handles[0], 0, 0, nil)
 	require.Equal(t, waiterCap, cap(c.files.virtual[1].openWaiters))
-	if c.pending.Value(handles[1]).ready == 0 {
+	if handles[1].state != workReady {
 		t.Fatal("read did not become ready at open completion")
 	}
 	completeForTest(c, handles[1], 0, 1, nil)
 }
 
 func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
-	c := newTestCoordinator(4, 2, &fakeRingQueue{})
+	c := newTestCoordinator(t, 4, 2)
 	_, handles := acceptOps(c,
 		VReadOp(1, make([]byte, 1), 0),
 		VCloseOp(1),
 	)
 
-	if c.pending.Value(handles[1]).waitCount != 1 {
+	if handles[1].waitCount != 1 {
 		t.Fatal("close did not wait for older read")
 	}
 	completeForTest(c, handles[0], 0, 1, nil)
-	if c.pending.Value(handles[1]).ready == 0 {
+	if handles[1].state != workReady {
 		t.Fatal("close did not become ready after read")
 	}
 	completeForTest(c, handles[1], 0, 0, nil)
 }
 
 func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
-	c := newTestCoordinator(4, 1, &fakeRingQueue{})
+	c := newTestCoordinator(t, 4, 1)
 	_, handles := acceptOps(c,
 		VReadOp(0, make([]byte, 1), 0),
 		VWriteOp(0, make([]byte, 1), 1).Link(
@@ -591,8 +508,8 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 		),
 	)
 
-	chain := c.pending.Value(handles[1])
-	if chain.waitCount != 1 || chain.ready != 0 {
+	chain := handles[1]
+	if chain.waitCount != 1 || chain.state == workReady {
 		t.Fatal("close chain did not wait exactly for older work")
 	}
 	if got := c.files.virtual[0].closeRemaining; got != 1 {
@@ -608,7 +525,7 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	}
 
 	completeForTest(c, handles[0], 0, 1, nil)
-	if c.pending.Value(handles[1]).ready == 0 {
+	if handles[1].state != workReady {
 		t.Fatal("close chain did not become ready after older work completed")
 	}
 	completeForTest(c, handles[1], 0, 1, nil)
@@ -617,7 +534,7 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 }
 
 func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
-	c := newTestCoordinator(4, 1, &fakeRingQueue{})
+	c := newTestCoordinator(t, 4, 1)
 	tickets, handles := acceptOps(c,
 		VCloseOp(0),
 		VReadOp(0, make([]byte, 1), 0),
@@ -634,22 +551,22 @@ func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
 }
 
 func TestDeferredMultiFileWorkIsKnownAtAdmission(t *testing.T) {
-	c := newTestCoordinator(8, 2, &fakeRingQueue{})
+	c := newTestCoordinator(t, 8, 2)
 	_, handles := acceptOps(c,
 		VOpenatOp(0, "a", 0, 0, 0),
 		VReadOp(0, make([]byte, 1), 0).Link(VWriteOp(1, make([]byte, 1), 0)),
 		VCloseOp(1),
 	)
 
-	if c.pending.Value(handles[1]).waitCount != 1 {
+	if handles[1].waitCount != 1 {
 		t.Fatal("linked work did not wait for open")
 	}
-	if c.pending.Value(handles[2]).waitCount != 1 {
+	if handles[2].waitCount != 1 {
 		t.Fatal("close overtook older blocked write")
 	}
 	completeForTest(c, handles[0], 0, 0, nil)
 	completeForTest(c, handles[1], 0, 1, nil)
-	if c.pending.Value(handles[2]).ready != 0 {
+	if handles[2].state == workReady {
 		t.Fatal("close became ready before the linked write completed")
 	}
 	completeForTest(c, handles[1], 1, 1, nil)
@@ -657,7 +574,7 @@ func TestDeferredMultiFileWorkIsKnownAtAdmission(t *testing.T) {
 }
 
 func TestOpenBarrierWaitsForWholeLinkedChain(t *testing.T) {
-	c := newTestCoordinator(4, 2, &fakeRingQueue{})
+	c := newTestCoordinator(t, 4, 2)
 	_, handles := acceptOps(c,
 		VOpenatOp(0, "a", 0, 0, 0).Link(
 			VFallocateOp(0, 4096),
@@ -667,29 +584,29 @@ func TestOpenBarrierWaitsForWholeLinkedChain(t *testing.T) {
 	)
 
 	completeForTest(c, handles[0], 0, 0, nil)
-	if c.pending.Value(handles[1]).ready != 0 {
+	if handles[1].state == workReady {
 		t.Fatal("open dependent escaped after only the open completed")
 	}
 	completeForTest(c, handles[0], 1, 0, nil)
-	if c.pending.Value(handles[1]).ready != 0 {
+	if handles[1].state == workReady {
 		t.Fatal("open dependent escaped before the whole linked chain completed")
 	}
 	completeForTest(c, handles[0], 2, 1, nil)
-	if c.pending.Value(handles[1]).ready == 0 {
+	if handles[1].state != workReady {
 		t.Fatal("open dependent did not become ready with the linked chain")
 	}
 	completeForTest(c, handles[1], 0, 1, nil)
 }
 
 func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
-	c := newTestCoordinator(4, 1, &fakeRingQueue{})
+	c := newTestCoordinator(t, 4, 1)
 	_, handles := acceptOps(c,
 		VOpenatOp(0, "a", 0, 0, 0),
 		VWriteOp(0, make([]byte, 1), 0),
 	)
 
 	completeForTest(c, handles[0], 0, 0, syscall.ENOENT)
-	if c.pending.Value(handles[1]).ready == 0 {
+	if handles[1].state != workReady {
 		t.Fatal("failed open did not release waiting write")
 	}
 
@@ -705,10 +622,10 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	finalRoot := VOpenatOp(0, "b", 0, 0, 0)
 	finalRequest, final := newSubmission(finalRoot, int32(finalRoot.opCount()))
 	c.accept(finalRequest)
-	if c.pending.Len() != 1 {
+	if c.accepted.len != 1 {
 		t.Fatal("retry open was not accepted after prior slot work completed")
 	}
-	handle, _ := c.pending.Front()
+	handle := c.accepted.head
 	completeForTest(c, handle, 0, 0, nil)
 	_, err = final.Wait()
 	if err != nil {
@@ -716,50 +633,43 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	}
 }
 
-func TestWriteGroupPreservesCountsOnSyncError(t *testing.T) {
-	syncErr := errors.New("fdatasync failed")
-	c := newTestCoordinator(4, 1, &fakeRingQueue{})
+// TestCoalescedDurableWritesShareSyncError coalesces two durable writes. Each
+// keeps its own byte count, and both report the error of the one fdatasync
+// they share. The writes are delivered by hand; the fdatasync is real and
+// fails because virtual slot 0 holds no file.
+func TestCoalescedDurableWritesShareSyncError(t *testing.T) {
+	c := newTestCoordinator(t, 4, 1)
 	tickets, handles := acceptOps(c,
-		VWriteOp(0, make([]byte, 4), 0),
-		VWriteOp(0, make([]byte, 4), 4),
+		VWriteOp(0, make([]byte, 4), 0).Durable(),
+		VWriteOp(0, make([]byte, 4), 4).Durable(),
 	)
-	for _, handle := range handles {
-		work := c.pending.Value(handle)
-		c.ready.Remove(work.ready)
-		work.ready = 0
-		work.inflight = true
-	}
-	completion := writeGroupCompletion{count: 2}
-	completion.inline[0] = writeTarget{work: handles[0], bytes: 4}
-	completion.inline[1] = writeTarget{work: handles[1], bytes: 4}
-	c.pending.Value(handles[0]).writeGroup = completion
-	c.finishWrite(handles[0], 8, nil, syncErr)
+	issueWriteGroupForTest(c, handles...)
+	c.finishWrite(handles[0], 8, nil)
 
+	c.placeReady(false)
+	require.Equal(t, 1, c.occupied, "the two writes should share one fdatasync")
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	for _, ticket := range tickets {
 		n, err := ticket.Wait()
-		if n != 4 || !errors.Is(err, syncErr) {
-			t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", n, err, syncErr)
-		}
+		require.ErrorIs(t, err, syscall.EBADF)
+		require.Equal(t, 4, n)
 	}
 }
 
+// TestDurableWritePreservesCountsOnRingFailureAfterWrite fails a durable write
+// whose write completed while it waited for its fdatasync. The ticket keeps
+// the byte count the write reported.
 func TestDurableWritePreservesCountsOnRingFailureAfterWrite(t *testing.T) {
 	ringErr := errors.New("ring failed")
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(2, 1, ring)
-	tickets, _ := acceptOps(c,
-		VWriteOp(0, make([]byte, 4), 0).Durable(),
-	)
-	c.placeReady(true)
+	c := newTestCoordinator(t, 2, 0)
+	f := testFile(t, 4)
+	tickets, _ := acceptOps(c, WriteOp(f, make([]byte, 4), 0).Durable())
+	c.placeReady(false)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	require.Len(t, c.syncPending, 1, "the write should be waiting for its fdatasync")
 
-	writeSlot := ring.handles[0]
-	ring.complete(writeSlot, 4)
-	c.reap()
-	c.failRemaining(nil, ringErr)
-	c.releaseAllSlots()
-
-	ticket := tickets[0]
-	n, err := ticket.Wait()
+	c.failRemaining(nil, ringErr, ringErr)
+	n, err := tickets[0].Wait()
 	if n != 4 || !errors.Is(err, ringErr) {
 		t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", n, err, ringErr)
 	}
@@ -780,133 +690,106 @@ func TestFileTableReusesRegularState(t *testing.T) {
 	}
 }
 
-func TestCoordinatorOpenBarrierWithAdversarialCompletions(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(4, 2, ring)
-	tickets, handles := acceptOps(c,
-		VOpenatOp(0, "file", 0, 0, 0),
-		VReadOp(1, make([]byte, 1), 0),
+// TestOpenBarrierHoldsSlotWorkUntilChainCompletes accepts a same-slot read
+// after the open's chain is already in the ring. The read must stay out of the
+// ring while that chain runs, even after the open itself and unrelated work
+// complete, and be placed once the chain does.
+func TestOpenBarrierHoldsSlotWorkUntilChainCompletes(t *testing.T) {
+	c := newTestCoordinator(t, 8, 1)
+	want := []byte("opened")
+	path := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(path, want, 0o600))
+	chainTail, releaseChain := blockingRead(t)
+	other, releaseOther := blockingRead(t)
+	acceptOps(c,
+		VOpenatOp(unix.AT_FDCWD, path, unix.O_RDONLY, 0, 0).Link(ReadOp(chainTail, make([]byte, 8), 0)),
+		ReadOp(other, make([]byte, 8), 0),
 	)
 	c.placeReady(false)
-	if len(ring.handles) != 2 {
-		t.Fatalf("SQEs before open completion: got %d want 2", len(ring.handles))
-	}
+	require.NoError(t, c.enter(0))
 
-	// Accept the same-slot read only after the open has already been handed to
-	// the ring. Its SQE still cannot be prepared before the open CQE arrives.
-	readTickets, _ := acceptOps(c, VReadOp(0, make([]byte, 1), 0))
-	tickets = append(tickets, readTickets...)
+	got := make([]byte, len(want))
+	readTickets, _ := acceptOps(c, VReadOp(0, got, 0))
 	c.placeReady(false)
-	if len(ring.handles) != 2 {
-		t.Fatal("same-slot read reached the ring while the open was in flight")
-	}
+	require.Equal(t, 3, c.occupied, "same-slot read reached the ring while the open was in flight")
 
-	var openSlot, otherSlot ringHandle
-	foundOpen, foundOther := false, false
-	for _, slot := range c.slots {
-		op := slot.op
-		if op == nil {
-			continue
-		}
-		switch {
-		case op.kind() == OpOpenat:
-			openSlot = slot.handle
-			foundOpen = true
-		case op.kind() == OpRead && op.isVirtual() && op.vfd == 1:
-			otherSlot = slot.handle
-			foundOther = true
-		case op.kind() == OpRead && op.isVirtual() && op.vfd == 0:
-			t.Fatal("same-slot read reached the ring before open completed")
-		}
-	}
-	if !foundOpen || !foundOther {
-		t.Fatalf("missing initial SQEs: open=%v other=%v sqes=%+v", foundOpen, foundOther, ring.handles)
-	}
-	if openSlot == otherSlot {
-		t.Fatalf("initial SQEs reused slot %+v: %+v; ring slots=%+v", openSlot, ring.handles, c.slots)
-	}
-	openRingSlot := c.slots[openSlot.index]
-	otherRingSlot := c.slots[otherSlot.index]
-	if openRingSlot.work != handles[0] || otherRingSlot.work != handles[1] {
-		t.Fatalf("wrong work in slots: open=%d other=%d handles=%v", openRingSlot.work, otherRingSlot.work, handles)
-	}
-
-	ring.complete(otherSlot, 1)
-	c.reap()
+	releaseOther()
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 1 }) // the open and the unrelated read
 	c.placeReady(false)
-	if len(ring.handles) != 2 {
-		t.Fatal("same-slot read escaped while open completion was withheld")
-	}
+	require.Equal(t, 1, c.occupied, "same-slot read reached the ring before the open's chain completed")
 
-	ring.complete(openSlot, 0)
-	c.reap()
+	releaseChain()
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	c.placeReady(false)
-	if len(ring.handles) != 3 {
-		t.Fatalf("read not placed after open completion: sqes=%d", len(ring.handles))
-	}
-	last := ring.handles[len(ring.handles)-1]
-	lastOp := c.slots[last.index].op
-	if lastOp.kind() != OpRead || !lastOp.isVirtual() || lastOp.vfd != 0 {
-		t.Fatalf("last operation = %+v, want same-slot read", lastOp)
-	}
+	require.Equal(t, 1, c.occupied, "same-slot read was not placed after the open's chain completed")
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 
-	c.failRemaining(nil, errors.New("test cleanup"))
-	c.releaseAllSlots()
-	for _, ticket := range tickets {
-		ticket.Wait()
-	}
+	n, err := readTickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, len(want), n)
+	require.Equal(t, want, got)
 }
 
-func TestCoordinatorCloseDrainWithAdversarialCompletions(t *testing.T) {
-	ring := &fakeRingQueue{}
-	c := newTestCoordinator(4, 2, ring)
-	tickets, _ := acceptOps(c,
-		VReadOp(0, make([]byte, 1), 0),
-		VReadOp(1, make([]byte, 1), 0),
-	)
+// TestCloseDrainHoldsCloseUntilSlotWorkCompletes accepts a close behind a
+// same-slot read that is still in flight. The close must stay out of the ring
+// after unrelated work completes, and be placed once the read does. The slot
+// holds a FIFO, so the read completes when the test writes to it.
+func TestCloseDrainHoldsCloseUntilSlotWorkCompletes(t *testing.T) {
+	c := newTestCoordinator(t, 8, 1)
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	require.NoError(t, unix.Mkfifo(fifo, 0o600))
+	openTickets, _ := acceptOps(c, VOpenatOp(unix.AT_FDCWD, fifo, unix.O_RDWR, 0, 0))
 	c.placeReady(false)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	_, err := openTickets[0].Wait()
+	require.NoError(t, err)
 
+	other, releaseOther := blockingRead(t)
+	got := make([]byte, 4)
+	readTickets, _ := acceptOps(c, VReadOp(0, got, 0), ReadOp(other, make([]byte, 8), 0))
+	c.placeReady(false)
+	require.NoError(t, c.enter(0))
 	closeTickets, _ := acceptOps(c, VCloseOp(0))
-	tickets = append(tickets, closeTickets...)
 	c.placeReady(false)
-	if len(ring.handles) != 2 {
-		t.Fatal("close reached the ring before the older same-slot read completed")
-	}
+	require.Equal(t, 2, c.occupied, "close reached the ring before the older same-slot read completed")
 
-	var sameSlot, otherSlot ringHandle
-	foundSame, foundOther := false, false
-	for _, slot := range c.slots {
-		if slot.op == nil {
-			continue
-		}
-		switch slot.op.vfd {
-		case 0:
-			sameSlot, foundSame = slot.handle, true
-		case 1:
-			otherSlot, foundOther = slot.handle, true
-		}
-	}
-	if !foundSame || !foundOther {
-		t.Fatalf("missing read SQEs: %+v", ring.handles)
-	}
-
-	ring.complete(otherSlot, 1)
-	c.reap()
+	releaseOther()
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 1 })
 	c.placeReady(false)
-	if len(ring.handles) != 2 {
-		t.Fatal("unrelated completion released the close")
-	}
+	require.Equal(t, 1, c.occupied, "unrelated completion released the close")
 
-	ring.complete(sameSlot, 1)
-	c.reap()
+	// The slot's FIFO is open for reading, so this open does not block.
+	writer, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, writer.Close()) }()
+	_, err = writer.Write([]byte("ping"))
+	require.NoError(t, err)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	c.placeReady(false)
-	if len(ring.handles) != 3 || c.slots[ring.handles[2].index].op.kind() != OpClose {
-		t.Fatalf("close was not placed after the same-slot read: %+v", ring.handles)
-	}
+	require.Equal(t, 1, c.occupied, "close was not placed after the same-slot read completed")
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 
-	c.failRemaining(nil, errors.New("test cleanup"))
-	c.releaseAllSlots()
-	for _, ticket := range tickets {
-		ticket.Wait()
-	}
+	n, err := readTickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, "ping", string(got[:n]))
+	_, err = closeTickets[0].Wait()
+	require.NoError(t, err)
+}
+
+// TestChainWaitsOnceForAnOpen accepts a chain with two operations on a slot
+// whose open is unfinished: the chain waits for the open once, not once per
+// operation, and is released when the open's chain completes.
+func TestChainWaitsOnceForAnOpen(t *testing.T) {
+	c := newTestCoordinator(t, 4, 1)
+	_, handles := acceptOps(c,
+		VOpenatOp(0, "file", 0, 0, 0),
+		VReadOp(0, make([]byte, 1), 0).Link(VReadOp(0, make([]byte, 1), 1)),
+	)
+	require.EqualValues(t, 1, handles[1].waitCount)
+	require.Len(t, c.files.virtual[0].openWaiters, 1)
+
+	completeForTest(c, handles[0], 0, 0, nil)
+	require.Equal(t, workReady, handles[1].state, "the chain was not released by the open")
+	completeForTest(c, handles[1], 0, 1, nil)
+	completeForTest(c, handles[1], 1, 1, nil)
 }

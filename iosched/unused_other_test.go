@@ -7,7 +7,7 @@ package iosched
 // warning-free without build-tagging shared code.
 var (
 	_ = (*Op).coalescibleWrite
-	_ = sameWriteTarget
+	_ = sameFile
 	_ = defaultRingDepth
 	_ = makeSchedulerConfig
 	_ = (*Op).isFixed

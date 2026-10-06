@@ -307,6 +307,9 @@ ticket, err := sched.Submit(open)
 Wait for a close-containing ticket before reusing its slot. Contiguous,
 standalone writes accepted next to one another may be coalesced into a single
 `writev`; each original submission still receives its own ticket and count.
+Durable writes on the same file whose writes complete before the next
+`fdatasync` is issued share it (group commit), whether or not they were
+coalesced.
 
 ## Validation
 

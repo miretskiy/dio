@@ -28,8 +28,10 @@ type Scheduler interface {
 	//
 	// Operations in a Link or HardLink chain execute in order. Link cancels the
 	// remaining chain after a failure; HardLink continues it. URingScheduler
-	// rejects a chain longer than its configured ring depth. Durable applies only
-	// to standalone writes; put an explicit FdatasyncOp in a linked chain.
+	// rejects a chain of more than eight operations, or, on a smaller ring, of
+	// more than its depth less the one entry it keeps for its doorbell. Durable
+	// applies only to standalone writes; put an explicit FdatasyncOp in a linked
+	// chain.
 	//
 	// Separate submissions are unordered except for file lifecycle:
 	//   - A submission containing VOpenatOp holds subsequently accepted operations

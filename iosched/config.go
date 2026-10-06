@@ -46,7 +46,9 @@ func WithVFiles(n uint32) Option {
 }
 
 // WithRingDepth sets the io_uring SQ/CQ depth in entries. Zero (the default)
-// uses the backend's default depth.
+// uses the backend's default depth. The coordinator keeps one entry for its
+// doorbell, so the depth must be at least two, and on a ring of fewer than nine
+// entries a linked chain may use at most the depth less one.
 func WithRingDepth(n uint32) Option {
 	return optionFunc(func(c *schedulerConfig) { c.ringDepth = n })
 }
