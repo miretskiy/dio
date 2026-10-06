@@ -12,6 +12,9 @@
 // backpressure; [MmapPool.TryAcquire] is the non-blocking variant. Acquired
 // [MmapBuffer] values have a reference-counted lifecycle.
 //
+// Both pools implement [Allocator], the source of memory for an
+// [AlignedBuffer].
+//
 // Both pools allocate and pre-warm their memory at construction time so the
 // hot path does not use the kernel allocator. MmapPool stores raw byte slices
 // internally and wraps one in a fresh MmapBuffer on each acquisition. A stale
@@ -210,13 +213,18 @@ func (p *MmapPool) SetSlowAcquireWarning(d time.Duration) {
 // If [SetSlowAcquireWarning] has been called, a warning is logged each time
 // the pool stays empty for longer than the configured duration.
 func (p *MmapPool) Acquire() *MmapBuffer {
+	return p.wrap(p.acquireRaw())
+}
+
+// acquireRaw blocks until a buffer is available and returns its memory.
+func (p *MmapPool) acquireRaw() []byte {
 	if p.slowWarn == 0 {
 		raw := <-p.buffers
 		if raw == nil {
 			panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
 		}
 		p.outstanding.Add(1)
-		return p.wrap(raw)
+		return raw
 	}
 	for {
 		select {
@@ -225,7 +233,7 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 				panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
 			}
 			p.outstanding.Add(1)
-			return p.wrap(raw)
+			return raw
 		case <-time.After(p.slowWarn):
 			slog.Warn("mempool: Acquire blocked",
 				"pool", p.name,
@@ -236,6 +244,22 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 		}
 	}
 }
+
+// MaxAlloc implements [Allocator]: every allocation is one whole pool buffer.
+func (p *MmapPool) MaxAlloc() int { return int(align.PageAlign(p.poolSize)) }
+
+// Alloc implements [Allocator]. Like Acquire, it blocks until a buffer is
+// available, and returns that buffer's memory without a reference-counted
+// wrapper; return it with Free.
+func (p *MmapPool) Alloc(size int) ([]byte, error) {
+	if size > p.MaxAlloc() {
+		return nil, fmt.Errorf("mempool: allocation of %d bytes exceeds pool %q buffer size %d", size, p.name, p.MaxAlloc())
+	}
+	return p.acquireRaw(), nil
+}
+
+// Free implements [Allocator], returning memory obtained from Alloc.
+func (p *MmapPool) Free(mem []byte) { p.releaseBytes(mem) }
 
 // AcquireAligned returns a buffer large enough to hold at least size bytes.
 // If size fits within the pool's slab size, a pooled buffer is returned.

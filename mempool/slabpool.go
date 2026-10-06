@@ -182,6 +182,34 @@ func (p *SlabPool) Release(s Slot) {
 	p.shards[shardIdx].mask.And(^(uint64(1) << bit)) // atomically clear bit
 }
 
+// MaxAlloc implements [Allocator]: slab memory is handed out one slot at a
+// time.
+func (p *SlabPool) MaxAlloc() int { return int(p.slotSize) }
+
+// Alloc implements [Allocator], returning one free slot's memory. Like
+// Acquire, it never blocks: it returns [ErrSlabExhausted] when every slot is
+// in use. Return the memory with Free.
+func (p *SlabPool) Alloc(size int) ([]byte, error) {
+	if size > int(p.slotSize) {
+		return nil, fmt.Errorf("mempool: allocation of %d bytes exceeds slot size %d", size, p.slotSize)
+	}
+	s, err := p.Acquire()
+	if err != nil {
+		return nil, err
+	}
+	return s.Data, nil
+}
+
+// Free implements [Allocator], returning a slot obtained from Alloc. It panics
+// if mem does not start a slot of this pool.
+func (p *SlabPool) Free(mem []byte) {
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(mem)))
+	if !p.Contains(mem) || (base-p.basePtr)%uintptr(p.slotSize) != 0 {
+		panic("mempool: SlabPool.Free: memory does not start a slot of this pool")
+	}
+	p.Release(Slot{Data: mem, rawPtr: base, pool: p})
+}
+
 // Contains reports whether buf's base pointer lies within this slab.
 // Useful for validating that a buffer was obtained from this pool.
 func (p *SlabPool) Contains(buf []byte) bool {

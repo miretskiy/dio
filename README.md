@@ -157,6 +157,33 @@ defer buf.Unpin()
 copy(buf.Bytes(), payload)
 ```
 
+### Aligned buffers
+
+`AlignedBuffer` is a growable buffer in the spirit of `bytes.Buffer` whose
+memory is page-aligned chunks from an `Allocator` — a `SlabPool`, an
+`MmapPool`, or, if nil, fresh `mmap`s. The first chunk is the size hint,
+trimmed to the largest contiguous allocation the allocator supports; capacity
+then grows as data is written. Whether growing blocks or fails is the
+allocator's behavior (`MmapPool` blocks, `SlabPool` fails). Keeping the
+allocator open while buffers hold its memory is the caller's responsibility.
+
+`AlignedBuffer` implements `io.Writer`, `io.ReaderFrom` and `io.WriterTo`, so
+a download can land directly in aligned memory and be written with `O_DIRECT`.
+A buffer has a single owner, who returns its memory with `Release`. With a
+registered `SlabPool`, each chunk is a valid fixed-buffer range:
+
+```go
+buf := mempool.NewAlignedBuffer(slab, contentLength)
+defer buf.Release()
+if _, err := io.Copy(buf, resp.Body); err != nil { // ReadFrom: no bounce buffer
+    return err
+}
+for _, chunk := range buf.Slices(0, int(align.PageAlign(int64(buf.Len()))), nil) {
+    ticket, err := sched.Submit(iosched.WriteFixedOp(f, chunk, offset))
+    // ...
+}
+```
+
 ## File operations
 
 The `sys` package keeps `*os.File` live across raw syscalls and normalizes the
