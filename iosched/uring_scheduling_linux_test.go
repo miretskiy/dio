@@ -793,3 +793,121 @@ func TestChainWaitsOnceForAnOpen(t *testing.T) {
 	completeForTest(c, handles[1], 0, 1, nil)
 	completeForTest(c, handles[1], 1, 1, nil)
 }
+
+// withDefaultBudget gives a test coordinator the scheduler's default in-flight
+// budget, which newTestCoordinator leaves off.
+func withDefaultBudget(c *coordinator) *coordinator {
+	c.sched.config.budget = defaultBudget()
+	return c
+}
+
+// TestBudgetHoldsWritesNotReads queues more writes than the write budget
+// allows, then a read. The read is placed past the held writes, and the next
+// write is placed once the first one completes and returns its cost.
+func TestBudgetHoldsWritesNotReads(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
+	f := testFile(t, 3<<20)
+	mib := make([]byte, 1<<20)
+	tickets, handles := acceptOps(c,
+		WriteOp(f, mib, 0),
+		WriteOp(f, mib, 1<<20),
+		WriteOp(f, mib, 2<<20),
+		ReadOp(f, make([]byte, 4096), 0),
+	)
+	// A 1 MiB write costs 0.86 ms of the 1.5 ms goal, so only one fits.
+	placed, room := c.placeReady(false)
+	require.Equal(t, 2, placed, "want the first write and the read")
+	require.Equal(t, workIssued, handles[0].state)
+	require.Equal(t, workReady, handles[1].state)
+	require.Equal(t, workReady, handles[2].state)
+	require.Equal(t, workIssued, handles[3].state, "the read waited for the write budget")
+	require.True(t, room, "reads still have budget, so new work could be placed")
+
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	require.Equal(t, [budgetedClasses]int64{}, c.inFlightCost, "completed work kept its cost")
+	placed, _ = c.placeReady(false)
+	require.Equal(t, 1, placed, "want the second write alone")
+	require.Equal(t, workIssued, handles[1].state)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	c.placeReady(false)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	for i, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoErrorf(t, err, "ticket %d", i)
+	}
+}
+
+// TestBudgetKeepsClassOrder holds a small read behind a large one that does
+// not fit: within a class, later work waits for earlier work, so a large
+// operation is never overtaken indefinitely.
+func TestBudgetKeepsClassOrder(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
+	f := testFile(t, 4<<20)
+	_, handles := acceptOps(c,
+		ReadOp(f, make([]byte, 1<<20), 0),
+		ReadOp(f, make([]byte, 1<<20), 1<<20),
+		ReadOp(f, make([]byte, 1<<20), 2<<20),
+		ReadOp(f, make([]byte, 1<<20), 3<<20), // 4 × 0.41 ms > 1.5 ms
+		ReadOp(f, make([]byte, 4096), 0),
+	)
+	placed, room := c.placeReady(false)
+	require.Equal(t, 3, placed)
+	require.Equal(t, workReady, handles[3].state)
+	require.Equal(t, workReady, handles[4].state, "a small read overtook a large one")
+	require.True(t, room, "writes still have budget")
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+}
+
+// TestBudgetAdmitsOneOversizedOperation places an operation that costs more
+// than the whole goal when its class has nothing in flight.
+func TestBudgetAdmitsOneOversizedOperation(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
+	f := testFile(t, 4<<20)
+	big := make([]byte, 2<<20) // 1.7 ms of write time, more than the 1.5 ms goal
+	_, handles := acceptOps(c, WriteOp(f, big, 0), WriteOp(f, big, 2<<20))
+	placed, room := c.placeReady(false)
+	require.Equal(t, 1, placed, "want the first oversized write alone")
+	require.Equal(t, workReady, handles[1].state)
+	require.True(t, room)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	placed, _ = c.placeReady(false)
+	require.Equal(t, 1, placed)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+}
+
+// TestBudgetChargesCoalescedRun charges a coalesced run the cost of all its
+// members and returns it when the run's write completes.
+func TestBudgetChargesCoalescedRun(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
+	f := testFile(t, 4*4096)
+	ops := make([]Op, 4)
+	for i := range ops {
+		ops[i] = WriteOp(f, make([]byte, 4096), int64(i*4096))
+	}
+	_, handles := acceptOps(c, ops...)
+	placed, _ := c.placeReady(true)
+	require.Equal(t, 1, placed)
+	require.Equal(t, 4*handles[0].cost, c.inFlightCost[classWrite])
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	require.Zero(t, c.inFlightCost[classWrite])
+}
+
+// TestBudgetReleaseOfUnchargedWork completes work that was never placed, as
+// tests and shutdown do: there is nothing to return to the budget.
+func TestBudgetReleaseOfUnchargedWork(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 4, 1))
+	_, handles := acceptOps(c, VReadOp(0, make([]byte, 4096), 0))
+	completeForTest(c, handles[0], 0, 4096, nil)
+	require.Zero(t, c.inFlightCost[classRead])
+}
+
+func TestNewURingSchedulerValidatesBudget(t *testing.T) {
+	if !IOUringAvailable {
+		t.Skip("io_uring not available")
+	}
+	_, err := NewURingScheduler(WithLatencyGoal(0))
+	require.ErrorContains(t, err, "WithoutIOBudget")
+	s, err := NewURingScheduler(WithoutIOBudget())
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+}

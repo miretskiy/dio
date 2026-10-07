@@ -23,6 +23,11 @@ type submission struct {
 	// durable marks a standalone durable write. Its ticket completes only once
 	// an fdatasync placed after its write completed has completed too.
 	durable bool
+	// class and cost are what the work's first operation charges against the
+	// in-flight budget while it runs; charged reports that it is charged now.
+	class   ioClass
+	cost    int64
+	charged bool
 
 	// links place the submission on up to two queues at once: the accepted
 	// queue, and either the ready queue or a file's sync batch. A queue clears
@@ -125,11 +130,4 @@ func (c *coordinator) makeReady(work *submission) {
 	}
 	work.state = workReady
 	c.ready.push(work)
-}
-
-// takeReady removes the head of the ready queue and marks it issued.
-func (c *coordinator) takeReady() *submission {
-	work := c.ready.pop()
-	work.state = workIssued
-	return work
 }

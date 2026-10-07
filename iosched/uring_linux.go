@@ -137,6 +137,9 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	}
 
 	cfg := makeSchedulerConfig(opts)
+	if err := cfg.budget.validate(); err != nil {
+		return nil, err
+	}
 	if cfg.dmaPoolSet && cfg.dmaPool == nil {
 		return nil, errors.New("iosched: cannot register a nil DMA slab")
 	}
@@ -415,6 +418,10 @@ type coordinator struct {
 	files        fileTable
 	nextSequence uint64
 
+	// inFlightCost is the cost of each class's operations in flight, in
+	// nanoseconds of device time; see ioBudget.
+	inFlightCost [budgetedClasses]int64
+
 	// syncPending holds the files with durable writes waiting for an fdatasync
 	// that is not placed yet, in the order their first write completed.
 	syncPending []*fileState
@@ -514,7 +521,7 @@ func (c *coordinator) run() error {
 			doorbell = c.armDoorbell()
 		}
 		c.accept(c.sched.takeStaged())
-		placed := c.placeReady(c.sched.config.coalescing)
+		placed, room := c.placeReady(c.sched.config.coalescing)
 
 		// After placement, accepted work requires at least one occupied ring slot
 		// besides the doorbell.
@@ -522,7 +529,7 @@ func (c *coordinator) run() error {
 			return fmt.Errorf("iosched: accepted work has no runnable or issued operation: %w", err)
 		}
 
-		if err := c.submitAndWait(placed); err != nil {
+		if err := c.submitAndWait(placed, room); err != nil {
 			return fmt.Errorf("iosched: ring error: %w", err)
 		}
 	}
@@ -534,17 +541,16 @@ func (c *coordinator) run() error {
 // skips the wait only when more work is already staged, so the next pass can
 // take it.
 //
-// If placement left an fdatasync or ready work unplaced, it did not fit, and
-// new work would queue behind it, so only a completion can help. With
-// doorbellMaxInFlight operations in flight, a completion is due about as soon
-// as a wakeup would be. Otherwise it first asks Submit to wake it: through the
-// doorbell, whose read is a completion that ends the wait, or, with only the
-// doorbell in the ring, through the channel, which costs a submitter less than
-// a write and a wakeup from io_uring_enter.
-func (c *coordinator) submitAndWait(placed int) error {
+// Without room for new work (see placeReady), only a completion can help.
+// With doorbellMaxInFlight operations in flight, a completion is due about as
+// soon as a wakeup would be. Otherwise it first asks Submit to wake it: through
+// the doorbell, whose read is a completion that ends the wait, or, with only
+// the doorbell in the ring, through the channel, which costs a submitter less
+// than a write and a wakeup from io_uring_enter.
+func (c *coordinator) submitAndWait(placed int, room bool) error {
 	s := c.sched
 	inFlight := c.occupied - doorbellSlots
-	if len(c.syncPending) != 0 || c.ready.len != 0 || inFlight >= doorbellMaxInFlight {
+	if !room || inFlight >= doorbellMaxInFlight {
 		return c.enter(1)
 	}
 	idle := inFlight == 0
@@ -614,6 +620,7 @@ func (c *coordinator) accept(head *submission) {
 			completeFailed(root, err)
 			continue
 		}
+		work.class, work.cost = c.sched.config.budget.cost(root)
 		work.remaining = work.count
 		if work.durable {
 			work.remaining++ // the fdatasync that covers the write
@@ -638,13 +645,16 @@ func (c *coordinator) releaseWait(work *submission) {
 	}
 }
 
-// placeReady places what waits for the ring, until nothing is left or the next
-// item does not fit in the free ring entries, and returns how many entries it
-// placed. Pending fdatasyncs go first: the writes they cover have completed,
-// so each one only completes tickets. Ready work follows in order; a run of
-// adjacent contiguous writes becomes one write, and anything else is placed as
-// its own linked chain, one entry per operation.
-func (c *coordinator) placeReady(coalesce bool) int {
+// placeReady places what waits for the ring and returns how many entries it
+// placed, and whether new work could still be placed now. Pending fdatasyncs
+// go first: the writes they cover have completed, so each one only completes
+// tickets. Ready work follows, oldest first, while it fits in the ring and in
+// its class's in-flight budget. Once one item of a class does not fit its
+// budget, later items of that class wait too, so a large operation is not
+// overtaken indefinitely, but other classes go on: a read never waits for the
+// write budget. A run of adjacent contiguous writes becomes one write; anything
+// else is placed as its own linked chain, one entry per operation.
+func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 	start := c.occupied
 	free := func() int { return int(c.sched.config.ringDepth) - c.occupied }
 
@@ -658,29 +668,75 @@ func (c *coordinator) placeReady(coalesce bool) int {
 	}
 	c.syncPending = c.syncPending[:copy(c.syncPending, c.syncPending[syncs:])]
 	if len(c.syncPending) != 0 {
-		return c.occupied - start
+		return c.occupied - start, false
 	}
 
-	for c.ready.len != 0 {
-		front := c.ready.head
+	var overBudget [budgetedClasses]bool
+	for work := c.ready.head; work != nil; {
+		if work.class != classOther && overBudget[work.class] {
+			work = c.ready.next(work)
+			continue
+		}
 		run := 1
 		if coalesce {
-			run = c.coalescedRun(front)
+			run = c.coalescedRun(work)
 		}
-		need := 1
-		if run == 1 {
-			need = front.root.opCount()
+		need, cost := work.root.opCount(), work.cost
+		if run > 1 {
+			need = 1
+			for member, i := c.ready.next(work), 1; i < run; member, i = c.ready.next(member), i+1 {
+				cost += member.cost
+			}
 		}
 		if need > free() {
-			return c.occupied - start
+			return c.occupied - start, false
+		}
+		if !c.fitsBudget(work.class, cost) {
+			overBudget[work.class] = true
+			if overBudget[classRead] && overBudget[classWrite] {
+				break
+			}
+			work = c.ready.next(work)
+			continue
 		}
 		if run > 1 {
-			c.placeCoalescedRun(run)
+			work = c.placeCoalescedRun(work, run)
 		} else {
-			c.placeChain()
+			work = c.placeChain(work)
 		}
 	}
-	return c.occupied - start
+	return c.occupied - start, free() > 0 && !(overBudget[classRead] && overBudget[classWrite])
+}
+
+// fitsBudget reports whether cost more of class may be placed. A class with
+// nothing in flight takes any one operation, however costly, so none waits
+// forever.
+func (c *coordinator) fitsBudget(class ioClass, cost int64) bool {
+	if class == classOther {
+		return true
+	}
+	inFlight := c.inFlightCost[class]
+	return inFlight == 0 || inFlight+cost <= int64(c.sched.config.budget.goal)
+}
+
+// take removes work from the ready queue, marks it issued and charges its
+// cost to its class's budget.
+func (c *coordinator) take(work *submission) {
+	c.ready.remove(work)
+	work.state = workIssued
+	if work.class != classOther && work.cost != 0 {
+		c.inFlightCost[work.class] += work.cost
+		work.charged = true
+	}
+}
+
+// release returns work's cost to its class's budget once the operation it was
+// charged for has completed.
+func (c *coordinator) release(work *submission) {
+	if work.charged {
+		c.inFlightCost[work.class] -= work.cost
+		work.charged = false
+	}
 }
 
 // coalescedRun returns how many ready entries, starting at first, form one run
@@ -719,10 +775,11 @@ func ringoLinkType(op *Op) ringo.LinkType {
 	return ringo.LinkSoft
 }
 
-// placeChain places the head of the ready queue as one linked chain: one ring
-// entry per operation, linked as the caller linked them.
-func (c *coordinator) placeChain() {
-	work := c.takeReady()
+// placeChain places work as one linked chain, one ring entry per operation,
+// linked as the caller linked them, and returns the ready work after it.
+func (c *coordinator) placeChain(work *submission) (next *submission) {
+	next = c.ready.next(work)
+	c.take(work)
 	root := &work.root
 	first := c.translateOp(root)
 	if root.linked == nil {
@@ -731,7 +788,7 @@ func (c *coordinator) placeChain() {
 			panic(fmt.Sprintf("iosched: Ringo rejected a validated operation: %v", err))
 		}
 		c.place(ringHandle, ringSlot{kind: slotOperation, work: work, op: root})
-		return
+		return next
 	}
 
 	// PushLinked does not retain links.
@@ -748,18 +805,22 @@ func (c *coordinator) placeChain() {
 		c.place(ringHandle, ringSlot{kind: slotOperation, work: work, op: op})
 		op = op.linked
 	}
+	return next
 }
 
-// placeCoalescedRun places the first run entries of the ready queue, adjacent
-// writes to contiguous ranges of one file, as one writev of their buffers. The
-// leader records every member, so the one completion can be split back into
-// each member's result.
-func (c *coordinator) placeCoalescedRun(run int) {
+// placeCoalescedRun places the run ready entries starting at first, adjacent
+// writes to contiguous ranges of one file, as one writev of their buffers, and
+// returns the ready work after them. The leader records every member, so the
+// one completion can be split back into each member's result.
+func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submission) {
 	members := make([]*submission, run)
 	// Ringo snapshots the buffer list into the Op it builds.
 	bufs := make([][]byte, run)
+	next = first
 	for i := range members {
-		members[i] = c.takeReady()
+		members[i] = next
+		next = c.ready.next(next)
+		c.take(members[i])
 		bufs[i] = members[i].root.buf
 	}
 	leader := members[0]
@@ -772,6 +833,7 @@ func (c *coordinator) placeCoalescedRun(run int) {
 		panic(fmt.Sprintf("iosched: Ringo rejected a validated write: %v", err))
 	}
 	c.place(ringHandle, ringSlot{kind: slotCoalescedWrite, work: leader})
+	return next
 }
 
 // placeSync places one fdatasync for the durable writes waiting on state's
@@ -1001,6 +1063,9 @@ func (c *coordinator) finishWrite(leader *submission, n int, err error) {
 // durable write that succeeded then waits for its file's next fdatasync; one
 // that failed has nothing to make durable, so its fdatasync is retired with it.
 func (c *coordinator) finishOperation(work *submission, op *Op, n int, err error) {
+	if op == &work.root {
+		c.release(work) // the cost was the first operation's
+	}
 	err = writeResultError(op, n, err)
 	recordResult(&work.root, op, n, err)
 	c.operationDone(work, op)

@@ -83,11 +83,12 @@ func TestSleepWithoutRoomLeavesDoorbellQuiet(t *testing.T) {
 		ReadOp(second, make([]byte, 8), 0),
 		ReadOp(second, make([]byte, 8), 0),
 	)
-	c.placeReady(false)
+	placed, room := c.placeReady(false)
 	require.Equal(t, 1, c.ready.len, "the third read should be waiting for an entry")
+	require.False(t, room, "placement reported room in a full ring")
 
 	slept := make(chan error, 1)
-	go func() { slept <- c.submitAndWait(0) }()
+	go func() { slept <- c.submitAndWait(placed, room) }()
 	_, err := s.Submit(ReadOp(second, make([]byte, 8), 0))
 	require.NoError(t, err)
 	require.Equal(t, wakeNone, s.wake.Load(), "asked to be woken with no room to place work")
@@ -117,11 +118,11 @@ func TestManyInFlightLeavesDoorbellQuiet(t *testing.T) {
 		reads[i] = ReadOp(stuck, make([]byte, 8), 0)
 	}
 	acceptOps(c, reads...)
-	c.placeReady(false)
+	placed, room := c.placeReady(false)
 	require.Zero(t, c.ready.len, "every read should fit")
 
 	waited := make(chan error, 1)
-	go func() { waited <- c.submitAndWait(doorbellMaxInFlight) }()
+	go func() { waited <- c.submitAndWait(placed, room) }()
 	_, err := s.Submit(ReadOp(stuck, make([]byte, 8), 0))
 	require.NoError(t, err)
 	require.Equal(t, wakeNone, s.wake.Load(), "asked to be woken with many operations in flight")
@@ -165,7 +166,7 @@ func TestSleepRechecksStagingAfterPublishingSleep(t *testing.T) {
 	require.True(t, s.tryPush(request)) // pushed, but no doorbell
 
 	slept := make(chan error, 1)
-	go func() { slept <- c.submitAndWait(0) }() // nothing ready: new work would fit
+	go func() { slept <- c.submitAndWait(0, true) }() // nothing ready: new work would fit
 	select {
 	case err := <-slept:
 		require.NoError(t, err)
@@ -187,7 +188,7 @@ func TestIdleCoordinatorParksOnChannel(t *testing.T) {
 	c.armDoorbell()
 
 	parked := make(chan error, 1)
-	go func() { parked <- c.submitAndWait(0) }()
+	go func() { parked <- c.submitAndWait(0, true) }()
 	waitUntilWaiting(t, s, wakeChannel)
 	_, err := s.Submit(VReadOp(0, make([]byte, 1), 0))
 	require.NoError(t, err)

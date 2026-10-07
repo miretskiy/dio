@@ -246,9 +246,43 @@ sched, err := iosched.NewURingScheduler(
 `WithSQPOLL` enables kernel submission-queue polling. It can require additional
 privileges and dedicates a kernel thread, so it should be an explicit choice.
 
-The scheduler does not provide application-level backpressure. Callers that
-need an in-flight limit should own the semaphore, queue, or buffer pool that
-defines it. Submitted buffers must remain valid until the ticket completes.
+The scheduler does not provide application-level backpressure: `Submit` never
+blocks or refuses work for lack of capacity. Callers that need to bound what
+they submit should own the semaphore, queue, or buffer pool that defines it.
+Submitted buffers must remain valid until the ticket completes.
+
+### In-flight budget
+
+The io_uring backend does bound what it hands to the device. Queueing more than
+the device needs to reach its ceiling adds only latency (by Little's law, the
+device queue's latency is what is in flight divided by throughput), and a deep
+queue of writes makes every read wait behind it. So reads and writes each keep
+at most a latency goal of device time in flight; the rest waits in the
+scheduler, oldest first within each class, and a read never waits for the write
+budget. An operation costs `max(bytes / bandwidth, 1 / IOPS)` at its class's
+limits; a linked chain costs its first operation.
+
+| Option | Default |
+|---|---|
+| `WithReadBandwidth(bytesPerSecond)` | 2.56 GB/s |
+| `WithReadIOPS(iops)` | 500k |
+| `WithWriteBandwidth(bytesPerSecond)` | 1.22 GB/s |
+| `WithWriteIOPS(iops)` | 83k (writes into freshly allocated space) |
+| `WithLatencyGoal(d)` | 1.5 ms |
+| `WithoutIOBudget()` | — places work as soon as it fits in the ring |
+
+The defaults were measured on an AWS m7gd.8xlarge instance store. On another
+disk, measure them with `scripts/disk-model.sh DIR` (fio, about 10 minutes):
+take the 4 KiB IOPS and the 1 MiB bandwidth of each class, and a latency goal at
+least as large as the in-flight time at which the depth sweep reaches its
+ceiling. Leave margin above that knee: the scheduler takes some time to place
+the next operation after one completes, which fio does not. On the m7gd disk
+the knee was 0.86 ms, yet a 1 ms goal left the device 3% idle under a mixed
+read/write load, while 1.5 ms matched the throughput of no budget at a seventh
+of its device latency. The script also checks the two assumptions the model makes: that IOPS
+and bandwidth are independent limits, and that reads and writes reach their
+ceilings together. Limits set too low leave a faster disk underused; too high,
+they let the device queue grow.
 
 ### Operations and ordering
 
