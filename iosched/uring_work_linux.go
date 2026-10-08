@@ -57,8 +57,9 @@ const (
 
 func newSubmission(op Op, count int32) (*submission, Ticket) {
 	request := &submission{root: op, count: count}
+	request.completion.whenDone = op.whenDone
+	request.completion.wait.Add(1)
 	request.root.completion = &request.completion
-	request.completion.done.Add(1)
 	return request, Ticket{&request.completion}
 }
 

@@ -887,6 +887,8 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 		return ringo.Fdatasync(fd, recycle)
 	case OpFallocate:
 		return ringo.Fallocate(fd, op.offset, op.length, recycle)
+	case OpUnlinkat:
+		return ringo.UnlinkAt(ringo.BorrowedFD(op.dfd), string(op.path[:len(op.path)-1]), recycle)
 	case OpOpenat:
 		path := string(op.path[:len(op.path)-1])
 		if op.isVirtual() {
@@ -1113,7 +1115,7 @@ func (c *coordinator) operationDone(work *submission, op *Op) {
 	c.completedWork(work)
 	c.accepted.remove(work)
 	work.state = workDone
-	work.root.done.Done()
+	work.root.finish()
 }
 
 // failRemaining completes every ticket the coordinator still owns, staged
@@ -1149,7 +1151,7 @@ func completeFailed(root *Op, err error) {
 	if root.err == nil {
 		root.err = err
 	}
-	root.done.Done()
+	root.finish()
 }
 
 // completeUnknown reports that one of root's operations never told the
@@ -1159,5 +1161,5 @@ func completeFailed(root *Op, err error) {
 // caller its buffers are its own again.
 func completeUnknown(root *Op, err error) {
 	root.err = err
-	root.done.Done()
+	root.finish()
 }

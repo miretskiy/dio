@@ -135,7 +135,7 @@ func BenchmarkURingSubmissionState(b *testing.B) {
 	for range b.N {
 		request, ticket := newSubmission(Op{}, 1)
 		benchmarkURingRequest = request
-		request.root.done.Done()
+		request.root.finish()
 		benchmarkTicket = ticket
 	}
 }

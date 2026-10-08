@@ -3,6 +3,7 @@ package mempool
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"math/rand/v2"
 	"sync/atomic"
@@ -75,7 +76,8 @@ type SlabPool struct {
 	slotSize     uint32
 	numSlots     uint32
 	activeShards uint32 // number of shards in use; precomputed at init
-	shards       [SlabMaxShards]slabShard
+	shards       []slabShard
+	ownsMemory   bool
 }
 
 // NewSlabPool creates a SlabPool covering at least totalSize bytes, divided
@@ -106,12 +108,36 @@ func NewSlabPool(totalSize, slotSize int) (*SlabPool, error) {
 	}
 
 	data := align.AllocAligned(roundedTotal)
+	p, err := NewSlabPoolFrom(data, alignedSlot)
+	if err != nil {
+		align.FreeAligned(data)
+		return nil, err
+	}
+	p.ownsMemory = true
+	return p, nil
+}
+
+// NewSlabPoolFrom divides caller-owned aligned memory into fixed-size slots.
+// It neither maps nor frees the backing memory. The caller must keep data alive
+// until all slots are released and the pool is closed. A trailing partial slot
+// is unused; slot size is rounded up to a page boundary.
+func NewSlabPoolFrom(data []byte, slotSize int) (*SlabPool, error) {
+	if slotSize <= 0 || len(data) == 0 || !align.IsAligned(data) {
+		return nil, errors.New("mempool: need aligned memory and a positive slot size")
+	}
+	alignedSlot := int(align.PageAlign(int64(slotSize)))
+	slots := len(data) / alignedSlot
+	if alignedSlot > math.MaxUint32 || slots == 0 || slots > SlabMaxSlots {
+		return nil, errors.New("mempool: invalid slab dimensions")
+	}
+	shards := (slots + SlabBitsPerShard - 1) / SlabBitsPerShard
 	p := &SlabPool{
 		rawData:      data,
 		basePtr:      uintptr(unsafe.Pointer(&data[0])),
 		slotSize:     uint32(alignedSlot),
 		numSlots:     uint32(slots),
-		activeShards: uint32((slots + SlabBitsPerShard - 1) / SlabBitsPerShard),
+		activeShards: uint32(shards),
+		shards:       make([]slabShard, shards),
 	}
 	p.initMask(slots)
 	return p, nil
@@ -152,7 +178,7 @@ func (p *SlabPool) Acquire() (Slot, error) {
 			if p.shards[i].mask.CompareAndSwap(mask, mask|(uint64(1)<<freePos)) {
 				slot := i*SlabBitsPerShard + freePos
 				offset := slot * int(p.slotSize)
-				data := p.rawData[offset : offset+int(p.slotSize)]
+				data := p.rawData[offset : offset+int(p.slotSize) : offset+int(p.slotSize)]
 				return Slot{
 					Data:   data,
 					rawPtr: uintptr(unsafe.Pointer(&data[0])),
@@ -231,8 +257,11 @@ func (p *SlabPool) NumSlots() int { return int(p.numSlots) }
 // Intended for registering the buffer with io_uring (io_uring_register_buffers).
 func (p *SlabPool) RawData() []byte { return p.rawData }
 
-// Close unmaps the slab. Must be called only after all Slots have been
+// Close unmaps an owned slab, or detaches a borrowed slab. Must be called only after all Slots have been
 // released and after any io_uring ring that registered this pool has exited.
 func (p *SlabPool) Close() {
-	align.FreeAligned(p.rawData)
+	if p.ownsMemory {
+		align.FreeAligned(p.rawData)
+	}
+	p.rawData = nil
 }

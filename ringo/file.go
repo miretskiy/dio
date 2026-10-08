@@ -631,7 +631,7 @@ func (op *openAtOp) release() {
 func (op *openAtOp) reset() { *op = openAtOp{} }
 
 // validatePathDirectory validates the directory argument of a path operation.
-// Linux rejects IOSQE_FIXED_FILE for OPENAT, OPENAT2, and STATX, so a
+// Linux rejects IOSQE_FIXED_FILE for OPENAT, OPENAT2, UNLINKAT, and STATX, so a
 // fixed-file slot can never name their directory: the kernel fails such an
 // operation with EBADF. Refuse it here instead, where the caller learns which
 // argument is wrong.
@@ -694,6 +694,49 @@ func OpenAtDirect(
 	options ...OpOption,
 ) Op {
 	return newOpenAtOp(optionAlloc(options), dir, path, flags, mode, &file)
+}
+
+type unlinkAtOp struct {
+	opBase
+	dir  FD
+	path []byte
+}
+
+func (op *unlinkAtOp) release() {
+	alloc := op.alloc
+	if alloc == nil {
+		return
+	}
+	op.reset()
+	alloc.unlinkAts.put(op, alloc)
+}
+func (op *unlinkAtOp) reset()            { *op = unlinkAtOp{} }
+func (op *unlinkAtOp) opcode() rawOpcode { return rawOpUnlinkat }
+func (op *unlinkAtOp) validate(ring *Ring) error {
+	if err := op.opBase.validate(); err != nil {
+		return err
+	}
+	return validatePathDirectory(ring, op.dir)
+}
+func (op *unlinkAtOp) prepare(sqe *rawSQE) {
+	dir, flags := op.dir.sqe()
+	*sqe = rawSQE{
+		Opcode: uint8(rawOpUnlinkat),
+		Flags:  uint8(flags | op.sqeFlags),
+		Fd:     dir,
+		Addr:   uint64(slicePtr(op.path)),
+	}
+}
+
+// UnlinkAt constructs IORING_OP_UNLINKAT with flags zero: remove a file or
+// symlink relative to dir, retaining open descriptors until their own close.
+// It copies path and refuses fixed-file directory descriptors.
+func UnlinkAt(dir FD, path string, options ...OpOption) Op {
+	copied, err := copyCString(path)
+	op := optionAlloc(options).newUnlinkAtOp()
+	op.dir, op.path = dir, copied
+	op.fail(err)
+	return op
 }
 
 type openAt2Op struct {

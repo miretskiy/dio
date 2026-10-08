@@ -78,6 +78,7 @@ const (
 	rawOpRead          rawOpcode = C.IORING_OP_READ
 	rawOpWrite         rawOpcode = C.IORING_OP_WRITE
 	rawOpOpenat2       rawOpcode = C.IORING_OP_OPENAT2
+	rawOpUnlinkat      rawOpcode = C.IORING_OP_UNLINKAT
 	rawOpFtruncate     rawOpcode = C.IORING_OP_FTRUNCATE
 	rawOpReadvFixed    rawOpcode = C.IORING_OP_READV_FIXED
 	rawOpWritevFixed   rawOpcode = C.IORING_OP_WRITEV_FIXED

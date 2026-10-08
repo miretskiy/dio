@@ -34,7 +34,7 @@ func newFileTable(vfiles uint32) fileTable {
 }
 
 func (f *fileTable) lookup(op *Op) *fileState {
-	if op.kind() == OpOpenat && !op.isVirtual() {
+	if (op.kind() == OpOpenat || op.kind() == OpUnlinkat) && !op.isVirtual() {
 		return nil
 	}
 	if op.isVirtual() {
@@ -90,11 +90,10 @@ type fileUse struct {
 }
 
 // fileUses appends to uses one fileUse per file work addresses, in the order
-// of each file's first operation. A regular-file open addresses no file yet, so
-// it has none. A durable write's fdatasync counts as an operation on its file.
+// of each file's first operation. Path operations address no open file. A durable write's fdatasync counts as an operation on its file.
 func fileUses(work *submission, uses []fileUse) []fileUse {
 	for op := &work.root; op != nil; op = op.linked {
-		if op.kind() == OpOpenat && !op.isVirtual() {
+		if (op.kind() == OpOpenat || op.kind() == OpUnlinkat) && !op.isVirtual() {
 			continue
 		}
 		i := 0
@@ -123,16 +122,23 @@ func fileUses(work *submission, uses []fileUse) []fileUse {
 // whose lifecycle barrier was accepted earlier, and a virtual open while earlier
 // work on the slot remains. It only reads file state, so a rejected submission
 // leaves none behind.
+//
+// A chain that closes a virtual slot and then opens it again is a replacement.
+// Its open is accepted while earlier work on the slot remains, because the
+// chain's own close drains that work first. While a replacement is pending,
+// later plain operations on the slot are accepted and wait for it as for an
+// open; another open or close of the slot is still refused.
 func (f *fileTable) check(uses []fileUse) error {
 	for _, use := range uses {
 		state := f.lookup(use.op)
 		if state == nil {
 			continue
 		}
-		if state.closing != nil {
+		replacing := state.closing != nil && state.closing == state.opening
+		if state.closing != nil && (!replacing || use.open || use.close) {
 			return fmt.Errorf("iosched: operation submitted before file lifecycle barrier completed")
 		}
-		if use.open && (state.opening != nil || state.active != 0) {
+		if use.open && (state.opening != nil || (state.active != 0 && !use.close)) {
 			return fmt.Errorf("iosched: virtual open submitted before prior slot work completed")
 		}
 	}

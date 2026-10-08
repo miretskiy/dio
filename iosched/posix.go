@@ -67,7 +67,7 @@ func (s *POSIXScheduler) Submit(op Op) (Ticket, error) {
 			break
 		}
 	}
-	root.done.Done()
+	root.finish()
 	return ticket, nil
 }
 
@@ -169,6 +169,8 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 		n, err = vectoredPOSIX(syscall.Pwrite, int(f.Fd()), op.bufs, op.offset)
 		err = writeResultError(op, n, err)
 		err = posixDurable(op, f, err)
+	case OpUnlinkat:
+		err = unix.Unlinkat(op.dfd, string(op.path[:len(op.path)-1]), 0)
 	case OpOpenat:
 		// Plain openat: open the path and return the raw fd through Ticket.Wait;
 		// the caller owns it. (The virtual/direct form is handled in runVirtualOp.)

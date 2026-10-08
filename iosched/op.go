@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // Opcode identifies the type of I/O operation. The low bits name the operation;
@@ -24,6 +25,7 @@ const (
 	OpFsync     // fsync - flush data and metadata
 	OpFdatasync // fdatasync - flush data
 	OpFallocate // fallocate - preallocate file space
+	OpUnlinkat  // unlinkat - remove a directory entry
 )
 
 // Opcode flags OR'd into an opcode. opVirtual selects virtual-file addressing
@@ -51,6 +53,7 @@ type Op struct {
 	length   int64 // byte count for ops without a buffer (fallocate)
 	opFlags  uint32
 	linked   *Op
+	whenDone func(n int, err error) // set by SubmitNotify on the root operation
 
 	*completion
 }
@@ -159,6 +162,13 @@ func OpenatOp(dfd int, path string, flags int, mode uint32) Op {
 		openFlag: flags,
 		mode:     mode,
 	}
+}
+
+// UnlinkatOp removes path relative to dfd. It does not wait for operations on
+// already-open files; those descriptors remain usable until closed. Missing
+// paths report ENOENT. Keep dfd open until the ticket completes.
+func UnlinkatOp(dfd int, path string) Op {
+	return Op{opcode: OpUnlinkat, dfd: dfd, path: append([]byte(path), 0)}
 }
 
 // VOpenatOp constructs an openat operation that installs the opened file into
@@ -315,10 +325,40 @@ func (o *Op) isFixed() bool { return o.opcode&opFixed != 0 }
 // scheduler switches on the operation regardless of addressing or buffer mode.
 func (o *Op) kind() uint8 { return o.opcode &^ (opVirtual | opFixed) }
 
+// completion is a submission's result and its completion signal. The
+// scheduler records n and err, then calls finish exactly once. The done
+// channel is allocated only by Done. Wait uses a WaitGroup directly; completion
+// publishes a shared closed channel if no caller needed selectable completion.
 type completion struct {
-	n    int
-	err  error
-	done sync.WaitGroup
+	n        int
+	err      error
+	whenDone func(n int, err error) // from SubmitNotify; fixed before submission
+
+	wait sync.WaitGroup                // Wait does not allocate a channel
+	done atomic.Pointer[chan struct{}] // made only when Done is requested
+}
+
+// closedChan is the done channel of a ticket that completed before anyone
+// asked for one.
+var closedChan = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// finish completes the ticket: it closes the done channel, then calls the
+// submission's whenDone, if any, on the calling goroutine.
+func (c *completion) finish() {
+	// Exactly one finish races with any number of Done calls. Either finish
+	// publishes the shared closed channel, or a Done caller wins publication
+	// and finish closes that channel. No mutex or channel allocation on Wait.
+	if !c.done.CompareAndSwap(nil, &closedChan) {
+		close(*c.done.Load())
+	}
+	c.wait.Done()
+	if c.whenDone != nil {
+		c.whenDone(c.n, c.err)
+	}
 }
 
 // Ticket is the completion handle returned by a successful Scheduler.Submit.
@@ -327,15 +367,45 @@ type Ticket struct {
 }
 
 func (o *Op) prepareSubmission() Ticket {
-	o.completion = new(completion)
-	o.done.Add(1)
+	o.completion = &completion{whenDone: o.whenDone}
+	o.wait.Add(1)
 	return Ticket{o.completion}
+}
+
+// SubmitNotify submits op to s, like s.Submit, and has whenDone called with
+// the result when the returned Ticket completes, exactly once. If Submit fails,
+// whenDone is not called. Because whenDone travels with op, it survives any
+// wrapper that forwards op to the scheduler it wraps.
+//
+// whenDone runs on the goroutine that completes the Ticket, after Done is
+// closed. For URingScheduler that is the coordinator, which issues and reaps
+// all of the scheduler's I/O, so whenDone must be brief and must not block: no
+// Wait, no blocking channel operation, no lock held across blocking work.
+// Nothing enforces this. It may call Submit or SubmitNotify, which only stage
+// work. For POSIXScheduler, whenDone runs inside Submit, before it returns.
+func SubmitNotify(s Scheduler, op Op, whenDone func(n int, err error)) (Ticket, error) {
+	op.whenDone = whenDone
+	return s.Submit(op)
+}
+
+// Done returns a channel that is closed when the Ticket completes, for use in
+// a select. Like context.Context's Done, the channel is made on first use.
+func (t Ticket) Done() <-chan struct{} {
+	c := t.completion
+	if d := c.done.Load(); d != nil {
+		return *d
+	}
+	d := make(chan struct{})
+	if c.done.CompareAndSwap(nil, &d) {
+		return d
+	}
+	return *c.done.Load()
 }
 
 // Wait blocks until the Ticket completes and returns the root operation's byte
 // count (or opened file descriptor) and the first operation or scheduler error.
 func (t Ticket) Wait() (int, error) {
-	t.done.Wait()
+	t.wait.Wait()
 	return t.n, t.err
 }
 
@@ -347,12 +417,12 @@ func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 		if linked && p.durable() && (kind == OpWrite || kind == OpWritev) {
 			return 0, fmt.Errorf("iosched: Durable cannot be used in a linked chain; add FdatasyncOp explicitly")
 		}
-		if kind == OpOpenat {
+		if kind == OpOpenat || kind == OpUnlinkat {
 			if len(p.path) <= 1 {
-				return 0, fmt.Errorf("iosched: op %d has empty open path", count)
+				return 0, fmt.Errorf("iosched: op %d has empty path", count)
 			}
 			if bytes.IndexByte(p.path[:len(p.path)-1], 0) >= 0 {
-				return 0, fmt.Errorf("iosched: op %d open path contains NUL", count)
+				return 0, fmt.Errorf("iosched: op %d path contains NUL", count)
 			}
 			if int(int32(p.dfd)) != p.dfd {
 				return 0, fmt.Errorf("iosched: op %d directory descriptor does not fit the kernel ABI", count)
@@ -379,7 +449,7 @@ func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 					return 0, fmt.Errorf("iosched: virtual file index %d outside configured table", p.vfd)
 				}
 			}
-		} else if kind != OpOpenat && p.f == nil {
+		} else if kind != OpOpenat && kind != OpUnlinkat && p.f == nil {
 			return 0, fmt.Errorf("iosched: op %d has nil file", count)
 		}
 		count++

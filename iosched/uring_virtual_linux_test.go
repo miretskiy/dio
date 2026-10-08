@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
@@ -269,4 +270,88 @@ func TestURing_VSlot1_Recycle(t *testing.T) {
 		_, err = submitOne(t, s, iosched.VCloseOp(vfd))
 		require.NoErrorf(t, err, "iter %d: close2", i)
 	}
+}
+
+// TestURing_BarrierChainFollowsCompletionFunctions checks the lifecycle
+// contract that a chain holding a close is placed only after the completion
+// functions of the operations it waited for have returned: a completion
+// function changes the buffer the held chain writes, and the change lands.
+func TestURing_BarrierChainFollowsCompletionFunctions(t *testing.T) {
+	s := newVURingSched(t, iosched.WithRingDepth(64), iosched.WithVFiles(1))
+	const vfd = uint32(0)
+	const bulk = 64 << 20 // long enough to be in flight when the chain is submitted
+	path := filepath.Join(t.TempDir(), "barrier.dat")
+	_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR|unix.O_DIRECT, 0o600, vfd).
+		Link(iosched.VFallocateOp(vfd, bulk+4096)))
+	require.NoError(t, err)
+
+	data := align.AllocAligned(bulk)
+	defer align.FreeAligned(data)
+	tail := align.AllocAligned(4096)
+	defer align.FreeAligned(tail)
+	copy(tail, "original")
+
+	write, err := iosched.SubmitNotify(s, iosched.VWriteOp(vfd, data, 0), func(_ int, err error) {
+		if err == nil {
+			copy(tail, "modified")
+		}
+	})
+	require.NoError(t, err)
+	_, err = submitOne(t, s, iosched.VWriteOp(vfd, tail, bulk).Link(iosched.VCloseOp(vfd)))
+	require.NoError(t, err)
+	_, err = write.Wait()
+	require.NoError(t, err)
+
+	got := make([]byte, 8)
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+	_, err = f.ReadAt(got, bulk)
+	require.NoError(t, err)
+	require.Equal(t, "modified", string(got))
+}
+
+// TestURing_ReplaceSlotWhileBusy covers a chain that closes a slot and opens
+// another file in it while a read of the first file is still in flight: it is
+// accepted and waits for that read, and a read of the new file submitted while
+// it is pending waits for it rather than being refused. A close submitted
+// meanwhile is still refused. Refusals happen at acceptance, so they are
+// ticket errors.
+func TestURing_ReplaceSlotWhileBusy(t *testing.T) {
+	s := newVURingSched(t, iosched.WithRingDepth(64), iosched.WithVFiles(1))
+	const vfd = uint32(0)
+	const bulk = 64 << 20
+	dir := t.TempDir()
+	first, second := filepath.Join(dir, "first"), filepath.Join(dir, "second")
+	require.NoError(t, os.WriteFile(first, make([]byte, bulk), 0o600))
+	require.NoError(t, os.WriteFile(second, []byte("second file"), 0o600))
+
+	_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, first, unix.O_RDONLY|unix.O_DIRECT, 0, vfd))
+	require.NoError(t, err)
+	big := align.AllocAligned(bulk)
+	defer align.FreeAligned(big)
+	inFlight, err := s.Submit(iosched.VReadOp(vfd, big, 0)) // holds the replacement pending
+	require.NoError(t, err)
+
+	replace, err := s.Submit(iosched.VCloseOp(vfd).Link(iosched.VOpenatOp(unix.AT_FDCWD, second, unix.O_RDONLY, 0, vfd)))
+	require.NoError(t, err)
+	got := make([]byte, len("second file"))
+	read, err := s.Submit(iosched.VReadOp(vfd, got, 0))
+	require.NoError(t, err)
+	refused, err := s.Submit(iosched.VCloseOp(vfd))
+	require.NoError(t, err)
+
+	n, err := inFlight.Wait()
+	require.NoError(t, err)
+	require.Equal(t, bulk, n, "the read in flight finished against the first file")
+	_, err = replace.Wait()
+	require.NoError(t, err, "a replacement is accepted while the slot is busy")
+	_, err = read.Wait()
+	require.NoError(t, err, "a read submitted during the replacement waits for it")
+	require.Equal(t, "second file", string(got))
+	_, err = refused.Wait()
+	require.Error(t, err, "a close during a pending replacement is still refused")
+
+	_, err = submitOne(t, s, iosched.VCloseOp(vfd))
+	require.NoError(t, err)
 }

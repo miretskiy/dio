@@ -152,6 +152,7 @@ const (
 	rawOpRead          rawOpcode = 0x16
 	rawOpWrite         rawOpcode = 0x17
 	rawOpOpenat2       rawOpcode = 0x1c
+	rawOpUnlinkat      rawOpcode = 0x24
 	rawOpFtruncate     rawOpcode = 0x37
 	rawOpReadvFixed    rawOpcode = 0x3c
 	rawOpWritevFixed   rawOpcode = 0x3d

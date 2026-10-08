@@ -7,7 +7,7 @@
 // [SlabPool.Acquire] method is non-blocking, and the complete slab can be
 // registered as one io_uring fixed buffer.
 //
-// [MmapPool] owns a fixed set of individually allocated buffers. Its Acquire
+// [MmapPool] owns a bounded set of individually allocated buffers. Its Acquire
 // method blocks until a buffer is available, providing token-bucket
 // backpressure; [MmapPool.TryAcquire] is the non-blocking variant. Acquired
 // [MmapBuffer] values have a reference-counted lifecycle.
@@ -15,8 +15,8 @@
 // Both pools implement [Allocator], the source of memory for an
 // [AlignedBuffer].
 //
-// Both pools allocate and pre-warm their memory at construction time so the
-// hot path does not use the kernel allocator. MmapPool stores raw byte slices
+// NewMmapPool and NewSlabPool preallocate and warm their memory.
+// NewLazyMmapPool grows on demand, and NewSlabPoolFrom borrows existing memory. MmapPool stores raw byte slices
 // internally and wraps one in a fresh MmapBuffer on each acquisition. A stale
 // *MmapBuffer held by a racing reader therefore remains distinct from the next
 // MmapBuffer for the same underlying memory.
@@ -167,14 +167,15 @@ func NewMmapBuffer(size int64) *MmapBuffer {
 
 // --- MmapPool ---
 
-// MmapPool is a fixed-capacity pool of pre-allocated, page-aligned mmap
-// buffers. Create with [NewMmapPool]; close with [Close] after all
+// MmapPool is a bounded pool of page-aligned mmap buffers. Create with
+// [NewMmapPool] or [NewLazyMmapPool]; close with [Close] after all
 // outstanding buffers have been returned via [MmapBuffer.Unpin].
 type MmapPool struct {
 	buffers     chan []byte
 	poolSize    int64
 	name        string
 	outstanding atomic.Int64
+	allocated   atomic.Int64
 	slowWarn    time.Duration // 0 = disabled
 }
 
@@ -184,13 +185,32 @@ type MmapPool struct {
 // All buffers are pre-allocated and pre-warmed at construction time.
 // Typical usage: NewMmapPool("writes", 1<<20, 32) — 32 × 1 MiB slabs.
 func NewMmapPool(name string, bufferSize int64, capacity int) *MmapPool {
+	p := NewLazyMmapPool(name, bufferSize, capacity)
+	for i := 0; i < capacity; i++ {
+		<-p.buffers
+		p.buffers <- align.AllocAligned(int(p.poolSize))
+	}
+	p.allocated.Store(int64(capacity))
+	return p
+}
+
+// NewLazyMmapPool creates a pool that maps buffers on demand, up to capacity.
+// Returned buffers are retained for reuse; Trim releases idle buffers.
+// Acquire and TryAcquire map and prefault a buffer when they consume nil.
+// FIFO acquisition can grow the pool even with returned buffers behind nil
+// entries; capacity always bounds the number of mappings.
+func NewLazyMmapPool(name string, bufferSize int64, capacity int) *MmapPool {
+	if bufferSize <= 0 || capacity <= 0 {
+		panic("mempool: buffer size and capacity must be positive")
+	}
 	p := &MmapPool{
 		buffers:  make(chan []byte, capacity),
-		poolSize: bufferSize,
+		poolSize: align.PageAlign(bufferSize),
 		name:     name,
 	}
-	for i := 0; i < capacity; i++ {
-		p.buffers <- align.AllocAligned(int(bufferSize))
+	// Each nil entry represents capacity that has not been mapped yet.
+	for range capacity {
+		p.buffers <- nil
 	}
 	return p
 }
@@ -219,28 +239,22 @@ func (p *MmapPool) Acquire() *MmapBuffer {
 // acquireRaw blocks until a buffer is available and returns its memory.
 func (p *MmapPool) acquireRaw() []byte {
 	if p.slowWarn == 0 {
-		raw := <-p.buffers
-		if raw == nil {
+		raw, ok := <-p.buffers
+		if !ok {
 			panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
 		}
-		p.outstanding.Add(1)
-		return raw
+		return p.materialize(raw)
 	}
 	for {
 		select {
-		case raw := <-p.buffers:
-			if raw == nil {
+		case raw, ok := <-p.buffers:
+			if !ok {
 				panic(fmt.Sprintf("mempool: Acquire on closed pool %q", p.name))
 			}
-			p.outstanding.Add(1)
-			return raw
+			return p.materialize(raw)
 		case <-time.After(p.slowWarn):
-			slog.Warn("mempool: Acquire blocked",
-				"pool", p.name,
-				"outstanding", p.outstanding.Load(),
-				"capacity", cap(p.buffers),
-				"threshold", p.slowWarn,
-			)
+			slog.Warn("mempool: Acquire blocked", "pool", p.name,
+				"outstanding", p.outstanding.Load(), "capacity", cap(p.buffers), "threshold", p.slowWarn)
 		}
 	}
 }
@@ -274,25 +288,63 @@ func (p *MmapPool) AcquireAligned(size int64) *MmapBuffer {
 	return NewMmapBuffer(size)
 }
 
-// TryAcquire returns a buffer immediately if one is available, or (nil, false)
-// if the pool is currently empty. It is the non-blocking counterpart of [Acquire].
+// TryAcquire reuses or allocates a buffer without waiting for a borrower.
+// It returns (nil, false) when all capacity is checked out.
 func (p *MmapPool) TryAcquire() (*MmapBuffer, bool) {
 	select {
-	case raw := <-p.buffers:
-		if raw == nil {
-			return nil, false // pool closed
+	case raw, ok := <-p.buffers:
+		if ok {
+			return p.wrap(p.materialize(raw)), true
 		}
-		p.outstanding.Add(1)
-		return p.wrap(raw), true
 	default:
-		return nil, false
+	}
+	return nil, false
+}
+
+// materialize consumes one capacity token, returning it if mmap panics.
+func (p *MmapPool) materialize(raw []byte) []byte {
+	if raw == nil {
+		defer func() {
+			if raw == nil {
+				p.buffers <- nil
+			}
+		}()
+		raw = align.AllocAligned(int(p.poolSize))
+		p.allocated.Add(1)
+	}
+	p.outstanding.Add(1)
+	return raw
+}
+
+// Allocated returns the number of mapped buffers, including checked-out buffers.
+func (p *MmapPool) Allocated() int { return int(p.allocated.Load()) }
+
+// Trim releases currently idle buffers. Checked-out buffers are unaffected.
+// Like acquisition and release, Trim must not race Close.
+func (p *MmapPool) Trim() {
+	// Restore capacity tokens after unmapping. A blocked Acquire can consume
+	// a token and grow again; trimming cannot strand its waiters.
+	for range len(p.buffers) {
+		select {
+		case raw, ok := <-p.buffers:
+			if !ok {
+				return
+			}
+			if raw != nil {
+				_ = unix.Munmap(raw)
+				p.allocated.Add(-1)
+			}
+			p.buffers <- nil
+		default:
+			return
+		}
 	}
 }
 
 // Outstanding returns the number of buffers currently checked out of the pool.
 func (p *MmapPool) Outstanding() int64 { return p.outstanding.Load() }
 
-// Capacity returns the total pool capacity (in-use + available).
+// Capacity returns the maximum number of pooled buffers.
 func (p *MmapPool) Capacity() int { return cap(p.buffers) }
 
 // Name returns the pool's name, useful for diagnostics.
@@ -321,6 +373,7 @@ func (p *MmapPool) releaseBytes(raw []byte) {
 		// Pool is full — this should never happen. Reclaim to avoid leak.
 		_ = unix.Madvise(raw, unix.MADV_DONTNEED)
 		_ = unix.Munmap(raw)
+		p.allocated.Add(-1)
 	}
 }
 
@@ -329,6 +382,9 @@ func (p *MmapPool) releaseBytes(raw []byte) {
 func (p *MmapPool) Close() {
 	close(p.buffers)
 	for raw := range p.buffers {
-		_ = unix.Munmap(raw)
+		if raw != nil {
+			_ = unix.Munmap(raw)
+			p.allocated.Add(-1)
+		}
 	}
 }

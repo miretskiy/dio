@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -14,7 +16,7 @@ func TestTicketErrorReportsLinkedError(t *testing.T) {
 	root := Op{}.Link(Op{})
 	ticket := root.prepareSubmission()
 	recordResult(&root, root.linked, 0, err)
-	root.done.Done()
+	root.finish()
 	_, got := ticket.Wait()
 	if got != err {
 		t.Fatalf("ticket error: got %v want %v", got, err)
@@ -96,7 +98,7 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 	if root.linked == nil || string(root.linked.buf) != "linked" {
 		t.Fatal("submission did not retain the immutable linked chain")
 	}
-	root.done.Done()
+	root.finish()
 	ticket.Wait()
 }
 
@@ -169,7 +171,7 @@ func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 	default:
 	}
 
-	root.done.Done()
+	root.finish()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -180,7 +182,7 @@ func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 func BenchmarkTicketCompletion(b *testing.B) {
 	root := Op{}
 	ticket := root.prepareSubmission()
-	root.done.Done()
+	root.finish()
 	ticket.Wait()
 
 	b.ReportAllocs()
@@ -188,7 +190,7 @@ func BenchmarkTicketCompletion(b *testing.B) {
 	for range b.N {
 		root := Op{}
 		ticket := root.prepareSubmission()
-		root.done.Done()
+		root.finish()
 		ticket.Wait()
 	}
 }
@@ -202,7 +204,7 @@ func BenchmarkSubmissionState(b *testing.B) {
 		root := Op{}
 		ticket := root.prepareSubmission()
 		benchmarkSubmission = &root
-		root.done.Done()
+		root.finish()
 		benchmarkTicket = ticket
 	}
 }
@@ -233,5 +235,127 @@ func BenchmarkOpLinkBatch8(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		benchmarkLinkedOp = (Op{}).Link(tail...)
+	}
+}
+
+func TestTicketDoneClosesOnCompletion(t *testing.T) {
+	root := Op{}
+	ticket := root.prepareSubmission()
+	done := ticket.Done()
+	if done != ticket.Done() {
+		t.Fatal("Done returned a different channel on the second call")
+	}
+	select {
+	case <-done:
+		t.Fatal("Done closed before the ticket completed")
+	default:
+	}
+	recordResult(&root, &root, 7, nil)
+	root.finish()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Done not closed after completion")
+	}
+	if n, err := ticket.Wait(); n != 7 || err != nil {
+		t.Fatalf("Wait after Done: got (%d, %v) want (7, nil)", n, err)
+	}
+}
+
+func TestTicketDoneAfterCompletionIsClosed(t *testing.T) {
+	root := Op{}
+	ticket := root.prepareSubmission()
+	root.finish()
+	select {
+	case <-ticket.Done():
+	default:
+		t.Fatal("Done of a completed ticket is not closed")
+	}
+}
+
+func TestSubmitNotify(t *testing.T) {
+	path := t.TempDir() + "/f"
+	if err := os.WriteFile(path, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	s := NewPOSIXScheduler()
+	defer s.Close()
+
+	calls, gotN := 0, 0
+	var gotErr error
+	ticket, err := SubmitNotify(s, ReadOp(f, make([]byte, 5), 0), func(n int, err error) {
+		calls, gotN, gotErr = calls+1, n, err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := ticket.Wait(); n != 5 || err != nil {
+		t.Fatalf("Wait: (%d, %v)", n, err)
+	}
+	if calls != 1 || gotN != 5 || gotErr != nil {
+		t.Fatalf("whenDone: calls=%d n=%d err=%v", calls, gotN, gotErr)
+	}
+
+	plain, err := s.Submit(ReadOp(f, make([]byte, 5), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain.Wait()
+	if calls != 1 {
+		t.Fatal("whenDone of one submission ran for another")
+	}
+}
+
+// TestWhenDoneRacesWait completes tickets concurrently with Wait; whenDone
+// must run exactly once, after Done is closed (run with -race).
+func TestWhenDoneRacesWait(t *testing.T) {
+	for range 1000 {
+		var calls atomic.Int32
+		root := Op{whenDone: func(int, error) { calls.Add(1) }}
+		ticket := root.prepareSubmission()
+		go root.finish()
+		ticket.Wait()
+		for deadline := time.Now().Add(time.Second); calls.Load() == 0 && time.Now().Before(deadline); {
+			time.Sleep(time.Microsecond)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("whenDone ran %d times", got)
+		}
+	}
+}
+
+// Selectable completion and allocation-free Wait may race each other and
+// finish. Every Done caller must see the same channel and published result.
+func TestTicketConcurrentDoneAndWait(t *testing.T) {
+	for range 500 {
+		root := Op{}
+		ticket := root.prepareSubmission()
+		var workers sync.WaitGroup
+		channels := make(chan (<-chan struct{}), 8)
+		for range 8 {
+			workers.Go(func() {
+				done := ticket.Done()
+				channels <- done
+				<-done
+				n, err := ticket.Wait()
+				if n != 7 || err != nil {
+					t.Errorf("completion result: %d, %v", n, err)
+				}
+			})
+		}
+		recordResult(&root, &root, 7, nil)
+		root.finish()
+		workers.Wait()
+		close(channels)
+		for done := range channels {
+			if done != ticket.Done() {
+				t.Fatal("Done channel changed")
+			}
+		}
 	}
 }

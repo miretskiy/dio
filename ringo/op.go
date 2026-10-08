@@ -209,6 +209,7 @@ type freeListAlloc struct {
 	fsyncs         freeList[fsyncOp]
 	fallocates     freeList[fallocateOp]
 	openAts        freeList[openAtOp]
+	unlinkAts      freeList[unlinkAtOp]
 	openAt2s       freeList[openAt2Op]
 	statxes        freeList[statxOp]
 	ftruncates     freeList[ftruncateOp]
@@ -296,6 +297,15 @@ func (alloc *OpAlloc) newOpenAtOp() *openAtOp {
 		return new(openAtOp)
 	}
 	op := alloc.openAts.get(alloc)
+	op.alloc = alloc
+	return op
+}
+
+func (alloc *OpAlloc) newUnlinkAtOp() *unlinkAtOp {
+	if alloc == nil {
+		return new(unlinkAtOp)
+	}
+	op := alloc.unlinkAts.get(alloc)
 	op.alloc = alloc
 	return op
 }
