@@ -10,20 +10,22 @@ import (
 const defaultRingDepth uint32 = 256
 
 type schedulerConfig struct {
-	ringDepth  uint32
-	sqPoll     bool
-	vfiles     uint32
-	coalescing bool
-	dmaPool    *mempool.SlabPool
-	dmaPoolSet bool
-	budget     ioBudget
+	coordinatorCPU int // -1 leaves affinity unchanged
+	ringDepth      uint32
+	sqPoll         bool
+	vfiles         uint32
+	coalescing     bool
+	dmaPool        *mempool.SlabPool
+	dmaPoolSet     bool
+	budget         ioBudget
 }
 
 func makeSchedulerConfig(opts []Option) schedulerConfig {
 	c := schedulerConfig{
-		ringDepth:  defaultRingDepth,
-		coalescing: true,
-		budget:     defaultBudget(),
+		coordinatorCPU: -1,
+		ringDepth:      defaultRingDepth,
+		coalescing:     true,
+		budget:         defaultBudget(),
 	}
 	for _, opt := range opts {
 		opt.apply(&c)
@@ -50,6 +52,15 @@ func (f optionFunc) apply(c *schedulerConfig) { f(c) }
 // emulated table is unbounded).
 func WithVFiles(n uint32) Option {
 	return optionFunc(func(c *schedulerConfig) { c.vfiles = n })
+}
+
+// WithCoordinatorCPU requests best-effort affinity for the io_uring coordinator.
+// The default, -1, leaves affinity unchanged. Affinity failures are logged; I/O
+// continues on the dedicated OS thread without the requested affinity.
+// This pins the userspace coordinator, not kernel workers or device IRQs.
+// The POSIX backend ignores this option.
+func WithCoordinatorCPU(cpu int) Option {
+	return optionFunc(func(c *schedulerConfig) { c.coordinatorCPU = cpu })
 }
 
 // WithRingDepth sets the io_uring SQ/CQ depth in entries. Zero (the default)

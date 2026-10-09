@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -142,6 +144,9 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	}
 	if cfg.dmaPoolSet && cfg.dmaPool == nil {
 		return nil, errors.New("iosched: cannot register a nil DMA slab")
+	}
+	if cfg.coordinatorCPU < -1 {
+		return nil, fmt.Errorf("iosched: invalid coordinator CPU %d", cfg.coordinatorCPU)
 	}
 	dmaPool := cfg.dmaPool
 	cfg.dmaPool = nil
@@ -443,6 +448,15 @@ func newCoordinator(s *URingScheduler) *coordinator {
 }
 
 func (s *URingScheduler) loop() {
+	runtime.LockOSThread()
+	// Exit locked so the runtime cannot reuse a thread with restricted affinity.
+	if cpu := s.config.coordinatorCPU; cpu >= 0 {
+		var set unix.CPUSet
+		set.Set(cpu)
+		if err := unix.SchedSetaffinity(0, &set); err != nil {
+			slog.Warn("iosched: cannot pin coordinator", "cpu", cpu, "error", err)
+		}
+	}
 	defer close(s.done)
 	c := newCoordinator(s)
 	s.drainErr = c.shutdown(c.run())

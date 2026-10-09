@@ -157,6 +157,12 @@ defer buf.Unpin()
 copy(buf.Bytes(), payload)
 ```
 
+`NewLazyMmapPool(name, bufferSize, capacity)` reserves capacity without mapping
+all buffers up front. The first acquisition of each slot maps and prefaults it.
+`TryAcquire` returns immediately when no slot is available; `Trim` releases idle
+mappings. `NewSlabPoolFrom(data, slotSize)` divides caller-owned aligned memory
+into slots; closing that slab leaves the backing memory with its caller.
+
 ### Aligned buffers
 
 `AlignedBuffer` is a growable buffer in the spirit of `bytes.Buffer` whose
@@ -245,6 +251,12 @@ sched, err := iosched.NewURingScheduler(
 
 `WithSQPOLL` enables kernel submission-queue polling. It can require additional
 privileges and dedicates a kernel thread, so it should be an explicit choice.
+
+Each io_uring coordinator runs on a dedicated OS thread. `WithCoordinatorCPU(n)`
+requests affinity to CPU `n`; the default leaves affinity unchanged. Affinity
+setup is best effort: failures are logged and the loop continues. Pinning does
+not reserve a CPU or set kernel-worker or interrupt affinity. The thread exits
+with the coordinator so restricted affinity cannot leak into unrelated Go work.
 
 The scheduler does not provide application-level backpressure: `Submit` never
 blocks or refuses work for lack of capacity. Callers that need to bound what
