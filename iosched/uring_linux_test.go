@@ -15,8 +15,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
-	"github.com/miretskiy/dio/v2/mempool"
 	"github.com/miretskiy/dio/v2/sys"
 )
 
@@ -389,12 +389,12 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 	require.Error(t, err)
 }
 
-func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, *mempool.SlabPool) {
+func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, *alloc.SlabPool) {
 	t.Helper()
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	pool, err := alloc.NewSlabPool(align.HugepageSize, align.BlockSize)
 	require.NoError(t, err)
 	s, err := iosched.NewURingScheduler(
 		iosched.WithRingDepth(64),
@@ -420,23 +420,23 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 	payload := make([]byte, align.BlockSize)
 	_, _ = rand.Read(payload)
 
-	wslot, err := pool.Acquire()
+	wslot, err := pool.TryAcquire()
 	require.NoError(t, err)
-	copy(wslot.Data, payload)
+	copy(wslot.Bytes(), payload)
 
-	n, err := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Data, 0))
+	n, err := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Bytes(), 0))
 	require.NoError(t, err)
 	require.Equal(t, align.BlockSize, n)
-	wslot.Release()
+	wslot.Unpin()
 
-	rslot, err := pool.Acquire()
+	rslot, err := pool.TryAcquire()
 	require.NoError(t, err)
 
-	n, err = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Data, 0))
+	n, err = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Bytes(), 0))
 	require.NoError(t, err)
 	require.Equal(t, align.BlockSize, n)
-	require.Equal(t, payload, rslot.Data)
-	rslot.Release()
+	require.Equal(t, payload, rslot.Bytes())
+	rslot.Unpin()
 }
 
 func TestURing_FixedOp_MultipleSlots(t *testing.T) {
@@ -449,17 +449,17 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 	f := openRW(t, path)
 
 	payloads := make([][]byte, chunks)
-	slots := make([]mempool.Slot, chunks)
+	slots := make([]*alloc.Buffer, chunks)
 	tickets := make([]iosched.Ticket, chunks)
 
 	for i := range chunks {
 		payloads[i] = make([]byte, align.BlockSize)
 		_, _ = rand.Read(payloads[i])
 
-		slots[i], _ = pool.Acquire()
-		copy(slots[i].Data, payloads[i])
+		slots[i], _ = pool.TryAcquire()
+		copy(slots[i].Bytes(), payloads[i])
 
-		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Data, int64(i*align.BlockSize)))
+		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Bytes(), int64(i*align.BlockSize)))
 		require.NoError(t, err)
 		tickets[i] = ticket
 	}
@@ -467,7 +467,7 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 	for i, ticket := range tickets {
 		_, err := ticket.Wait()
 		require.NoError(t, err, "chunk %d write failed", i)
-		slots[i].Release()
+		slots[i].Unpin()
 	}
 
 	for i := range chunks {
@@ -481,7 +481,7 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	s := newURingSched(t)
 
-	pool, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	pool, err := alloc.NewSlabPool(align.HugepageSize, align.BlockSize)
 	require.NoError(t, err)
 	defer pool.Close()
 
@@ -489,11 +489,11 @@ func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
 	f := openRW(t, path)
 
-	slot, err := pool.Acquire()
+	slot, err := pool.TryAcquire()
 	require.NoError(t, err)
-	defer slot.Release()
+	defer slot.Unpin()
 
-	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Data, 0))
+	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Bytes(), 0))
 	require.Error(t, err)
 	t.Logf("validation error for unregistered fixed op: %v", err)
 }

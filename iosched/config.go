@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/miretskiy/dio/v2/mempool"
+	"github.com/miretskiy/dio/v2/alloc"
 )
 
 const defaultRingDepth uint32 = 256
@@ -15,7 +15,7 @@ type schedulerConfig struct {
 	sqPoll         bool
 	vfiles         uint32
 	coalescing     bool
-	dmaPool        *mempool.SlabPool
+	dmaPool        *alloc.SlabPool
 	dmaPoolSet     bool
 	budget         ioBudget
 }
@@ -87,7 +87,7 @@ func WithCoalescing(enabled bool) Option {
 // coordinator starts. The scheduler retains pool until Close returns; callers
 // must release all pool slots and close the scheduler before closing pool. The
 // POSIX fallback ignores this option.
-func WithDMASlab(pool *mempool.SlabPool) Option {
+func WithDMASlab(pool *alloc.SlabPool) Option {
 	return optionFunc(func(c *schedulerConfig) {
 		c.dmaPool = pool
 		c.dmaPoolSet = true

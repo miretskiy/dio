@@ -53,15 +53,18 @@ type Scheduler interface {
 	//     the slot's file: it is accepted while earlier work on the slot remains
 	//     (its close drains that work), and plain operations submitted for the
 	//     slot while it is pending wait for it, as they wait for an open.
-	//     Otherwise, separate work submitted for a file after its lifecycle
-	//     barrier has been accepted but before it completes is unsupported. Callers must stop using
-	//     a regular file before DrainOp and may close it after the Ticket completes.
+	//   - A VOpenatOp submitted after a chain that leaves its slot closed waits
+	//     for that chain and starts the slot's next generation. Its following
+	//     operations wait for this new open. No caller-side close wait is needed.
+	//     Other separate work after a close without a new open is rejected.
+	//     Callers must stop using a regular file before DrainOp and may close it
+	//     after the Ticket completes.
 	//
 	// These rules use the coordinator's acceptance order. Submit calls racing from
 	// different goroutines do not establish an application-visible order.
 	Submit(op Op) (Ticket, error)
 
-	// Close shuts down the scheduler and waits for accepted tickets to finish.
+	// Close gives accepted work a bounded drain, then cancels and closes.
 	// Work that has not completed may finish with a scheduler-closed error.
 	// Close must be called exactly once. Callers must stop submitting first;
 	// racing Close with Submit is not supported.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime"
 	"sync/atomic"
 	"syscall"
@@ -12,8 +13,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/internal/buildutil"
-	"github.com/miretskiy/dio/v2/mempool"
 	"github.com/miretskiy/dio/v2/ringo"
 )
 
@@ -105,7 +106,7 @@ type URingScheduler struct {
 
 	ring              *ringo.Ring
 	fixedFiles        []ringo.FixedFile
-	registeredPool    *mempool.SlabPool
+	registeredPool    *alloc.SlabPool
 	registeredBuffers *ringo.FixedBuffers
 	stagingHead       atomic.Pointer[submission]
 	done              chan struct{}
@@ -125,9 +126,8 @@ type URingScheduler struct {
 
 	stop atomic.Pointer[error]
 
-	// drainErr records that the coordinator gave up waiting for placed
-	// operations. It is written before done closes and read after Close observes
-	// that close, so the channel supplies the ordering.
+	// drainErr records a coordinator failure or shutdown timeout. It is written
+	// before done closes and read after Close observes that close.
 	drainErr error
 }
 
@@ -305,84 +305,36 @@ func (s *URingScheduler) closeStaging() *submission {
 	if head == &stagingClosed {
 		return nil
 	}
-	return head
+	return reverseStaged(head)
 }
 
-const (
-	// shutdownCancelTimeout bounds each synchronous cancellation attempt during
-	// shutdown. Cancellation is best effort, so exceeding it is not an error.
-	shutdownCancelTimeout = time.Second
-	// A cancellation attempt can race a batch being placed. Retry promptly while
-	// the coordinator can still enter a blocking submission, without spinning if
-	// the kernel reports that there is currently nothing to cancel.
-	shutdownCancelRetryDelay = time.Millisecond
-)
+// shutdownTimeout covers the graceful drain, cancellation, and final reap.
+// Tests shorten it; production has one deadline for the entire shutdown.
+var shutdownTimeout = 5 * time.Second
 
-// Close stops the coordinator and releases ring resources. Unplaced work is
-// failed with the scheduler-closed error. Placed work retains its resources
-// until its final completion; Close requests cancellation but may wait for
-// noncancelable in-flight file I/O. Cancellation is retried until the
-// coordinator exits, so work placed after an earlier attempt is not missed.
-// Close must be called exactly once. Callers must stop submitting first; racing
-// Close with Submit is not supported.
-//
-// Close returns an error if the ring stopped reporting completions while
-// operations were still placed. Tickets for that work report the same error,
-// and Ringo permanently retains those operands because the kernel may still be
-// using them. A caller that registered a DMA slab must not close it in that
-// case, and must not reuse the buffers involved.
+const shutdownCancelTimeout = time.Second
+
+// Close stops admission and asks the coordinator to finish accepted work.
+// The coordinator owns the bounded drain and cancellation; Close then releases
+// the ring. Callers must stop submitting first and call Close exactly once.
 func (s *URingScheduler) Close() error {
 	if s.signalShutdown(errSchedulerClosed) {
-		// The coordinator may be parked or asleep in io_uring_enter; wake it
-		// either way. Ringing is best effort: if the write fails, the
-		// cancellation below completes the doorbell read instead, and Close
-		// returns only once the coordinator has drained either way.
 		s.wakeChannel()
-		_ = s.ringDoorbell()
+		if err := s.ringDoorbell(); err != nil {
+			_ = s.ring.CancelAll(shutdownCancelTimeout)
+		}
 	}
-	cancelUntilCoordinatorDone(s.done, s.ring.CancelAll)
-
-	err := s.drainErr
-	// Ringo's Close always releases the ring. If operations are still pending,
-	// because the drain gave up, it retains their operands and reports
-	// ringo.ErrPending. The kernel may still use the registered DMA slab and the
-	// doorbell then, so they must outlive this call too.
+	<-s.done
 	ringErr := s.ring.Close()
-	err = errors.Join(err, ringErr)
+	err := errors.Join(s.drainErr, ringErr)
 	if ringErr != nil {
-		return err
+		return err // Ringo retains resources still held by outstanding operations.
 	}
 	s.registeredPool = nil
 	s.registeredBuffers = nil
 	err = errors.Join(err, unix.Close(s.doorbellFD))
 	s.doorbellFD = -1
 	return err
-}
-
-// cancelUntilCoordinatorDone closes the window in which one cancellation can
-// run just before the coordinator places and submits a new batch. It is a
-// shutdown-only path and does not add synchronization to normal I/O.
-func cancelUntilCoordinatorDone(
-	done <-chan struct{},
-	cancel func(time.Duration) error,
-) {
-	for {
-		select {
-		case <-done:
-			return
-		default:
-		}
-
-		// ANY ignores the match key; ALL cancels every request. The operation is
-		// best effort: a noncancelable request keeps Close waiting for the
-		// coordinator, exactly as documented.
-		_ = cancel(shutdownCancelTimeout)
-		select {
-		case <-done:
-			return
-		case <-time.After(shutdownCancelRetryDelay):
-		}
-	}
 }
 
 func (s *URingScheduler) signalShutdown(err error) bool {
@@ -462,35 +414,22 @@ func (s *URingScheduler) loop() {
 	s.drainErr = c.shutdown(c.run())
 }
 
-// shutdown retires the coordinator once run has returned cause. It returns an
-// error only when the drain gave up on placed operations.
+// shutdown is the sole owner of draining accepted work and cancellation.
 func (c *coordinator) shutdown(cause error) error {
-	s := c.sched
-	// Fail every later Submit. Close may have stopped the scheduler already.
-	s.signalShutdown(cause)
-	// The drain below waits for every placed operation, the doorbell read
-	// included. Ringing the doorbell completes that read even if the
-	// cancellation below does not reach it, and the cancellation completes it if
-	// this write fails, so the write is best effort like the cancellation.
-	_ = s.ringDoorbell()
-	// Cancellation is best effort and it races submission: Close cancels before
-	// it waits for the coordinator, so a batch placed in between was never
-	// offered to that cancellation, and a coordinator-initiated shutdown has not
-	// cancelled at all. Ask once more now that placement has stopped. Draining
-	// final completions below remains the ownership barrier.
-	_ = s.ring.CancelAll(shutdownCancelTimeout)
-	// Closing the stack makes any Submit still racing this shutdown fail rather
-	// than stage work no one will take. Failing staged work is order-free.
-	staged := s.closeStaging()
-	// A drain that gives up leaves placed work that never reported; the kernel
-	// may still be using its operands, so its tickets report an unknown outcome.
-	drainErr := c.waitForInflight()
-	placedErr := cause
-	if drainErr != nil {
-		placedErr = drainErr
+	c.sched.signalShutdown(cause)
+	_ = c.sched.ringDoorbell()
+	staged := c.sched.closeStaging()
+	graceful := cause == errSchedulerClosed
+	if graceful {
+		c.accept(staged)
+		staged = nil
 	}
-	c.failRemaining(staged, cause, placedErr)
-	return drainErr
+	err := c.drain(graceful)
+	c.failRemaining(staged, cause, errors.Join(cause, err))
+	if !graceful {
+		return errors.Join(cause, err)
+	}
+	return err
 }
 
 // How work moves through the coordinator, with its workState in brackets:
@@ -610,8 +549,12 @@ func (c *coordinator) armDoorbell() ringo.Handle {
 }
 
 func (s *URingScheduler) takeStaged() *submission {
+	return reverseStaged(s.stagingHead.Swap(nil))
+}
+
+func reverseStaged(head *submission) *submission {
 	var out *submission
-	for head := s.stagingHead.Swap(nil); head != nil; {
+	for head != nil {
 		next := head.staged
 		head.staged = out
 		out = head
@@ -628,13 +571,12 @@ func (c *coordinator) accept(head *submission) {
 		root := &work.root
 		work.durable = root.durable() && (root.kind() == OpWrite || root.kind() == OpWritev)
 
-		var inline [4]fileUse
-		uses := fileUses(work, inline[:0])
+		uses := fileUses(work, work.inlineFile[:0])
 		if err := c.files.check(uses); err != nil {
 			completeFailed(root, err)
 			continue
 		}
-		work.class, work.cost = c.sched.config.budget.cost(root)
+		work.cost = c.sched.config.budget.costs(root)
 		work.remaining = work.count
 		if work.durable {
 			work.remaining++ // the fdatasync that covers the write
@@ -687,7 +629,11 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 
 	var overBudget [budgetedClasses]bool
 	for work := c.ready.head; work != nil; {
-		if work.class != classOther && overBudget[work.class] {
+		blocked := false
+		for class, cost := range work.cost {
+			blocked = blocked || (cost != 0 && overBudget[class])
+		}
+		if blocked {
 			work = c.ready.next(work)
 			continue
 		}
@@ -699,14 +645,18 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 		if run > 1 {
 			need = 1
 			for member, i := c.ready.next(work), 1; i < run; member, i = c.ready.next(member), i+1 {
-				cost += member.cost
+				cost[classWrite] += member.cost[classWrite]
 			}
 		}
 		if need > free() {
 			return c.occupied - start, false
 		}
-		if !c.fitsBudget(work.class, cost) {
-			overBudget[work.class] = true
+		for class, amount := range cost {
+			if amount != 0 && !c.fitsBudget(ioClass(class), amount) {
+				overBudget[class], blocked = true, true
+			}
+		}
+		if blocked {
 			if overBudget[classRead] && overBudget[classWrite] {
 				break
 			}
@@ -738,18 +688,20 @@ func (c *coordinator) fitsBudget(class ioClass, cost int64) bool {
 func (c *coordinator) take(work *submission) {
 	c.ready.remove(work)
 	work.state = workIssued
-	if work.class != classOther && work.cost != 0 {
-		c.inFlightCost[work.class] += work.cost
-		work.charged = true
+	for class, cost := range work.cost {
+		c.inFlightCost[class] += cost
 	}
+	work.charged = true
 }
 
-// release returns work's cost to its class's budget once the operation it was
-// charged for has completed.
-func (c *coordinator) release(work *submission) {
+// release returns each operation's cost at its own completion, including
+// canceled followers. Metadata operations have no charge.
+func (c *coordinator) release(work *submission, op *Op) {
 	if work.charged {
-		c.inFlightCost[work.class] -= work.cost
-		work.charged = false
+		class, cost := c.sched.config.budget.cost(op)
+		if class != classOther {
+			c.inFlightCost[class] -= cost
+		}
 	}
 }
 
@@ -763,6 +715,8 @@ func (c *coordinator) coalescedRun(first *submission) int {
 		return 1
 	}
 	run := 1
+	cost := first.cost[classWrite]
+	goal := int64(c.sched.config.budget.goal)
 	sequence := first.sequence
 	runEnd := firstOp.offset + int64(len(firstOp.buf))
 	// Only adjacent submissions are coalesced. Searching past unrelated work
@@ -776,6 +730,13 @@ func (c *coordinator) coalescedRun(first *submission) int {
 			!sameFile(firstOp, op) || op.offset != runEnd {
 			break
 		}
+		// The oversized-operation escape is for one caller operation, never an
+		// oversized batch manufactured by coalescing. Use the remaining budget.
+		nextCost := cost + work.cost[classWrite]
+		if goal > 0 && c.inFlightCost[classWrite]+nextCost > goal {
+			break
+		}
+		cost = nextCost
 		runEnd += int64(len(op.buf))
 		run++
 	}
@@ -958,64 +919,41 @@ func (c *coordinator) reap() {
 	}
 }
 
-// drainStallLimit bounds how many consecutive drain rounds may reap nothing
-// before the coordinator stops waiting. On a usable ring SubmitAndWait blocks
-// until at least one completion is available, so a round that reaps nothing
-// means the ring can no longer report: it has recorded a fault, or entering it
-// keeps failing. Neither clears on its own. Tests lower these.
-//
-// TODO: a stall round only occurs when entering the ring fails, so this is a
-// busy retry against a failing syscall that gives up after about a second.
-// Replace the fixed count and delay with a backoff against a deadline.
-var (
-	drainStallLimit = 1024
-	drainStallDelay = time.Millisecond
-)
-
-// waitForInflight keeps every placed operation and its ticket alive until Ringo
-// yields the operation's final completion. Cancellation only shortens this
-// wait; an unsupported, timed-out, or otherwise failed cancellation does not
-// relax the ownership boundary.
-//
-// It returns an error only when the ring stops reporting completions
-// altogether, leaving c.slots populated. That is not recoverable: the
-// coordinator cannot tell an operation whose completion was lost from one still
-// running, so it can prove nothing about the operands either still holds.
-func (c *coordinator) waitForInflight() error {
-	stalls := 0
-	for c.occupied != 0 {
-		// Nothing is placed during the drain, so the ring is still reporting
-		// exactly when a reap lowers the occupied count.
-		before := c.occupied
-		if c.reap(); c.occupied < before {
-			stalls = 0
-			continue
+// drain gives normal work half the shutdown period, then cancels once and
+// reaps until the same deadline. No blocking completion wait can hide that
+// deadline. An I/O error takes the cancellation path immediately.
+func (c *coordinator) drain(graceful bool) error {
+	deadline := time.Now().Add(shutdownTimeout)
+	cancelAt := deadline.Add(-shutdownTimeout / 2)
+	cancelled := false
+	var lastErr error
+	for {
+		c.reap()
+		if c.occupied == 0 && (cancelled || !graceful || c.accepted.len == 0) {
+			return lastErr
 		}
-		err := c.enter(1)
-		if c.reap(); c.occupied < before {
-			stalls = 0
-			continue
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("iosched: shutdown timed out with %d operations pending: %w",
+				c.occupied, errors.Join(os.ErrDeadlineExceeded, lastErr))
 		}
-		stalls++
-		if stalls >= drainStallLimit {
-			if err == nil {
-				// Entering kept succeeding and reaping kept finding nothing,
-				// which SubmitAndWait's minimum completion count should make
-				// impossible. Name it rather than wrap a nil.
-				err = errors.New("ring reported no completions")
+		if !cancelled && graceful && time.Now().Before(cancelAt) {
+			c.placeReady(c.sched.config.coalescing)
+		}
+		// Flush placed SQEs before cancellation so they are visible to the kernel.
+		if err := c.enter(0); err != nil {
+			lastErr = err
+			graceful = false
+		}
+		if !cancelled && (!graceful || !time.Now().Before(cancelAt)) {
+			// Stop placement and request cancellation once. Leave time to reap.
+			if err := c.ring.CancelAll(min(shutdownCancelTimeout, remaining/2)); err != nil && !errors.Is(err, syscall.ENOENT) {
+				lastErr = err
 			}
-			return fmt.Errorf(
-				"iosched: %d io_uring operations stopped reporting completions "+
-					"after %d attempts: %w",
-				c.occupied, stalls, err,
-			)
+			cancelled = true
 		}
-		// An enter error does not prove that previously submitted I/O has
-		// stopped, so keep the state and retry rather than completing tickets
-		// whose buffers may still be in use.
-		time.Sleep(drainStallDelay)
+		time.Sleep(time.Millisecond)
 	}
-	return nil
 }
 
 // place records scheduler state for a queued operation in the entry its handle
@@ -1079,9 +1017,7 @@ func (c *coordinator) finishWrite(leader *submission, n int, err error) {
 // durable write that succeeded then waits for its file's next fdatasync; one
 // that failed has nothing to make durable, so its fdatasync is retired with it.
 func (c *coordinator) finishOperation(work *submission, op *Op, n int, err error) {
-	if op == &work.root {
-		c.release(work) // the cost was the first operation's
-	}
+	c.release(work, op)
 	err = writeResultError(op, n, err)
 	recordResult(&work.root, op, n, err)
 	c.operationDone(work, op)
@@ -1097,7 +1033,7 @@ func (c *coordinator) finishOperation(work *submission, op *Op, n int, err error
 // its file's next fdatasync. Every durable write on the file that completes
 // before that fdatasync is placed shares it.
 func (c *coordinator) awaitSync(work *submission) {
-	state := c.files.lookup(&work.root)
+	state := work.fileState(&work.root)
 	if state.syncBatch.len == 0 {
 		c.syncPending = append(c.syncPending, state)
 	}
@@ -1146,7 +1082,7 @@ func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) 
 		// Work in a file's sync batch is still linked there; the table goes
 		// away with the coordinator, but the Ticket keeps work reachable.
 		work.links = [2]queueLinks{}
-		if work.state == workIssued {
+		if work.state == workIssued && c.occupied != 0 {
 			completeUnknown(&work.root, placed)
 		} else {
 			completeFailed(&work.root, unplaced)
@@ -1168,12 +1104,12 @@ func completeFailed(root *Op, err error) {
 	root.finish()
 }
 
-// completeUnknown reports that one of root's operations never told the
-// coordinator what happened to it. Only a drain that gave up reaches this. It
-// replaces any result another operation in the same work recorded, because that
-// result reads as a settled failure, and a settled failure is what tells a
-// caller its buffers are its own again.
+// completeUnknown reports a forced shutdown without releasing operands whose
+// kernel completions have not been reaped.
 func completeUnknown(root *Op, err error) {
 	root.err = err
+	// A forced close cannot release resources still borrowed by kernel I/O.
+	// Report the ticket error, but leave its resource-release callback alone.
+	root.completion.whenDone = nil
 	root.finish()
 }

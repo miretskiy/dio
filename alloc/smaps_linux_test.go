@@ -1,6 +1,6 @@
 //go:build linux
 
-package mempool_test
+package alloc_test
 
 import (
 	"fmt"
@@ -12,11 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/miretskiy/dio/v2/align"
-	"github.com/miretskiy/dio/v2/mempool"
+	"github.com/miretskiy/dio/v2/alloc"
 )
 
 func TestSlabPool_HugepageInfo(t *testing.T) {
-	p, err := mempool.NewSlabPool(align.HugepageSize, align.BlockSize)
+	p, err := alloc.NewSlabPool(align.HugepageSize, align.BlockSize)
 	require.NoError(t, err)
 	defer p.Close()
 	t.Logf("slab backing: %s", slabHugepageInfo(p))
@@ -24,7 +24,7 @@ func TestSlabPool_HugepageInfo(t *testing.T) {
 
 // slabHugepageInfo reports the KernelPageSize for the slab's first page
 // by scanning /proc/self/smaps. Returns a diagnostic string for t.Log.
-func slabHugepageInfo(p *mempool.SlabPool) string {
+func slabHugepageInfo(p *alloc.SlabPool) string {
 	raw := p.RawData()
 	if len(raw) == 0 {
 		return "empty slab"

@@ -82,3 +82,42 @@ func TestFixedListRejectsReturnedHandle(t *testing.T) {
 	assertPanics(t, "returned handle", func() { list.Remove(handle) })
 	assertPanics(t, "zero handle", func() { list.Value(0) })
 }
+
+func TestFixedListAllSlots(t *testing.T) {
+	list := MakeFixedList[int](3)
+	first := list.PushBack()
+	*list.Value(first) = 10
+	second := list.PushBack()
+	*list.Value(second) = 20
+	list.Remove(first)
+
+	// Include a returned slot, an occupied slot, and a never-used slot.
+	want := []int{10, 20, 0}
+	count := 0
+	for i, value := range list.AllSlots() {
+		if *value != want[i] {
+			t.Fatalf("slot %d: got %d, want %d", i, *value, want[i])
+		}
+		*value += 1
+		count++
+	}
+	if count != list.Cap() || list.Len() != 1 {
+		t.Fatalf("visited %d slots; occupied %d", count, list.Len())
+	}
+	if *list.Value(second) != 21 || *list.Value(list.PushBack()) != 11 {
+		t.Fatal("slot updates were not retained")
+	}
+
+	count = 0
+	for range list.AllSlots() {
+		count++
+		break
+	}
+	if count != 1 {
+		t.Fatalf("early stop visited %d slots", count)
+	}
+	empty := MakeFixedList[int](0)
+	for range empty.AllSlots() {
+		t.Fatal("empty list yielded a slot")
+	}
+}

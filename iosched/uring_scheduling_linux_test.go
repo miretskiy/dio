@@ -4,6 +4,7 @@ package iosched
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -59,7 +60,7 @@ func closeTestCoordinator(t *testing.T, c *coordinator) {
 		return
 	}
 	_ = c.ring.CancelAll(shutdownCancelTimeout)
-	require.NoError(t, c.waitForInflight())
+	require.NoError(t, c.drain(false))
 	c.failRemaining(c.sched.closeStaging(), errSchedulerClosed, errSchedulerClosed)
 	require.NoError(t, c.ring.Close())
 }
@@ -228,20 +229,6 @@ func TestCloseCancellationReportsSchedulerClosed(t *testing.T) {
 	require.ErrorIs(t, err, errSchedulerClosed)
 }
 
-func TestShutdownCancellationRetriesUntilCoordinatorStops(t *testing.T) {
-	done := make(chan struct{})
-	attempts := 0
-	cancelUntilCoordinatorDone(done, func(timeout time.Duration) error {
-		require.Equal(t, shutdownCancelTimeout, timeout)
-		attempts++
-		if attempts == 2 {
-			close(done)
-		}
-		return syscall.ETIME
-	})
-	require.Equal(t, 2, attempts)
-}
-
 // TestChainKeepsEachLinkType checks that every edge of a chain reaches the
 // kernel with its own link type, by failing a read in the middle and watching
 // which writes after it land: Link cancels the rest of the chain, HardLink
@@ -287,7 +274,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 		t.Fatalf("run error: got %v want %v", cause, errSchedulerClosed)
 	}
 	staged := s.closeStaging()
-	require.NoError(t, c.waitForInflight())
+	require.NoError(t, c.drain(false))
 	c.failRemaining(staged, cause, cause)
 
 	_, err := ticket.Wait()
@@ -305,18 +292,17 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 // waiting instead of spinning forever, must not release the placed operations,
 // and must tell whoever holds their tickets that the outcome is unknown.
 func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
-	defer func(limit int, delay time.Duration) {
-		drainStallLimit, drainStallDelay = limit, delay
-	}(drainStallLimit, drainStallDelay)
-	drainStallLimit, drainStallDelay = 4, time.Microsecond
+	oldTimeout := shutdownTimeout
+	shutdownTimeout = 20 * time.Millisecond
+	defer func() { shutdownTimeout = oldTimeout }()
 
 	c := newTestCoordinator(t, 4, 0)
 	first, _ := blockingRead(t)
 	second, _ := blockingRead(t)
-	tickets, _ := acceptOps(c,
-		ReadOp(first, make([]byte, 8), 0),
-		ReadOp(second, make([]byte, 8), 0),
-	)
+	released := false
+	op := ReadOp(first, make([]byte, 8), 0)
+	op.whenDone = func(int, error) { released = true }
+	tickets, _ := acceptOps(c, op, ReadOp(second, make([]byte, 8), 0))
 	c.placeReady(false)
 	require.NoError(t, c.enter(0))
 	require.Equal(t, 2, c.occupied, "operations were not placed")
@@ -324,13 +310,14 @@ func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
 	// Closing the ring under the coordinator leaves it with operations in
 	// flight that can never be reaped: the ring has stopped reporting.
 	require.ErrorIs(t, c.ring.Close(), ringo.ErrPending)
-	err := c.waitForInflight()
+	err := c.drain(false)
 	require.ErrorIs(t, err, ringo.ErrClosed)
 	c.sched.drainErr = err
 	require.Equal(t, 2, c.occupied,
 		"drain released operations it could not prove had finished")
 
 	c.failRemaining(nil, errSchedulerClosed, err)
+	require.False(t, released, "forced shutdown must retain a buffer whose I/O was not reaped")
 	for i, ticket := range tickets {
 		_, waitErr := ticket.Wait()
 		require.ErrorIsf(t, waitErr, ringo.ErrClosed, "ticket %d", i)
@@ -343,10 +330,9 @@ func TestDrainGivesUpAndReportsUnknownOutcome(t *testing.T) {
 // unknown, because the earlier failure reads as settled and would tell its
 // holder the buffers are free.
 func TestDrainOutcomeOverridesEarlierOperationError(t *testing.T) {
-	defer func(limit int, delay time.Duration) {
-		drainStallLimit, drainStallDelay = limit, delay
-	}(drainStallLimit, drainStallDelay)
-	drainStallLimit, drainStallDelay = 4, time.Microsecond
+	oldTimeout := shutdownTimeout
+	shutdownTimeout = 20 * time.Millisecond
+	defer func() { shutdownTimeout = oldTimeout }()
 
 	c := newTestCoordinator(t, 4, 0)
 	f := testFile(t, 1)
@@ -361,7 +347,7 @@ func TestDrainOutcomeOverridesEarlierOperationError(t *testing.T) {
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 1 }) // the EBADF read
 
 	require.ErrorIs(t, c.ring.Close(), ringo.ErrPending)
-	drainErr := c.waitForInflight()
+	drainErr := c.drain(false)
 	require.ErrorIs(t, drainErr, ringo.ErrClosed)
 	c.sched.drainErr = drainErr
 
@@ -401,64 +387,80 @@ func TestFailRemainingPreservesCompletedRoot(t *testing.T) {
 	}
 }
 
-func TestCleanupDrainsPlacedCompletionsBeforeFailingUnplacedWork(t *testing.T) {
-	ringErr := errors.New("ring failed")
+func TestShutdownReapsCancellationBeforeFailingUnplacedWork(t *testing.T) {
+	cause := errors.New("ring failed")
 	c := newTestCoordinator(t, 1, 0)
-	f := testFile(t, 1)
-	tickets, _ := acceptOps(c,
-		ReadOp(f, make([]byte, 1), 0),
-		ReadOp(f, make([]byte, 1), 0),
-	)
+	f, _ := blockingRead(t)
+	released := false
+	op := ReadOp(f, make([]byte, 8), 0)
+	op.whenDone = func(_ int, err error) {
+		require.ErrorIs(t, err, syscall.ECANCELED)
+		released = true
+	}
+	tickets, _ := acceptOps(c, op, ReadOp(f, make([]byte, 8), 0))
 	c.placeReady(false)
 	require.Equal(t, 1, c.occupied, "the second read should not fit")
 	require.NoError(t, c.enter(0))
 
-	require.NoError(t, c.waitForInflight())
-	c.failRemaining(nil, ringErr, ringErr)
-
-	n, err := tickets[0].Wait()
-	if n != 1 || err != nil {
-		t.Fatalf("consumed request: N=%d error=%v", n, err)
-	}
+	require.ErrorIs(t, c.shutdown(cause), cause)
+	_, err := tickets[0].Wait()
+	require.ErrorIs(t, err, syscall.ECANCELED)
+	require.True(t, released, "the kernel completion must release the I/O reference")
 	_, err = tickets[1].Wait()
-	if !errors.Is(err, ringErr) {
-		t.Fatalf("remaining request error: got %v want %v", err, ringErr)
-	}
-	if c.accepted.len != 0 || c.occupied != 0 {
-		t.Fatalf("coordinator retained failed work: pending=%d placed=%d", c.accepted.len, c.occupied)
-	}
+	require.ErrorIs(t, err, cause, "unplaced work reports the scheduler failure")
+	require.Zero(t, c.accepted.len)
+	require.Zero(t, c.occupied)
 }
 
-func TestDrainWaitsForFinalCompletionBeforeCompletingTicket(t *testing.T) {
+func TestShutdownCancelsBlockedOperation(t *testing.T) {
+	oldTimeout := shutdownTimeout
+	shutdownTimeout = 100 * time.Millisecond
+	defer func() { shutdownTimeout = oldTimeout }()
 	c := newTestCoordinator(t, 2, 0)
-	c.sched.signalShutdown(errSchedulerClosed)
 	stuck, _ := blockingRead(t)
-	tickets, _ := acceptOps(c, ReadOp(stuck, make([]byte, 8), 0))
+	completed := false
+	op := ReadOp(stuck, make([]byte, 8), 0)
+	op.whenDone = func(_ int, err error) {
+		require.ErrorIs(t, err, errSchedulerClosed)
+		completed = true
+	}
+	tickets, _ := acceptOps(c, op)
 	c.placeReady(false)
 	require.NoError(t, c.enter(0))
 
-	drained := make(chan error, 1)
-	go func() { drained <- c.waitForInflight() }()
-	select {
-	case <-drained:
-		t.Fatal("drain returned before the final completion")
-	case <-time.After(20 * time.Millisecond):
-	}
+	start := time.Now()
+	require.NoError(t, c.shutdown(errSchedulerClosed))
+	require.Less(t, time.Since(start), time.Second)
+	_, err := tickets[0].Wait()
+	require.ErrorIs(t, err, errSchedulerClosed)
+	require.True(t, completed, "cancellation completion must release the caller's resources")
+	require.Zero(t, c.accepted.len)
+	require.Zero(t, c.occupied)
+}
 
-	// CancelAll is the one Ring call that may overlap the drain's wait.
-	require.NoError(t, c.ring.CancelAll(shutdownCancelTimeout))
-	select {
-	case err := <-drained:
+func TestShutdownDrainsStagedFileGenerationsInOrder(t *testing.T) {
+	c := newTestCoordinator(t, 4, 1)
+	f := testFile(t, 2)
+	var tickets []Ticket
+	for _, op := range []Op{
+		VOpenatOp(unix.AT_FDCWD, f.Name(), os.O_WRONLY, 0, 0).Link(VWriteOp(0, []byte("a"), 0)),
+		VCloseOp(0),
+		VOpenatOp(unix.AT_FDCWD, f.Name(), os.O_WRONLY, 0, 0).Link(VWriteOp(0, []byte("b"), 1)),
+		VCloseOp(0),
+	} {
+		work, ticket := newSubmission(op, int32(op.opCount()))
+		require.True(t, c.sched.tryPush(work))
+		tickets = append(tickets, ticket)
+	}
+	require.NoError(t, c.shutdown(errSchedulerClosed))
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
 		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("drain did not return after the final completion")
 	}
-	if _, err := tickets[0].Wait(); !errors.Is(err, errSchedulerClosed) {
-		t.Fatalf("ticket error: got %v want %v", err, errSchedulerClosed)
-	}
-	if c.accepted.len != 0 || c.occupied != 0 {
-		t.Fatalf("coordinator retained drained work: pending=%d placed=%d", c.accepted.len, c.occupied)
-	}
+	got := make([]byte, 2)
+	_, err := f.ReadAt(got, 0)
+	require.NoError(t, err)
+	require.Equal(t, "ab", string(got))
 }
 
 func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
@@ -887,7 +889,7 @@ func TestBudgetChargesCoalescedRun(t *testing.T) {
 	_, handles := acceptOps(c, ops...)
 	placed, _ := c.placeReady(true)
 	require.Equal(t, 1, placed)
-	require.Equal(t, 4*handles[0].cost, c.inFlightCost[classWrite])
+	require.Equal(t, 4*handles[0].cost[classWrite], c.inFlightCost[classWrite])
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	require.Zero(t, c.inFlightCost[classWrite])
 }
@@ -910,4 +912,107 @@ func TestNewURingSchedulerValidatesBudget(t *testing.T) {
 	s, err := NewURingScheduler(WithoutIOBudget())
 	require.NoError(t, err)
 	require.NoError(t, s.Close())
+}
+
+func TestBudgetLimitsMergedWritesAndPreservesOversizedProgress(t *testing.T) {
+	for _, size := range []int{512 << 10, 1 << 20, 2 << 20} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			c := withDefaultBudget(newTestCoordinator(t, 16, 0))
+			f := testFile(t, 4*size)
+			var ops []Op
+			for i := range 4 {
+				ops = append(ops, WriteOp(f, make([]byte, size), int64(i*size)))
+			}
+			tickets, handles := acceptOps(c, ops...)
+			for c.accepted.len != 0 {
+				c.placeReady(true)
+				require.Positive(t, c.occupied, "an oversized record must make progress")
+				issued := 0
+				for _, w := range handles {
+					if w.state == workIssued {
+						issued++
+					}
+				}
+				if handles[0].cost[classWrite] > int64(DefaultLatencyGoal) {
+					require.Equal(t, 1, issued, "only one oversized record may bypass the budget")
+				} else {
+					require.LessOrEqual(t, c.inFlightCost[classWrite], int64(DefaultLatencyGoal), "coalescing exceeded the budget")
+				}
+				submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+			}
+			for _, ticket := range tickets {
+				_, err := ticket.Wait()
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestBudgetChargesOpenFollowersUntilTheirCompletion(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 1))
+	_, works := acceptOps(c,
+		VOpenatOp(0, "unused", 0, 0, 0).Link(VWriteOp(0, make([]byte, 1<<20), 0)),
+		VWriteOp(0, make([]byte, 1<<20), 1<<20),
+	)
+	require.Positive(t, works[0].cost[classWrite])
+	c.take(works[0]) // model CQEs without accessing the fake path
+	completeForTest(c, works[0], 0, 0, nil)
+	require.Positive(t, c.inFlightCost[classWrite], "open CQE released its follower's write charge")
+	completeForTest(c, works[0], 1, 1<<20, nil)
+	require.Zero(t, c.inFlightCost[classWrite])
+	completeForTest(c, works[1], 0, 1<<20, nil)
+}
+
+func TestVirtualGenerationsQueueBehindClose(t *testing.T) {
+	c := newTestCoordinator(t, 16, 1)
+	var ops []Op
+	for range 3 {
+		ops = append(ops, VOpenatOp(0, "unused", 0, 0, 0),
+			VWriteOp(0, make([]byte, 1), 0),
+			VCloseOp(0))
+	}
+	tickets, works := acceptOps(c, ops...)
+	require.Len(t, works, len(ops), "a queued reopen was rejected")
+	for i := range works {
+		require.Equal(t, workReady, works[i].state, "next operation %d", i)
+		for _, later := range works[i+1:] {
+			require.Equal(t, workWaiting, later.state)
+		}
+		completeForTest(c, works[i], 0, 1, nil)
+	}
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	require.Len(t, c.files.free, 2, "old generations should be reusable")
+}
+
+func TestQueuedOpenWriteCloseChainsKeepGenerationsSeparate(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 1))
+	var ops []Op
+	for range 3 {
+		ops = append(ops, VOpenatOp(0, "unused", 0, 0, 0).Link(
+			VWriteOp(0, make([]byte, 4096), 0), VCloseOp(0)))
+	}
+	tickets, works := acceptOps(c, ops...)
+	require.Len(t, works, 3)
+	for i, work := range works {
+		require.Equal(t, workReady, work.state)
+		completeForTest(c, work, 0, 0, nil)
+		completeForTest(c, work, 1, 4096, nil)
+		if i+1 < len(works) {
+			require.Equal(t, workWaiting, works[i+1].state)
+		}
+		completeForTest(c, work, 2, 0, nil)
+	}
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+}
+
+func TestShutdownReportsCoordinatorFailure(t *testing.T) {
+	c := newTestCoordinator(t, 2, 0)
+	cause := errors.New("ring failed")
+	require.ErrorIs(t, c.shutdown(cause), cause)
 }

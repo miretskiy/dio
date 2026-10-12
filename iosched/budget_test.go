@@ -27,8 +27,6 @@ func TestBudgetCost(t *testing.T) {
 		{"1 MiB write", WriteOp(f, mib, 0), classWrite, 859488},
 		{"1 MiB fixed write", WriteFixedOp(f, mib, 0), classWrite, 859488},
 		{"fdatasync", FdatasyncOp(f), classOther, 0},
-		{"chain costs its first operation", WriteOp(f, mib, 0).Link(ReadOp(f, mib, 0)), classWrite, 859488},
-		{"chain led by an unbudgeted operation", FdatasyncOp(f).Link(WriteOp(f, mib, 0)), classOther, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			class, cost := b.cost(&tc.op)
@@ -60,4 +58,15 @@ func TestBudgetOptions(t *testing.T) {
 	for _, opt := range []Option{WithLatencyGoal(0), WithReadIOPS(0), WithWriteBandwidth(-1)} {
 		require.Error(t, makeSchedulerConfig([]Option{opt}).budget.validate())
 	}
+}
+
+func TestBudgetChargesAllChainData(t *testing.T) {
+	b := defaultBudget()
+	f := new(os.File)
+	data := make([]byte, 1<<20)
+	op := VOpenatOp(0, "file", 0, 0, 0).Link(
+		VWriteOp(0, data, 0), ReadOp(f, data, 0), VWriteOp(0, data, 1<<20))
+	costs := b.costs(&op)
+	require.Equal(t, int64(409600), costs[classRead])
+	require.Equal(t, int64(2*859488), costs[classWrite])
 }

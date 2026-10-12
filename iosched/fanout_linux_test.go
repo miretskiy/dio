@@ -27,8 +27,8 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
-	"github.com/miretskiy/dio/v2/mempool"
 	"github.com/miretskiy/dio/v2/sys"
 )
 
@@ -173,7 +173,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 	ff := setupFanout(b)
 
 	// 1 GiB slab, 1 MiB slots.  Size is a 2 MiB multiple → MAP_HUGETLB attempted.
-	pool, err := mempool.NewSlabPool(1<<30, fanoutChunk)
+	pool, err := alloc.NewSlabPool(1<<30, fanoutChunk)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -201,40 +201,40 @@ func BenchmarkFanout_URing(b *testing.B) {
 	for i := range b.N {
 		offset := int64(i%fanoutNumChunks) * fanoutChunk
 
-		slot, err := pool.Acquire()
+		slot, err := pool.TryAcquire()
 		if err != nil {
 			b.Fatalf("acquire slot: %v", err)
 		}
 
 		// Fixed read.
-		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Data, offset))
+		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Bytes(), offset))
 		if err != nil {
-			slot.Release()
+			slot.Unpin()
 			b.Fatalf("submit read: %v", err)
 		}
 		if _, rerr := readTicket.Wait(); rerr != nil {
-			slot.Release()
+			slot.Unpin()
 			b.Fatalf("read at %d: %v", offset, rerr)
 		}
 
 		// Fan-out: submit all sinks before waiting, allowing the coordinator
 		// to place them in the same ring wave.
 		for si := range fanoutNumSinks {
-			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Data, offset))
+			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Bytes(), offset))
 			if err != nil {
-				slot.Release()
+				slot.Unpin()
 				b.Fatalf("submit write sink%d: %v", si+1, err)
 			}
 			writeTickets[si] = writeTicket
 		}
 		for si := range fanoutNumSinks {
 			if _, werr := writeTickets[si].Wait(); werr != nil {
-				slot.Release()
+				slot.Unpin()
 				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}
 		}
 
-		slot.Release()
+		slot.Unpin()
 	}
 	b.StopTimer()
 }

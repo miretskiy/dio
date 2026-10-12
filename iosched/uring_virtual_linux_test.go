@@ -355,3 +355,31 @@ func TestURing_ReplaceSlotWhileBusy(t *testing.T) {
 	_, err = submitOne(t, s, iosched.VCloseOp(vfd))
 	require.NoError(t, err)
 }
+
+func TestURing_QueuedSlotReuseWithoutWaiting(t *testing.T) {
+	s := newVURingSched(t, iosched.WithRingDepth(32), iosched.WithVFiles(1))
+	dir := t.TempDir()
+	var tickets []iosched.Ticket
+	for i := range 48 {
+		path := filepath.Join(dir, fmt.Sprint(i))
+		data := []byte(fmt.Sprintf("generation %d", i))
+		for _, op := range []iosched.Op{
+			iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, 0),
+			iosched.VWriteOp(0, data, 0),
+			iosched.VCloseOp(0),
+		} {
+			ticket, err := s.Submit(op)
+			require.NoError(t, err)
+			tickets = append(tickets, ticket)
+		}
+	}
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	for i := range 48 {
+		got, err := os.ReadFile(filepath.Join(dir, fmt.Sprint(i)))
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("generation %d", i), string(got))
+	}
+}

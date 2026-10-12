@@ -3,8 +3,8 @@ package intrusive
 import "iter"
 
 // FixedList is a fixed-capacity List whose values remain in stable storage.
-// Removed values are retained for reuse; callers must clear live references
-// before Remove.
+// Removed values are retained for reuse; callers must clear references they
+// no longer need.
 type FixedList[T any] struct {
 	list List[T]
 }
@@ -87,6 +87,19 @@ func (l *FixedList[T]) Prev(handle Handle) (Handle, bool) {
 // during iteration; other mutations are unsupported.
 func (l *FixedList[T]) All() iter.Seq2[Handle, *T] {
 	return l.list.All()
+}
+
+// AllSlots yields every slot in storage order, including free slots and their
+// retained values. Indices are storage positions, not handles. Values may be
+// modified through the returned pointers; slot occupancy is unchanged.
+func (l *FixedList[T]) AllSlots() iter.Seq2[int, *T] {
+	return func(yield func(int, *T) bool) {
+		for i := range l.list.nodes {
+			if !yield(i, &l.list.nodes[i].value) {
+				return
+			}
+		}
+	}
 }
 
 // Len returns the number of occupied slots in l.

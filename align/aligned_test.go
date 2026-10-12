@@ -1,9 +1,11 @@
 package align
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // ─── PageAlign ───────────────────────────────────────────────────────────────
@@ -25,6 +27,41 @@ func TestPageAlign(t *testing.T) {
 	for _, tt := range tests {
 		require.Equal(t, tt.want, PageAlign(tt.in), "PageAlign(%d)", tt.in)
 	}
+}
+
+func TestAllocAligned(t *testing.T) {
+	for _, size := range []int64{-1, 0, math.MaxInt64, int64(math.MaxInt)} {
+		require.Panics(t, func() { AllocAligned(size) })
+	}
+	buf := AllocAligned(4097)
+	defer FreeAligned(buf)
+	require.Len(t, buf, 8192)
+	require.True(t, IsAligned(buf))
+}
+
+func TestFreeAlignedZeroLengthMapping(t *testing.T) {
+	buf := AllocAligned(4096)
+	FreeAligned(buf[:0])
+	// unix tracks its mappings: a second unmap fails if FreeAligned released it.
+	require.Error(t, unix.Munmap(buf))
+}
+
+func TestGrowAlignedPreservesDataAndFailureOwnership(t *testing.T) {
+	buf := AllocAligned(4096)
+	copy(buf, "contents")
+	require.Panics(t, func() { GrowAligned(buf, math.MaxInt64) })
+	require.Equal(t, "contents", string(buf[:8]))
+	grown := GrowAligned(buf, 8192)
+	defer FreeAligned(grown)
+	require.Equal(t, "contents", string(grown[:8]))
+	require.Error(t, unix.Munmap(buf))
+}
+
+func TestGrowAlignedReleasesEmptyMapping(t *testing.T) {
+	buf := AllocAligned(4096)
+	grown := GrowAligned(buf[:0], 8192)
+	defer FreeAligned(grown)
+	require.Error(t, unix.Munmap(buf))
 }
 
 // ─── IsAligned ───────────────────────────────────────────────────────────────
@@ -98,7 +135,7 @@ func TestAllocAligned_SizeRoundsUp(t *testing.T) {
 		{16385, 20480},
 	}
 	for _, tt := range tests {
-		buf := AllocAligned(tt.request)
+		buf := AllocAligned(int64(tt.request))
 		require.Equal(t, tt.wantLen, len(buf),
 			"AllocAligned(%d): want len %d", tt.request, tt.wantLen)
 		require.True(t, IsAligned(buf),
@@ -186,8 +223,8 @@ func TestGrowAligned_NilBuf(t *testing.T) {
 func TestGrowAligned_ExactPageMultiple(t *testing.T) {
 	cases := []int{4096, 8192, 16384, 1 << 20}
 	for _, n := range cases {
-		buf := AllocAligned(n)
-		result := GrowAligned(buf[:0], n)
+		buf := AllocAligned(int64(n))
+		result := GrowAligned(buf[:0], int64(n))
 		require.Equal(t, n, len(result), "GrowAligned(buf, %d)", n)
 		require.True(t, IsAligned(result))
 		FreeAligned(result)

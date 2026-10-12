@@ -373,9 +373,11 @@ func (o *Op) prepareSubmission() Ticket {
 }
 
 // SubmitNotify submits op to s, like s.Submit, and has whenDone called with
-// the result when the returned Ticket completes, exactly once. If Submit fails,
-// whenDone is not called. Because whenDone travels with op, it survives any
-// wrapper that forwards op to the scheduler it wraps.
+// the result after completion. If Submit fails, whenDone is not called. A forced
+// shutdown that cannot reap an operation also leaves its callback uncalled:
+// its operands may still be in use. Ticket.Wait and Close report the shutdown
+// error. Because whenDone travels with op, it survives any wrapper that forwards
+// op to the scheduler it wraps.
 //
 // whenDone runs on the goroutine that completes the Ticket, after Done is
 // closed. For URingScheduler that is the coordinator, which issues and reaps

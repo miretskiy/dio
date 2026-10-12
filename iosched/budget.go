@@ -65,9 +65,7 @@ func defaultBudget() ioBudget {
 	}
 }
 
-// cost returns op's class and its cost in nanoseconds of its class's device
-// time. A linked chain is charged as its first operation alone: chains are
-// rare, and exact accounting would not change how they are placed.
+// cost returns one operation's class and estimated device time in nanoseconds.
 func (b *ioBudget) cost(op *Op) (ioClass, int64) {
 	class := classOf(op)
 	if b.goal <= 0 || class == classOther {
@@ -77,4 +75,16 @@ func (b *ioBudget) cost(op *Op) (ioClass, int64) {
 	byBytes := int64(float64(opBytes(op)) * 1e9 / float64(limits.bandwidth))
 	byOps := int64(time.Second) / limits.iops
 	return class, max(byBytes, byOps)
+}
+
+// costs charges every data operation, including followers of an open. A chain
+// is admitted whole; each operation returns its charge when its CQE arrives.
+func (b *ioBudget) costs(root *Op) (costs [budgetedClasses]int64) {
+	for op := root; op != nil; op = op.linked {
+		class, cost := b.cost(op)
+		if class != classOther {
+			costs[class] += cost
+		}
+	}
+	return
 }
