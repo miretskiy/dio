@@ -389,29 +389,32 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 	require.Error(t, err)
 }
 
-func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, *alloc.SlabPool) {
+func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, []*alloc.Buffer) {
 	t.Helper()
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	pool, err := alloc.NewSlabPool(align.HugepageSize, align.BlockSize)
+	allocator, err := alloc.NewSlabAllocator(align.HugepageSize)
 	require.NoError(t, err)
+	t.Cleanup(allocator.Close)
+	buffers := make([]*alloc.Buffer, 8)
+	for i := range buffers {
+		buffers[i], err = allocator.TryAcquire(4096)
+		require.NoError(t, err)
+		t.Cleanup(buffers[i].Unpin)
+	}
 	s, err := iosched.NewURingScheduler(
 		iosched.WithRingDepth(64),
-		iosched.WithDMASlab(pool),
+		iosched.WithDMABuffers(buffers...),
 	)
 	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		require.NoError(t, s.Close())
-		pool.Close()
-	})
-	return s, pool
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	return s, buffers
 }
 
 func TestURing_FixedOp_WriteRead(t *testing.T) {
 	t.Skip()
-	s, pool := newRegisteredURingSched(t)
+	s, buffers := newRegisteredURingSched(t)
 
 	path := filepath.Join(t.TempDir(), "fixed.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
@@ -420,46 +423,41 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 	payload := make([]byte, align.BlockSize)
 	_, _ = rand.Read(payload)
 
-	wslot, err := pool.TryAcquire()
-	require.NoError(t, err)
-	copy(wslot.Bytes(), payload)
+	wslot := buffers[0]
+	copy(wslot.Chunks()[0], payload)
 
-	n, err := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Bytes(), 0))
+	n, err := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Chunks()[0], 0))
 	require.NoError(t, err)
 	require.Equal(t, align.BlockSize, n)
-	wslot.Unpin()
 
-	rslot, err := pool.TryAcquire()
-	require.NoError(t, err)
+	rslot := buffers[1]
 
-	n, err = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Bytes(), 0))
+	n, err = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Chunks()[0], 0))
 	require.NoError(t, err)
 	require.Equal(t, align.BlockSize, n)
-	require.Equal(t, payload, rslot.Bytes())
-	rslot.Unpin()
+	require.Equal(t, payload, rslot.Chunks()[0])
 }
 
 func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 	t.Skip()
 	const chunks = 8
-	s, pool := newRegisteredURingSched(t)
+	s, buffers := newRegisteredURingSched(t)
 
 	path := filepath.Join(t.TempDir(), "fixed_multi.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, chunks*align.BlockSize), 0644))
 	f := openRW(t, path)
 
 	payloads := make([][]byte, chunks)
-	slots := make([]*alloc.Buffer, chunks)
+	slots := buffers[:chunks]
 	tickets := make([]iosched.Ticket, chunks)
 
 	for i := range chunks {
 		payloads[i] = make([]byte, align.BlockSize)
 		_, _ = rand.Read(payloads[i])
 
-		slots[i], _ = pool.TryAcquire()
-		copy(slots[i].Bytes(), payloads[i])
+		copy(slots[i].Chunks()[0], payloads[i])
 
-		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Bytes(), int64(i*align.BlockSize)))
+		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Chunks()[0], int64(i*align.BlockSize)))
 		require.NoError(t, err)
 		tickets[i] = ticket
 	}
@@ -467,7 +465,6 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 	for i, ticket := range tickets {
 		_, err := ticket.Wait()
 		require.NoError(t, err, "chunk %d write failed", i)
-		slots[i].Unpin()
 	}
 
 	for i := range chunks {
@@ -481,19 +478,19 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	s := newURingSched(t)
 
-	pool, err := alloc.NewSlabPool(align.HugepageSize, align.BlockSize)
+	allocator, err := alloc.NewSlabAllocator(align.HugepageSize)
 	require.NoError(t, err)
-	defer pool.Close()
+	defer allocator.Close()
 
 	path := filepath.Join(t.TempDir(), "noreg.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
 	f := openRW(t, path)
 
-	slot, err := pool.TryAcquire()
+	slot, err := allocator.TryAcquire(4096)
 	require.NoError(t, err)
 	defer slot.Unpin()
 
-	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Bytes(), 0))
+	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Chunks()[0], 0))
 	require.Error(t, err)
 	t.Logf("validation error for unregistered fixed op: %v", err)
 }

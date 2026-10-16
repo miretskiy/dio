@@ -39,9 +39,9 @@ func TestAllocAligned(t *testing.T) {
 	require.True(t, IsAligned(buf))
 }
 
-func TestFreeAlignedZeroLengthMapping(t *testing.T) {
+func TestFreeAlignedReleasesMapping(t *testing.T) {
 	buf := AllocAligned(4096)
-	FreeAligned(buf[:0])
+	FreeAligned(buf)
 	// unix tracks its mappings: a second unmap fails if FreeAligned released it.
 	require.Error(t, unix.Munmap(buf))
 }
@@ -147,6 +147,7 @@ func TestAllocAligned_SizeRoundsUp(t *testing.T) {
 func TestAllocAligned_DataIsWritable(t *testing.T) {
 	buf := AllocAligned(8192)
 	defer FreeAligned(buf)
+	Warmup(buf, BlockSize)
 	// Write a recognisable pattern and read it back.
 	for i := range buf {
 		buf[i] = byte(i % 251)
@@ -154,12 +155,6 @@ func TestAllocAligned_DataIsWritable(t *testing.T) {
 	for i := range buf {
 		require.Equal(t, byte(i%251), buf[i], "byte %d mismatch", i)
 	}
-}
-
-func TestFreeAligned_EmptyIsNoOp(t *testing.T) {
-	// Must not panic.
-	FreeAligned(nil)
-	FreeAligned([]byte{})
 }
 
 // ─── GrowAligned ─────────────────────────────────────────────────────────────
@@ -210,14 +205,6 @@ func TestGrowAligned_AllocatesNewWhenTooSmall(t *testing.T) {
 	// Backing array must differ from the freed one.
 	// (We can't dereference old, but we can compare the addresses if
 	// the allocator happened to return the same page — that's fine too.)
-}
-
-func TestGrowAligned_NilBuf(t *testing.T) {
-	// A nil buf (len=0) should always allocate.
-	result := GrowAligned(nil, 1)
-	defer FreeAligned(result)
-	require.Equal(t, 4096, len(result))
-	require.True(t, IsAligned(result))
 }
 
 func TestGrowAligned_ExactPageMultiple(t *testing.T) {

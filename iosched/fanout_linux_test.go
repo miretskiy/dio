@@ -163,7 +163,7 @@ func BenchmarkFanout_Naive(b *testing.B) {
 // ── io_uring: registered fixed buffers ───────────────────────────────────────
 
 // BenchmarkFanout_URing copies one 1 MiB chunk per iteration using io_uring:
-//  1. IORING_OP_READ_FIXED into a registered slab slot.
+//  1. IORING_OP_READ_FIXED into a registered staging buffer.
 //  2. Three IORING_OP_WRITE_FIXED submitted as independent ops (parallel).
 func BenchmarkFanout_URing(b *testing.B) {
 	if !iosched.IOUringAvailable {
@@ -172,25 +172,20 @@ func BenchmarkFanout_URing(b *testing.B) {
 
 	ff := setupFanout(b)
 
-	// 1 GiB slab, 1 MiB slots.  Size is a 2 MiB multiple → MAP_HUGETLB attempted.
-	pool, err := alloc.NewSlabPool(1<<30, fanoutChunk)
-	if err != nil {
-		b.Fatal(err)
-	}
-
+	// The caller keeps one staging buffer registered through scheduler shutdown.
+	slot := alloc.NewBuffer(fanoutChunk)
+	defer slot.Unpin()
 	sched, err := iosched.NewURingScheduler(
 		iosched.WithRingDepth(256),
-		iosched.WithDMASlab(pool),
+		iosched.WithDMABuffers(slot),
 	)
 	if err != nil {
-		pool.Close()
 		b.Fatal(err)
 	}
 	defer func() {
 		if err := sched.Close(); err != nil {
 			b.Errorf("close io_uring scheduler: %v", err)
 		}
-		pool.Close()
 	}()
 
 	writeTickets := make([]iosched.Ticket, fanoutNumSinks)
@@ -201,40 +196,29 @@ func BenchmarkFanout_URing(b *testing.B) {
 	for i := range b.N {
 		offset := int64(i%fanoutNumChunks) * fanoutChunk
 
-		slot, err := pool.TryAcquire()
-		if err != nil {
-			b.Fatalf("acquire slot: %v", err)
-		}
-
 		// Fixed read.
-		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Bytes(), offset))
+		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Chunks()[0], offset))
 		if err != nil {
-			slot.Unpin()
 			b.Fatalf("submit read: %v", err)
 		}
 		if _, rerr := readTicket.Wait(); rerr != nil {
-			slot.Unpin()
 			b.Fatalf("read at %d: %v", offset, rerr)
 		}
 
 		// Fan-out: submit all sinks before waiting, allowing the coordinator
 		// to place them in the same ring wave.
 		for si := range fanoutNumSinks {
-			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Bytes(), offset))
+			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Chunks()[0], offset))
 			if err != nil {
-				slot.Unpin()
 				b.Fatalf("submit write sink%d: %v", si+1, err)
 			}
 			writeTickets[si] = writeTicket
 		}
 		for si := range fanoutNumSinks {
 			if _, werr := writeTickets[si].Wait(); werr != nil {
-				slot.Unpin()
 				b.Fatalf("write sink%d at %d: %v", si+1, offset, werr)
 			}
 		}
-
-		slot.Unpin()
 	}
 	b.StopTimer()
 }

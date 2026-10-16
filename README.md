@@ -7,7 +7,7 @@ the final completion. For applications that want scheduling rather than direct
 ring control, `iosched` provides a higher-level operation and ticket API with
 io_uring and synchronous POSIX backends.
 
-The supporting packages provide aligned memory, fixed-size buffer pools,
+The supporting packages provide aligned memory, fixed-size buffer allocators,
 portable file operations, and a targeted TLS read-buffer optimization.
 
 The module requires Go 1.25.11 or newer. The `align`, `alloc`, `sys`, and POSIX
@@ -33,7 +33,7 @@ Version 2 adds `/v2` to every import path. It replaces the raw `giouring`
 package with `ringo`, whose ownership-oriented API is intentionally not a
 drop-in replacement. Existing `align`, `sys`, `netbuf`, and
 `iosched` imports must also include `/v2`. The former `mempool` package is
-now `alloc`; its pools return owned `*alloc.Buffer` values.
+now `alloc`; its allocators return owned `*alloc.Buffer` values.
 
 ## Packages
 
@@ -42,7 +42,7 @@ now `alloc`; its pools return owned `*alloc.Buffer` values.
 | [`ringo`](https://pkg.go.dev/github.com/miretskiy/dio/v2/ringo) | Lifetime-safe low-level io_uring operations and resource ownership |
 | [`iosched`](https://pkg.go.dev/github.com/miretskiy/dio/v2/iosched) | A common operation/ticket API over POSIX and io_uring |
 | [`align`](https://pkg.go.dev/github.com/miretskiy/dio/v2/align) | Page-aligned allocation and range arithmetic |
-| [`alloc`](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc) | Owned aligned buffers and bounded mmap/slab pools |
+| [`alloc`](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc) | Owned aligned buffers and extent and slab allocators |
 | [`sys`](https://pkg.go.dev/github.com/miretskiy/dio/v2/sys) | Portable file allocation, syncing, direct I/O, and hole punching |
 | [`netbuf`](https://pkg.go.dev/github.com/miretskiy/dio/v2/netbuf) | TLS read-buffer pre-sizing for golang/go#47672 |
 
@@ -106,101 +106,54 @@ _ = alignedLength
 `GrowAligned` preserves an allocation when it is already large enough and
 copies the contents into a larger mapping otherwise. `AllocAligned` and
 `GrowAligned` take `int64` sizes and panic on allocation failure.
-Mapped memory is not managed by the garbage collector and must be released with `FreeAligned`, passing the
-original base and capacity (a zero-length reslice is fine).
+Mapped memory is not managed by the garbage collector. Pass the original
+allocation to `FreeAligned` when finished.
 
-## Owned buffers and pools
+## Owned buffers and allocators
 
-`alloc.Buffer` owns a reference to aligned memory. `Bytes()` exposes a view;
-keep the reference alive through every use of that view, including pending I/O.
-`TryInc()` acquires another reference and `Unpin()` releases one. The last
-reference returns pooled memory or unmaps a standalone allocation. Released
-buffer objects cannot be pinned again, even after their storage is reused.
-Extra `Unpin` calls after release panic.
+`alloc` provides page-aligned buffers for direct I/O. Use `alloc.NewBuffer(size)`
+for a standalone allocation, or choose an allocator for reusable storage:
 
-`alloc.NewBuffer(size)` creates a standalone mapping. Allocation failures panic;
-there is no automatic fallback from an exhausted pool to standalone memory.
-Pool constructors return errors for invalid configuration.
+| Allocator | Purpose |
+| --- | --- |
+| `ExtentAllocator` | Borrow whole allocations from a bounded pool |
+| `SlabAllocator` | Subdivide one backing buffer into fixed-size chunks |
 
-`MmapPool` lends whole slabs with a fixed capacity. `Acquire(ctx)` waits for a
-slab or context cancellation; `TryAcquire()` returns `ErrExhausted` instead of
-waiting. Both return `ErrClosed` after shutdown.
-
-```go
-pool, err := alloc.NewMmapPool(1<<20, 32, alloc.WithLazyInitSlabs(32))
-if err != nil {
-    return err
-}
-defer pool.Close()
-
-buf, err := pool.Acquire(ctx)
-if err != nil {
-    return err
-}
-defer buf.Unpin()
-copy(buf.Bytes(), payload)
-```
-
-`WithLazyInitSlabs(n)` defers mapping up to n slabs. Returned mappings are reused
-before mapping unused slots. Pass `context.Background()` to wait indefinitely.
-Cancellation observed before reservation returns `ctx.Err()`; it does not
-interrupt mapping or revoke an acquired buffer.
-
-`SlabPool` divides a contiguous backing buffer into fixed-size slots. Its
-`TryAcquire()` returns an owned `*Buffer` or `ErrExhausted`; it never waits for
-another borrower. `NewSlabPool(totalSize, slotSize)` creates the backing memory.
-`NewSlabPoolFrom(backing, slotSize)` instead retains a reference to an existing
-`*Buffer`, including one acquired from a `MmapPool`. The caller keeps its own
-reference; closing the slab pool releases the pool's reference.
-
-A complete slab can be registered as one io_uring fixed buffer. `RawData()`
-provides a view for registration, not an allocation to free or a way to access
-borrowed slots.
+Both implement `Allocator`: `Acquire(ctx, size)` waits for capacity,
+`TryAcquire(size)` returns `ErrExhausted` when space is insufficient, and `Close()`
+releases retained storage. Backing is mapped up front; pages are committed on first use unless
+`WithWarmup()` is supplied. The slab allocator defaults to 4 KiB chunks;
+`WithChunkSize` changes the size. A slab can use an existing buffer via `WithBackingBuffer`.
+Requests round up to whole chunks or extents, returned together in one Buffer.
 
 ```go
-slab, err := alloc.NewSlabPool(64<<20, 1<<20)
-if err != nil {
-    return err
-}
-defer slab.Close()
-
-sched, err := iosched.NewURingScheduler(
-    iosched.WithRingDepth(256),
-    iosched.WithDMASlab(slab),
+allocator, err := alloc.NewSlabAllocator(
+    64<<20, // one 64 MiB slab
+    alloc.WithChunkSize(128<<10),
 )
 if err != nil {
     return err
 }
-defer sched.Close() // unregister before closing the slab
+defer allocator.Close()
 
-buf, err := slab.TryAcquire()
+buf, err := allocator.Acquire(ctx, 128<<10)
 if err != nil {
     return err
 }
 defer buf.Unpin()
-
-ticket, err := sched.Submit(iosched.WriteFixedOp(f, buf.Bytes(), offset))
-if err != nil {
-    return err
-}
-_, err = ticket.Wait() // finish I/O before Unpin or reuse
+copy(buf.Chunks()[0], payload)
 ```
 
-Pools must outlive their acquired buffers. Finish acquisitions and `Unpin`
-calls before `Close`; shutdown must not race pool use. Close a registered
-scheduler before its slab pool, and a slab pool before its backing mmap pool.
+Access memory through `Buffer.Chunks()`.
+Release buffers with `Unpin()` after use, including pending I/O.
+`TryInc()` retains a reference when sharing a buffer.
+Return all acquired buffers before closing their allocator. See the
+[`alloc` API documentation](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc)
+for configuration and ownership details.
 
-Streaming writers belong to the caller. Reuse a bounded number of buffers after
-their I/O completes instead of accumulating an entire stream in memory. A cache
-can retain a buffer reference for a resident value while readers hold their own
-references. Synchronize lookup-and-pin with removal; remove an entry before
-dropping the cache reference. Allocation does not decide cache admission or
-whether an entry is still current.
-
-The former `MmapBuffer` is now `alloc.Buffer`, constructed by `alloc.NewBuffer`
-or pool acquisition. `NewBorrowedBuffer`, `AlignedBuffer`, the `Allocator`
-interface, and raw-slice `Alloc`/`Free` pool APIs are removed. `SlabPool.Acquire`
-is now `TryAcquire`; `NewSlabPoolFrom` takes an owned buffer rather than a slice.
+For fixed-buffer I/O, pass single-chunk buffers to the scheduler with
+`iosched.WithDMABuffers(buffers...)`. The caller obtains these buffers and keeps
+them alive until the scheduler closes.
 
 ## File operations
 

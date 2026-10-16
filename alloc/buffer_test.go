@@ -8,6 +8,7 @@ import (
 
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestBufferBounds(t *testing.T) {
@@ -15,9 +16,9 @@ func TestBufferBounds(t *testing.T) {
 	defer align.FreeAligned(data)
 	b := newBuffer(data[:4096], func() {})
 	defer b.Unpin()
-	require.Equal(t, 4096, b.Cap())
-	require.Equal(t, 4096, cap(b.Bytes()))
-	require.Panics(t, func() { _ = b.Bytes()[:8192] })
+	require.Equal(t, 4096, len(b.Chunks()[0]))
+	require.Equal(t, 4096, cap(b.Chunks()[0]))
+	require.Panics(t, func() { _ = b.Chunks()[0][:8192] })
 }
 
 func TestBufferLastReferenceReleasesExactlyOnce(t *testing.T) {
@@ -75,9 +76,11 @@ func TestBufferRefcountOverflow(t *testing.T) {
 
 func TestNewBuffer(t *testing.T) {
 	b := NewBuffer(4097)
-	require.Equal(t, 8192, b.Cap())
-	require.True(t, align.IsAligned(b.Bytes()))
+	require.Equal(t, 8192, len(b.Chunks()[0]))
+	require.True(t, align.IsAligned(b.Chunks()[0]))
+	data := b.Chunks()[0]
 	b.Unpin()
+	require.Error(t, unix.Munmap(data), "the pool must have unmapped the allocation")
 	require.False(t, b.TryInc())
 	for _, size := range []int64{-1, 0, math.MaxInt64} {
 		require.Panics(t, func() { NewBuffer(size) })
@@ -89,9 +92,9 @@ func TestNewBuffer(t *testing.T) {
 func TestCacheEvictionWithExistingReader(t *testing.T) {
 	data := align.AllocAligned(4096)
 	defer align.FreeAligned(data)
-	var released atomic.Bool
+	var releases atomic.Int32
 	var mu sync.Mutex
-	entry := newBuffer(data, func() { released.Store(true) })
+	entry := newBuffer(data, func() { releases.Add(1) })
 	lookup := func() *Buffer {
 		mu.Lock()
 		defer mu.Unlock()
@@ -108,8 +111,8 @@ func TestCacheEvictionWithExistingReader(t *testing.T) {
 	mu.Unlock()
 	evicted.Unpin()
 	require.Nil(t, lookup())
-	require.False(t, released.Load())
-	reader.Bytes()[0] = 42
+	require.Zero(t, releases.Load())
+	reader.Chunks()[0][0] = 42
 	reader.Unpin()
-	require.True(t, released.Load())
+	require.EqualValues(t, 1, releases.Load())
 }

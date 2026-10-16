@@ -2,6 +2,7 @@ package iosched
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/miretskiy/dio/v2/alloc"
@@ -15,8 +16,7 @@ type schedulerConfig struct {
 	sqPoll         bool
 	vfiles         uint32
 	coalescing     bool
-	dmaPool        *alloc.SlabPool
-	dmaPoolSet     bool
+	dmaBuffers     []*alloc.Buffer
 	budget         ioBudget
 }
 
@@ -83,14 +83,18 @@ func WithCoalescing(enabled bool) Option {
 	return optionFunc(func(c *schedulerConfig) { c.coalescing = enabled })
 }
 
-// WithDMASlab registers pool as one fixed buffer before the io_uring
-// coordinator starts. The scheduler retains pool until Close returns; callers
-// must release all pool slots and close the scheduler before closing pool. The
-// POSIX fallback ignores this option.
-func WithDMASlab(pool *alloc.SlabPool) Option {
+// WithDMABuffers registers each supplied single-chunk Buffer as one fixed buffer
+// before the io_uring coordinator starts. The caller obtains the buffers and
+// must keep a reference to each until the scheduler has closed successfully,
+// including between I/O operations. The scheduler does not pin, unpin, or acquire buffers.
+//
+// The buffer list is copied. Repeated options replace the list; an empty list
+// disables registration. NewURingScheduler returns an error for multi-chunk buffers.
+// The POSIX fallback ignores this option.
+func WithDMABuffers(buffers ...*alloc.Buffer) Option {
+	buffers = slices.Clone(buffers)
 	return optionFunc(func(c *schedulerConfig) {
-		c.dmaPool = pool
-		c.dmaPoolSet = true
+		c.dmaBuffers = buffers
 	})
 }
 

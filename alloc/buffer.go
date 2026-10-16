@@ -11,20 +11,28 @@ import (
 // adds a reference; every reference must be released with Unpin. The last
 // reference returns the storage to its owner. A buffer must not be copied.
 type Buffer struct {
-	raw     []byte
+	inline  [1][]byte
+	chunks  [][]byte
 	refs    atomic.Int32
 	release func()
 }
 
 // newBuffer wraps a nonempty, aligned allocation with one reference.
-// release returns that allocation to its owner on the last Unpin.
 func newBuffer(data []byte, release func()) *Buffer {
-	b := &Buffer{raw: data[:len(data):len(data)], release: release}
+	b := &Buffer{release: release}
+	b.inline[0] = data[:len(data):len(data)]
+	b.chunks = b.inline[:]
 	b.refs.Store(1)
 	return b
 }
 
-// NewBuffer maps and prefaults at least size bytes, rounded up to a page.
+func newChunkBuffer(chunks [][]byte, release func()) *Buffer {
+	b := &Buffer{chunks: chunks, release: release}
+	b.refs.Store(1)
+	return b
+}
+
+// NewBuffer maps at least size bytes, rounded up to a page, without warming it.
 // The returned buffer owns one reference and unmaps its storage on the last
 // Unpin. Invalid sizes and mapping failures panic.
 func NewBuffer(size int64) *Buffer {
@@ -47,16 +55,15 @@ func (b *Buffer) TryInc() bool {
 	}
 }
 
-// Bytes returns the memory covered by this buffer. Hold a reference for as
-// long as the returned slice is in use, including pending I/O. The slice is a
-// view, not an independent allocation; release the reference with Unpin.
-func (b *Buffer) Bytes() []byte { return b.raw }
+// Chunks returns the memory covered by this buffer, which may be non-contiguous.
+// Hold a reference while using the chunks, including pending I/O. Their contents
+// may be changed; do not replace or reslice entries in the returned list.
+func (b *Buffer) Chunks() [][]byte {
+	return b.chunks
+}
 
-// Cap returns the number of bytes covered by this buffer.
-func (b *Buffer) Cap() int { return len(b.raw) }
-
-// Unpin releases one reference. The last reference invokes the release
-// callback exactly once. Calling Unpin after release is a programming error.
+// Unpin releases one reference. The last reference calls the allocation's
+// release function exactly once. Calling Unpin after release is a programming error.
 func (b *Buffer) Unpin() {
 	for {
 		n := b.refs.Load()

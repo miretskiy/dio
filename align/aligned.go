@@ -11,7 +11,6 @@ package align
 
 import (
 	"fmt"
-	"math"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -54,60 +53,45 @@ func AlignRange(offset int64, length int) (alignedOffset, alignedLength int64) {
 
 // AllocAligned allocates a page-aligned byte slice backed by anonymous mmap.
 //
-// The returned slice length is rounded up to the nearest [BlockSize] page;
-// callers needing exactly n bytes may reslice. Each page is pre-touched to
-// commit physical RAM, avoiding first-access page faults during I/O.
+// The returned slice length is rounded up to the nearest [BlockSize] page.
 //
 // On Linux, if the aligned size is an exact multiple of [HugepageSize] (2 MiB),
-// AllocAligned first attempts MAP_HUGETLB. If huge pages are unavailable
-// (ENOMEM — no pages reserved — or EOPNOTSUPP), it falls back to standard
-// 4 KiB pages transparently.
+// AllocAligned first attempts MAP_HUGETLB. If huge pages are unavailable,
+// it falls back to standard pages.
 //
 // WARNING: The buffer is NOT managed by the Go GC. The caller MUST call
 // [FreeAligned] when done to avoid a memory leak. Invalid sizes and mmap
 // failures panic.
 func AllocAligned(size int64) []byte {
-	if size <= 0 || size > int64(math.MaxInt)-BlockMask {
-		panic(fmt.Errorf("align: invalid allocation size %d", size))
-	}
 	alignedSize := int(PageAlign(size))
-	stdFlags := unix.MAP_ANON | unix.MAP_PRIVATE
-
+	flags := unix.MAP_ANON | unix.MAP_PRIVATE
 	if HugepageSupported && alignedSize%HugepageSize == 0 {
-		data, err := unix.Mmap(-1, 0, alignedSize,
-			unix.PROT_READ|unix.PROT_WRITE,
-			stdFlags|hugePageMmapExtraFlags)
-		if err == nil {
-			// Pre-warm with hugepage stride.
-			for i := 0; i < len(data); i += HugepageSize {
-				data[i] = 0
-			}
-			return data
-		}
-		// Hugepages unavailable; fall through to standard allocation below.
+		flags |= hugePageMmapExtraFlags
 	}
-
-	data, err := unix.Mmap(-1, 0, alignedSize,
-		unix.PROT_READ|unix.PROT_WRITE,
-		stdFlags)
+	data, err := unix.Mmap(-1, 0, alignedSize, unix.PROT_READ|unix.PROT_WRITE, flags)
+	if err != nil && flags&hugePageMmapExtraFlags != 0 {
+		data, err = unix.Mmap(-1, 0, alignedSize, unix.PROT_READ|unix.PROT_WRITE, flags&^hugePageMmapExtraFlags)
+	}
 	if err != nil {
 		panic(fmt.Errorf("align: mmap(%d bytes): %w", size, err))
-	}
-	// Pre-warm: touch each page to commit physical RAM.
-	for i := 0; i < len(data); i += BlockSize {
-		data[i] = 0
 	}
 	return data
 }
 
-// FreeAligned releases memory allocated by [AllocAligned].
-// Pass the original allocation, optionally resliced without changing its base
-// or capacity (including buf[:0]). The slice must not be used after this call.
-func FreeAligned(buf []byte) {
-	if cap(buf) == 0 {
-		return
+// Warmup zeroes one byte every stride bytes. Use the mapping's page size as
+// stride to fault in every page. Call before using the memory.
+func Warmup(data []byte, stride int) {
+	for i := 0; i < len(data); i += stride {
+		data[i] = 0
 	}
-	_ = unix.Munmap(buf[:cap(buf)])
+}
+
+// FreeAligned releases memory allocated by [AllocAligned].
+// You MUST pass the original allocation obtained from AllocAligned.
+func FreeAligned(buf []byte) {
+	if err := unix.Munmap(buf[:cap(buf)]); err != nil {
+		panic(fmt.Errorf("align: munmap failed: %w", err))
+	}
 }
 
 // GrowAligned grows an aligned buffer to at least newSize bytes.
@@ -118,9 +102,6 @@ func FreeAligned(buf []byte) {
 // and the old one freed. Allocation failure panics and leaves buf intact.
 // buf must satisfy the same ownership requirements as [FreeAligned].
 func GrowAligned(buf []byte, newSize int64) []byte {
-	if newSize < 0 || newSize > int64(math.MaxInt)-BlockMask {
-		panic("align: invalid growth size")
-	}
 	alignedSize := int(PageAlign(newSize))
 	if cap(buf) >= alignedSize {
 		return buf[:alignedSize]

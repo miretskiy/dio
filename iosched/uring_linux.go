@@ -13,7 +13,6 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/internal/buildutil"
 	"github.com/miretskiy/dio/v2/ringo"
 )
@@ -106,7 +105,6 @@ type URingScheduler struct {
 
 	ring              *ringo.Ring
 	fixedFiles        []ringo.FixedFile
-	registeredPool    *alloc.SlabPool
 	registeredBuffers *ringo.FixedBuffers
 	stagingHead       atomic.Pointer[submission]
 	done              chan struct{}
@@ -142,15 +140,18 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	if err := cfg.budget.validate(); err != nil {
 		return nil, err
 	}
-	if cfg.dmaPoolSet && cfg.dmaPool == nil {
-		return nil, errors.New("iosched: cannot register a nil DMA slab")
-	}
 	if cfg.coordinatorCPU < -1 {
 		return nil, fmt.Errorf("iosched: invalid coordinator CPU %d", cfg.coordinatorCPU)
 	}
-	dmaPool := cfg.dmaPool
-	cfg.dmaPool = nil
-	cfg.dmaPoolSet = false
+	data := make([][]byte, len(cfg.dmaBuffers))
+	for i, buffer := range cfg.dmaBuffers {
+		chunks := buffer.Chunks()
+		if len(chunks) > 1 {
+			return nil, fmt.Errorf("iosched: DMA buffer %d has %d chunks; expected one", i, len(chunks))
+		}
+		data[i] = chunks[0]
+	}
+	cfg.dmaBuffers = nil
 
 	ringOptions := []ringo.Option{ringo.WithDepth(cfg.ringDepth)}
 	if cfg.sqPoll {
@@ -195,12 +196,11 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 		wakeup:     make(chan struct{}, 1),
 		doorbellFD: doorbellFD,
 	}
-	if dmaPool != nil {
-		buffers, err := ring.RegisterBuffers(dmaPool.RawData())
+	if len(data) != 0 {
+		buffers, err := ring.RegisterBuffers(data...)
 		if err != nil {
 			return nil, abandon(fmt.Errorf("iosched: io_uring_register_buffers: %w", err))
 		}
-		s.registeredPool = dmaPool
 		s.registeredBuffers = buffers
 	}
 	go s.loop()
@@ -278,10 +278,10 @@ func (s *URingScheduler) validateFixedBuffers(root *Op) error {
 			continue
 		}
 		if s.registeredBuffers == nil {
-			return errors.New("iosched: fixed-buffer operation requires WithDMASlab")
+			return errors.New("iosched: fixed-buffer operation requires WithDMABuffers")
 		}
 		if _, err := s.registeredBuffers.Bind(op.buf); err != nil {
-			return fmt.Errorf("iosched: fixed buffer is outside the registered DMA slab: %w", err)
+			return fmt.Errorf("iosched: fixed buffer is outside the registered DMA buffers: %w", err)
 		}
 	}
 	return nil
@@ -330,7 +330,6 @@ func (s *URingScheduler) Close() error {
 	if ringErr != nil {
 		return err // Ringo retains resources still held by outstanding operations.
 	}
-	s.registeredPool = nil
 	s.registeredBuffers = nil
 	err = errors.Join(err, unix.Close(s.doorbellFD))
 	s.doorbellFD = -1
