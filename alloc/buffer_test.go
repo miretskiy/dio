@@ -125,3 +125,55 @@ func TestCacheEvictionWithExistingReader(t *testing.T) {
 	require.True(t, reader.Unpin(), "the final reference releases storage")
 	require.EqualValues(t, 1, releases.Load())
 }
+
+func TestBufferWrapRelease(t *testing.T) {
+	data := align.AllocAligned(4096)
+	defer align.FreeAligned(data)
+	var order []string
+	b := newBuffer(data, func() { order = append(order, "release") })
+	for _, name := range []string{"inner", "outer"} {
+		b.WrapRelease(func(release func()) func() {
+			return func() {
+				order = append(order, name+" before")
+				release()
+				order = append(order, name+" after")
+			}
+		})
+	}
+	require.Empty(t, order, "installation must not release storage")
+	require.True(t, b.TryInc())
+	require.False(t, b.Unpin())
+	require.Empty(t, order, "a borrower still holds the buffer")
+	require.True(t, b.Unpin())
+	require.Equal(t, []string{"outer before", "inner before", "release", "inner after", "outer after"}, order)
+	require.False(t, b.TryInc())
+	require.Panics(t, func() { b.Unpin() })
+	require.Len(t, order, 5, "neither callback is repeated after release")
+}
+
+func TestBufferWrapReleaseConcurrentUnpin(t *testing.T) {
+	data := align.AllocAligned(4096)
+	defer align.FreeAligned(data)
+	var releases, callbacks atomic.Int32
+	b := newBuffer(data, func() { releases.Add(1) })
+	b.WrapRelease(func(release func()) func() {
+		return func() {
+			release()
+			callbacks.Add(1)
+		}
+	})
+	for range 31 {
+		require.True(t, b.TryInc())
+	}
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			if b.Unpin() && (releases.Load() != 1 || callbacks.Load() != 1) {
+				t.Error("final Unpin returned before the entire release callback completed")
+			}
+		})
+	}
+	wg.Wait()
+	require.EqualValues(t, 1, releases.Load())
+	require.EqualValues(t, 1, callbacks.Load())
+}

@@ -150,6 +150,10 @@ Release buffers with `Unpin()` after use, including pending I/O. It returns
 its owner. Callers may ignore the result; method values used as `func()` callbacks
 need a wrapper such as `func() { buf.Unpin() }`.
 `TryInc()` retains a reference when sharing a buffer.
+`Buffer.WrapRelease` composes a callback around the existing final release.
+Install it before sharing the buffer, and call the original callback exactly
+once from the replacement. This lets allocator wrappers account for storage
+until the last borrower releases it without changing the underlying allocator.
 Both concrete allocators expose `Capacity()` and `Available()` byte snapshots.
 Free capacity excludes memory still pinned by readers, writers, or I/O after a
 cache has dropped its reference; it becomes available on the final release. Snapshots

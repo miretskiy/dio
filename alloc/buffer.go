@@ -68,6 +68,17 @@ func (b *Buffer) Chunks() [][]byte {
 	return b.chunks
 }
 
+// WrapRelease replaces the final-release callback with wrap's result. wrap is
+// called immediately with the current callback; its result runs on the last
+// Unpin and must call the original callback exactly once. Wrappers compose in
+// reverse installation order.
+//
+// Install wrappers before sharing the buffer. WrapRelease must not race other
+// buffer operations. It does not add a reference or allocate another Buffer.
+func (b *Buffer) WrapRelease(wrap func(release func()) func()) {
+	b.release = wrap(b.release)
+}
+
 // Unpin releases one reference and reports whether it was the last reference.
 // When true is returned, the allocation's release function has completed. Pooled
 // storage is reusable, but another acquisition may already have claimed it.
