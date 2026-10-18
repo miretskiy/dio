@@ -73,6 +73,7 @@ func TestAllocatorSizes(t *testing.T) {
 				require.NoError(t, err)
 				n := int((size-1)/chunk + 1)
 				require.Len(t, b.Chunks(), n)
+				require.EqualValues(t, n*chunk, b.Cap())
 				addresses := make(map[*byte]bool)
 				for _, data := range b.Chunks() {
 					require.Len(t, data, chunk)

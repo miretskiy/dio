@@ -68,6 +68,17 @@ func (b *Buffer) Chunks() [][]byte {
 	return b.chunks
 }
 
+// Cap returns the total usable bytes across all chunks, including allocator
+// rounding. Buffer has no logical data length: all of this storage is available
+// to the caller. Cap sums the chunk lengths, taking O(number of chunks) time.
+// Hold a reference while inspecting the buffer.
+func (b *Buffer) Cap() (capacity int64) {
+	for _, chunk := range b.chunks {
+		capacity += int64(len(chunk))
+	}
+	return capacity
+}
+
 // WrapRelease replaces the final-release callback with wrap's result. wrap is
 // called immediately with the current callback; its result runs on the last
 // Unpin and must call the original callback exactly once. Wrappers compose in

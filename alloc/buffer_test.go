@@ -86,6 +86,7 @@ func TestBufferRefcountOverflow(t *testing.T) {
 func TestNewBuffer(t *testing.T) {
 	b := NewBuffer(4097)
 	require.Equal(t, 8192, len(b.Chunks()[0]))
+	require.EqualValues(t, 8192, b.Cap())
 	require.True(t, align.IsAligned(b.Chunks()[0]))
 	data := b.Chunks()[0]
 	b.Unpin()
@@ -176,4 +177,15 @@ func TestBufferWrapReleaseConcurrentUnpin(t *testing.T) {
 	wg.Wait()
 	require.EqualValues(t, 1, releases.Load())
 	require.EqualValues(t, 1, callbacks.Load())
+}
+
+func TestBufferCapWithUnequalChunks(t *testing.T) {
+	data := align.AllocAligned(3 * align.BlockSize)
+	defer align.FreeAligned(data)
+	b := newChunkBuffer([][]byte{
+		data[:align.BlockSize:align.BlockSize],
+		data[align.BlockSize:],
+	}, func() {})
+	defer b.Unpin()
+	require.EqualValues(t, 3*align.BlockSize, b.Cap())
 }

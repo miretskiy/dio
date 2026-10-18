@@ -144,7 +144,8 @@ defer buf.Unpin()
 copy(buf.Chunks()[0], payload)
 ```
 
-Access memory through `Buffer.Chunks()`.
+Access memory through `Buffer.Chunks()`. `Buffer.Cap()` reports the total usable
+bytes across those chunks, including allocator rounding.
 Release buffers with `Unpin()` after use, including pending I/O. It returns
 `true` only when this call released the final reference and returned storage to
 its owner. Callers may ignore the result; method values used as `func()` callbacks
