@@ -19,8 +19,9 @@ var ErrExhausted = errors.New("alloc: allocator exhausted")
 // ErrClosed means acquisition was attempted after the allocator was closed.
 var ErrClosed = errors.New("alloc: allocator closed")
 
-// Allocator lends buffers with one reference. Release each acquired reference
-// with Buffer.Unpin. Acquisition and release are safe for concurrent use.
+// Allocator lends zeroed buffers with one reference. Every byte in the returned
+// chunks is zero, including space beyond the requested size. Release each acquired
+// reference with Buffer.Unpin. Acquisition and release are safe for concurrent use.
 // Sizes must be positive and are rounded up to whole chunks (whole extents for
 // ExtentAllocator). The returned chunks need not be contiguous.
 type Allocator interface {

@@ -56,6 +56,7 @@ func (p *SlabAllocator) TryAcquire(size int64) (*Buffer, error) {
 		b = p.slab.tryAcquireN(start, n)
 	}
 	if b != nil {
+		b.clear()
 		return b, nil
 	}
 	return nil, ErrExhausted

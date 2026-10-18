@@ -159,3 +159,46 @@ func TestAllocatorConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestAllocatorZeroedAcquisitions(t *testing.T) {
+	const chunk = 4096
+	for _, kind := range []string{"extent", "slab", "supplied-backing"} {
+		for _, chunks := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/chunks%d", kind, chunks), func(t *testing.T) {
+				var a Allocator
+				var err error
+				switch kind {
+				case "extent":
+					a, err = NewExtentAllocator(chunk, chunks)
+				case "slab":
+					a, err = NewSlabAllocator(int64(chunks * chunk))
+				case "supplied-backing":
+					backing := NewBuffer(int64(chunks * chunk))
+					defer backing.Unpin()
+					for i := range backing.Chunks()[0] {
+						backing.Chunks()[0][i] = 0xa5
+					}
+					a, err = NewSlabAllocator(int64(chunks*chunk), WithBackingBuffer(backing))
+				}
+				require.NoError(t, err)
+				defer a.Close()
+				for _, acquire := range []func(int64) (*Buffer, error){
+					a.TryAcquire,
+					func(size int64) (*Buffer, error) { return a.Acquire(context.Background(), size) },
+					a.TryAcquire,
+				} {
+					b, err := acquire(int64((chunks-1)*chunk + 1))
+					require.NoError(t, err)
+					require.Len(t, b.Chunks(), chunks)
+					for _, data := range b.Chunks() {
+						require.Equal(t, make([]byte, chunk), data)
+						for i := range data {
+							data[i] = 0xa5
+						}
+					}
+					b.Unpin()
+				}
+			})
+		}
+	}
+}

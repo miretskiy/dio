@@ -32,7 +32,13 @@ func newChunkBuffer(chunks [][]byte, release func()) *Buffer {
 	return b
 }
 
-// NewBuffer maps at least size bytes, rounded up to a page, without warming it.
+func (b *Buffer) clear() {
+	for _, data := range b.chunks {
+		clear(data)
+	}
+}
+
+// NewBuffer maps at least size zeroed bytes, rounded up to a page, without warming it.
 // The returned buffer owns one reference and unmaps its storage on the last
 // Unpin. Invalid sizes and mapping failures panic.
 func NewBuffer(size int64) *Buffer {

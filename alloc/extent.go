@@ -58,16 +58,16 @@ func NewExtentAllocator(extentSize int64, maxExtents int, opts ...Option) (*Exte
 func (p *ExtentAllocator) Acquire(ctx context.Context, size int64) (*Buffer, error) {
 	n := int((size-1)/p.extentSize + 1)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.closed {
+		p.mu.Unlock()
 		return nil, ErrClosed
 	}
 
 	if p.slots.Cap()-p.slots.Len() < n {
 		// AfterFunc runs the callback in a separate goroutine, even if ctx is
 		// already cancelled. It can safely wait for mu, which we hold here:
-		// Wait releases it while sleeping, and returning releases it via defer.
+		// Wait releases it while sleeping; other paths unlock before returning.
 		stop := context.AfterFunc(ctx, func() {
 			// Lock before broadcasting so cancellation cannot miss a waiter
 			// between its context check and Wait. Wake all to reach this caller.
@@ -82,10 +82,14 @@ func (p *ExtentAllocator) Acquire(ctx context.Context, size int64) (*Buffer, err
 	}
 
 	if err := ctx.Err(); err != nil {
+		p.mu.Unlock()
 		return nil, err
 	}
 
-	return p.acquireN(n), nil
+	b := p.acquireN(n)
+	p.mu.Unlock()
+	b.clear()
+	return b, nil
 }
 
 // TryAcquire rounds positive size up to whole extents. It returns ErrExhausted
@@ -94,15 +98,19 @@ func (p *ExtentAllocator) Acquire(ctx context.Context, size int64) (*Buffer, err
 func (p *ExtentAllocator) TryAcquire(size int64) (*Buffer, error) {
 	n := int((size-1)/p.extentSize + 1)
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	if p.closed {
+		p.mu.Unlock()
 		return nil, ErrClosed
 	}
 	if p.slots.Cap()-p.slots.Len() < n {
+		p.mu.Unlock()
 		return nil, ErrExhausted
 	}
-	return p.acquireN(n), nil
+	b := p.acquireN(n)
+	p.mu.Unlock()
+	b.clear()
+	return b, nil
 }
 
 // The caller holds mu and has checked that n extents are available.
