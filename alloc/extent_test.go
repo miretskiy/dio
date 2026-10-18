@@ -41,7 +41,7 @@ func TestExtentAllocatorCapacityAndReuse(t *testing.T) {
 	require.Equal(t, address, &next.Chunks()[0][0])
 	require.NotSame(t, first, next)
 	require.False(t, first.TryInc())
-	require.Panics(t, first.Unpin)
+	require.Panics(t, func() { first.Unpin() })
 	_, err = p.TryAcquire(4096)
 	require.ErrorIs(t, err, ErrExhausted, "stale buffer must not release the new lease")
 	next.Unpin()

@@ -68,9 +68,11 @@ func (b *Buffer) Chunks() [][]byte {
 	return b.chunks
 }
 
-// Unpin releases one reference. The last reference calls the allocation's
-// release function exactly once. Calling Unpin after release is a programming error.
-func (b *Buffer) Unpin() {
+// Unpin releases one reference and reports whether it was the last reference.
+// When true is returned, the allocation's release function has completed. Pooled
+// storage is reusable, but another acquisition may already have claimed it.
+// Calling Unpin after release is a programming error.
+func (b *Buffer) Unpin() bool {
 	for {
 		n := b.refs.Load()
 		if n == 0 {
@@ -79,8 +81,9 @@ func (b *Buffer) Unpin() {
 		if b.refs.CompareAndSwap(n, n-1) {
 			if n == 1 {
 				b.release()
+				return true
 			}
-			return
+			return false
 		}
 	}
 }

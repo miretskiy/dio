@@ -401,7 +401,7 @@ func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, []*alloc.Bu
 	for i := range buffers {
 		buffers[i], err = allocator.TryAcquire(4096)
 		require.NoError(t, err)
-		t.Cleanup(buffers[i].Unpin)
+		t.Cleanup(func() { buffers[i].Unpin() })
 	}
 	s, err := iosched.NewURingScheduler(
 		iosched.WithRingDepth(64),

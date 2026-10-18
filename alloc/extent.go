@@ -138,6 +138,27 @@ func (p *ExtentAllocator) release(handles ...intrusive.Handle) {
 	p.available.Broadcast()
 }
 
+// Capacity reports the pool's total usable bytes, or zero after Close.
+func (p *ExtentAllocator) Capacity() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return 0
+	}
+	return int64(p.slots.Cap()) * p.extentSize
+}
+
+// Available reports a snapshot of free extent bytes. An extent stays occupied
+// until the buffer's last Unpin. The result does not reserve those bytes.
+func (p *ExtentAllocator) Available() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return 0
+	}
+	return int64(p.slots.Cap()-p.slots.Len()) * p.extentSize
+}
+
 // Close releases all mappings. It must not race acquisitions or Unpin calls.
 // The caller must finish using and releasing borrowed buffers first.
 // Repeated closes are harmless.

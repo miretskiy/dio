@@ -45,7 +45,7 @@ func TestAllocatorLifecycle(t *testing.T) {
 			require.NoError(t, err)
 			require.NotSame(t, first, next)
 			require.False(t, first.TryInc())
-			require.Panics(t, first.Unpin)
+			require.Panics(t, func() { first.Unpin() })
 			require.Equal(t, byte(2), second.Chunks()[0][0])
 			next.Unpin()
 			second.Unpin()

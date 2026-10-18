@@ -30,13 +30,22 @@ func TestBufferLastReferenceReleasesExactlyOnce(t *testing.T) {
 		require.True(t, b.TryInc())
 	}
 	var wg sync.WaitGroup
+	var last atomic.Int32
 	for range 32 {
-		wg.Go(b.Unpin)
+		wg.Go(func() {
+			if b.Unpin() {
+				last.Add(1)
+				if releases.Load() != 1 {
+					t.Error("Unpin returned before releasing storage")
+				}
+			}
+		})
 	}
 	wg.Wait()
+	require.EqualValues(t, 1, last.Load())
 	require.EqualValues(t, 1, releases.Load())
 	require.False(t, b.TryInc())
-	require.Panics(t, b.Unpin)
+	require.Panics(t, func() { b.Unpin() })
 	require.EqualValues(t, 1, releases.Load())
 }
 
@@ -109,10 +118,10 @@ func TestCacheEvictionWithExistingReader(t *testing.T) {
 	evicted := entry
 	entry = nil
 	mu.Unlock()
-	evicted.Unpin()
+	require.False(t, evicted.Unpin(), "the reader still pins storage")
 	require.Nil(t, lookup())
 	require.Zero(t, releases.Load())
 	reader.Chunks()[0][0] = 42
-	reader.Unpin()
+	require.True(t, reader.Unpin(), "the final reference releases storage")
 	require.EqualValues(t, 1, releases.Load())
 }

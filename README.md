@@ -145,8 +145,16 @@ copy(buf.Chunks()[0], payload)
 ```
 
 Access memory through `Buffer.Chunks()`.
-Release buffers with `Unpin()` after use, including pending I/O.
+Release buffers with `Unpin()` after use, including pending I/O. It returns
+`true` only when this call released the final reference and returned storage to
+its owner. Callers may ignore the result; method values used as `func()` callbacks
+need a wrapper such as `func() { buf.Unpin() }`.
 `TryInc()` retains a reference when sharing a buffer.
+Both concrete allocators expose `Capacity()` and `Available()` byte snapshots.
+Free capacity excludes memory still pinned by readers, writers, or I/O after a
+cache has dropped its reference; it becomes available on the final release. Snapshots
+do not reserve memory; acquisition remains authoritative. Slab availability scans
+its bitmaps, avoiding a shared accounting counter on each allocation/release.
 Return all acquired buffers before closing their allocator. See the
 [`alloc` API documentation](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc)
 for configuration and ownership details.

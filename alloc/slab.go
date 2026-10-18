@@ -86,6 +86,30 @@ func (p *SlabAllocator) Acquire(ctx context.Context, size int64) (*Buffer, error
 	}
 }
 
+// Capacity reports the usable bytes in whole chunks, excluding a partial tail.
+// It must not race Close.
+func (p *SlabAllocator) Capacity() int64 {
+	if p.slab.backing == nil {
+		return 0
+	}
+	chunk := int64(p.slab.chunkSize)
+	return int64(len(p.slab.backing.Chunks()[0])) / chunk * chunk
+}
+
+// Available reports a snapshot of unclaimed bytes in whole chunks. Buffers stay
+// claimed until their last Unpin, even after a cache drops its own reference.
+// It scans the allocation bitmaps without adding a shared counter to the hot
+// path. Concurrent acquisitions and releases can change the result immediately;
+// partial acquisitions may also temporarily claim chunks. This is not a reservation.
+// It must not race Close.
+func (p *SlabAllocator) Available() int64 {
+	var chunks int64
+	for i := range p.slab.shards {
+		chunks += int64(bits.OnesCount64(^p.slab.shards[i].mask.Load()))
+	}
+	return chunks * int64(p.slab.chunkSize)
+}
+
 // Close releases the allocator's backing reference.
 // It must not race allocator use. Do not acquire buffers after Close.
 // The caller must finish using and releasing borrowed buffers first.
