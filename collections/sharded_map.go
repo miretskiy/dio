@@ -19,9 +19,8 @@ import (
 // Len, iteration, Collect, and Clear visit one shard at a time; they are not
 // atomic operations on the whole map. Iteration order is unspecified.
 type ShardedMap[K comparable, V, E any] struct {
-	shards     []MapShard[K, V, E]
-	hash       func(K) uint64
-	powerOfTwo bool
+	shards []MapShard[K, V, E]
+	hash   func(K) uint64
 }
 
 // MapShard holds entries and caller-owned state under the same lock.
@@ -55,9 +54,8 @@ func NewShardedMap[K comparable, V, E any](shards, capacity int, hash func(K) ui
 		hash = func(key K) uint64 { return maphash.Comparable(seed, key) }
 	}
 	m := &ShardedMap[K, V, E]{
-		shards:     make([]MapShard[K, V, E], shards),
-		hash:       hash,
-		powerOfTwo: shards&(shards-1) == 0,
+		shards: make([]MapShard[K, V, E], shards),
+		hash:   hash,
 	}
 	shardCapacity := capacity / shards
 	if capacity%shards != 0 {
@@ -73,7 +71,7 @@ func NewShardedMap[K comparable, V, E any](shards, capacity int, hash func(K) ui
 func (m *ShardedMap[K, V, E]) Shard(key K) *MapShard[K, V, E] {
 	index := m.hash(key)
 	count := uint64(len(m.shards))
-	if m.powerOfTwo {
+	if count&(count-1) == 0 {
 		index &= count - 1
 	} else {
 		index %= count
