@@ -1,16 +1,17 @@
 package collections
 
 import (
+	"fmt"
 	"hash/maphash"
 	"iter"
 	"slices"
 	"sync"
-
-	"golang.org/x/sys/cpu"
+	"unsafe"
 )
 
 // ShardedMap is a concurrent map with caller-owned state in each shard.
-// Use NewShardedMap to initialize it. A ShardedMap must not be copied.
+// Use NewShardedMap or NewShardedMapWithExtra to initialize it.
+// A ShardedMap must not be copied.
 //
 // Get, Put, and Delete lock one shard. Callers may instead lock a Shard to
 // update several entries and its Extra state together. Map methods do not
@@ -26,23 +27,51 @@ type ShardedMap[K comparable, V, E any] struct {
 // MapShard holds entries and caller-owned state under the same lock.
 // Access Items and Extra while holding the appropriate read or write lock.
 // A MapShard must not be copied after first use.
+//
+// E owns the shard layout, including any padding. Use VerifyAlignment in a
+// test to check that the shard size is a multiple of 64 bytes. Other layouts
+// work, but may cause false sharing between shards.
 type MapShard[K comparable, V, E any] struct {
 	sync.RWMutex
 	Items map[K]V
 	Extra E
-	_     cpu.CacheLinePad // Separate this shard's mutable fields from the next.
+}
+
+// Pad32 supplies padding when no per-shard state is needed. On 64-bit targets,
+// the lock and map occupy 32 bytes, so MapShard[K, V, Pad32] occupies 64 bytes.
+type Pad32 [32]byte
+
+// VerifyAlignment checks that a MapShard's size is a multiple of 64 bytes.
+// Call it from a test to check E's layout; constructors do not enforce it.
+// It checks the slice stride, not the allocation's starting address.
+func VerifyAlignment[K comparable, V, E any]() error {
+	var shard MapShard[K, V, E]
+	if size := unsafe.Sizeof(shard); size%64 != 0 {
+		return fmt.Errorf("collections: shard size %d is not a multiple of 64 bytes; adjust padding in Extra", size)
+	}
+	return nil
 }
 
 // NewShardedMap creates a map with exactly shards shards and a total capacity
-// hint distributed across them. It panics if shards is not positive or capacity
-// is negative. The shard count need not be a power of two.
+// hint distributed across them. It uses Pad32 for a 64-byte shard on 64-bit
+// targets. Use NewShardedMapWithExtra for caller-owned per-shard state.
+// It panics if shards is not positive or capacity is negative.
+// The shard count need not be a power of two.
 //
 // A nil hash uses maphash.Comparable with a seed unique to this map. A supplied
 // hash must be safe for concurrent calls, return the same hash for equal keys
 // throughout the map's lifetime, and distribute keys across its output bits.
 // Already-hashed keys can supply their existing hash without hashing again.
 // Hashes select shards; the underlying maps still compare complete keys.
-func NewShardedMap[K comparable, V, E any](shards, capacity int, hash func(K) uint64) *ShardedMap[K, V, E] {
+func NewShardedMap[K comparable, V any](shards, capacity int, hash func(K) uint64) *ShardedMap[K, V, Pad32] {
+	return NewShardedMapWithExtra[K, V](shards, capacity, hash, Pad32{})
+}
+
+// NewShardedMapWithExtra is NewShardedMap with caller-owned state and padding.
+// It copies extra into each shard. Any referenced objects remain shared;
+// initialize those separately through ShardAt if each shard needs its own.
+// No padding is added to E, and its layout is not checked at construction.
+func NewShardedMapWithExtra[K comparable, V, E any](shards, capacity int, hash func(K) uint64, extra E) *ShardedMap[K, V, E] {
 	if shards <= 0 {
 		panic("collections: shard count must be positive")
 	}
@@ -63,6 +92,7 @@ func NewShardedMap[K comparable, V, E any](shards, capacity int, hash func(K) ui
 	}
 	for i := range m.shards {
 		m.shards[i].Items = make(map[K]V, shardCapacity)
+		m.shards[i].Extra = extra
 	}
 	return m
 }
