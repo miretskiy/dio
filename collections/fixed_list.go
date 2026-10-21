@@ -1,10 +1,11 @@
-package intrusive
+package collections
 
 import "iter"
 
 // FixedList is a fixed-capacity List whose values remain in stable storage.
 // Removed values are retained for reuse; callers must clear references they
-// no longer need.
+// no longer need. Construct one with MakeFixedList. A FixedList must not be
+// copied after first use. It is not safe for concurrent access.
 type FixedList[T any] struct {
 	list List[T]
 }
@@ -12,7 +13,7 @@ type FixedList[T any] struct {
 // MakeFixedList creates a FixedList with capacity slots.
 func MakeFixedList[T any](capacity int) FixedList[T] {
 	if capacity < 0 || uint64(capacity) > uint64(freeNode-1) {
-		panic("intrusive: invalid fixed-list capacity")
+		panic("collections: invalid fixed-list capacity")
 	}
 	var fixed FixedList[T]
 	fixed.list.nodes = make([]node[T], capacity)
@@ -33,7 +34,7 @@ func MakeFixedList[T any](capacity int) FixedList[T] {
 func (l *FixedList[T]) PushBack() Handle {
 	handle, ok := l.TryPushBack()
 	if !ok {
-		panic("intrusive: fixed list is full")
+		panic("collections: fixed list is full")
 	}
 	return handle
 }

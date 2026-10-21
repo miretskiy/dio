@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/internal/buildutil"
-	"github.com/miretskiy/dio/v2/internal/intrusive"
 )
 
 var (
@@ -59,7 +59,7 @@ var abandoned sync.Map // *Ring -> struct{}
 // Handle is an opaque, comparable, ring-local operation identity.
 type Handle struct {
 	ring uint64
-	slot intrusive.Handle
+	slot collections.Handle
 }
 
 // Index returns a dense index for the operation, in [0, Ring.Capacity()). It
@@ -110,7 +110,7 @@ type pendingSlot struct {
 type Ring struct {
 	backend *rawRing
 	id      uint64
-	pending intrusive.FixedList[pendingSlot]
+	pending collections.FixedList[pendingSlot]
 
 	files   *FixedFiles
 	buffers *FixedBuffers
@@ -167,7 +167,7 @@ func New(options ...Option) (*Ring, error) {
 	ring := &Ring{
 		backend: raw,
 		id:      nextRingID.Add(1),
-		pending: intrusive.MakeFixedList[pendingSlot](int(raw.sqCapacity())),
+		pending: collections.MakeFixedList[pendingSlot](int(raw.sqCapacity())),
 	}
 	if config.fixedFiles != 0 {
 		if _, err := raw.registerFilesSparse(config.fixedFiles); err != nil {
@@ -397,7 +397,7 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 			// tail, so every position in the snapshot holds an entry.
 			cqe := ring.backend.cqeAt(head + offset)
 			consumed++
-			slotHandle := intrusive.Handle(cqe.Data)
+			slotHandle := collections.Handle(cqe.Data)
 			pending, resolved := ring.pending.TryValue(slotHandle)
 			// Every SQE carries a generation-tagged identity, so one Ringo
 			// cannot resolve means Ringo released a slot before the kernel's
@@ -433,7 +433,7 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 func (ring *Ring) yieldCompletion(
 	yield func(Completion) bool,
 	completion Completion,
-	slot intrusive.Handle,
+	slot collections.Handle,
 ) (more bool) {
 	if completion.Flags.More() {
 		return yield(completion)
@@ -442,7 +442,7 @@ func (ring *Ring) yieldCompletion(
 	return yield(completion)
 }
 
-func (ring *Ring) release(handle intrusive.Handle) {
+func (ring *Ring) release(handle collections.Handle) {
 	pending, ok := ring.pending.TryValue(handle)
 	if !ok {
 		return

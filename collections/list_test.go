@@ -1,4 +1,4 @@
-package intrusive
+package collections
 
 import "testing"
 

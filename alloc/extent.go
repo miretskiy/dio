@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/miretskiy/dio/v2/align"
-	"github.com/miretskiy/dio/v2/internal/intrusive"
+	"github.com/miretskiy/dio/v2/collections"
 )
 
 // ExtentAllocator owns a fixed number of equally sized backing extents, mapped
@@ -16,7 +16,7 @@ type ExtentAllocator struct {
 	// Occupied slots are borrowed; free slots retain their mappings for reuse.
 	mu         sync.Mutex
 	available  sync.Cond
-	slots      intrusive.FixedList[*Buffer]
+	slots      collections.FixedList[*Buffer]
 	closed     bool
 	extentSize int64
 }
@@ -38,7 +38,7 @@ func NewExtentAllocator(extentSize int64, maxExtents int, opts ...Option) (*Exte
 	}
 	extentSize = align.PageAlign(extentSize)
 	p := &ExtentAllocator{
-		slots:      intrusive.MakeFixedList[*Buffer](maxExtents),
+		slots:      collections.MakeFixedList[*Buffer](maxExtents),
 		extentSize: extentSize,
 	}
 	p.available.L = &p.mu
@@ -120,7 +120,7 @@ func (p *ExtentAllocator) acquireN(n int) *Buffer {
 		return newBuffer((*p.slots.Value(handle)).Chunks()[0], func() { p.release(handle) })
 	}
 	chunks := make([][]byte, n)
-	handles := make([]intrusive.Handle, n)
+	handles := make([]collections.Handle, n)
 	for i := range chunks {
 		handle := p.slots.PushBack()
 		handles[i] = handle
@@ -129,7 +129,7 @@ func (p *ExtentAllocator) acquireN(n int) *Buffer {
 	return newChunkBuffer(chunks, func() { p.release(handles...) })
 }
 
-func (p *ExtentAllocator) release(handles ...intrusive.Handle) {
+func (p *ExtentAllocator) release(handles ...collections.Handle) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, handle := range handles {

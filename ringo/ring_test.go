@@ -12,7 +12,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/miretskiy/dio/v2/internal/intrusive"
+	"github.com/miretskiy/dio/v2/collections"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -195,7 +195,7 @@ func newFakeRing(depth int) (*Ring, *testTransport) {
 	ring := &Ring{
 		backend: raw,
 		id:      nextRingID.Add(1),
-		pending: intrusive.MakeFixedList[pendingSlot](depth),
+		pending: collections.MakeFixedList[pendingSlot](depth),
 	}
 	return ring, transport
 }

@@ -1,8 +1,9 @@
-package intrusive
+package collections
 
 import "iter"
 
-// Handle identifies a value until it is removed. Its zero value is invalid.
+// Handle identifies a value in the list that created it until it is removed.
+// Its zero value is invalid; handles must not be used with another list.
 type Handle uint64
 
 const (
@@ -19,6 +20,11 @@ type node[T any] struct {
 
 // List is an indexed doubly linked list. Values stay in one canonical node
 // while other structures refer to them by Handle. Removed nodes are reused.
+// The zero value is an empty list. A List must not be copied after first use.
+// It is not safe for concurrent access.
+//
+// Value, Next, Prev, and Remove require a live handle from this list and panic
+// if it is invalid or stale. Use TryValue when a handle may have been removed.
 type List[T any] struct {
 	nodes []node[T]
 	head  uint32
@@ -49,7 +55,7 @@ func (l *List[T]) pushBack() (uint32, *node[T]) {
 		n.next = 0
 	} else {
 		if uint64(len(l.nodes)) == uint64(freeNode-1) {
-			panic("intrusive: handle space exhausted")
+			panic("collections: handle space exhausted")
 		}
 		l.nodes = append(l.nodes, node[T]{
 			prev:       l.tail,
@@ -105,7 +111,8 @@ func (l *List[T]) Value(handle Handle) *T {
 }
 
 // TryValue returns the value identified by handle, or false if handle is
-// invalid, stale, or no longer occupied.
+// invalid, stale, or no longer occupied. As with Value, the pointer must not
+// be retained across PushBack.
 func (l *List[T]) TryValue(handle Handle) (*T, bool) {
 	_, n, ok := l.tryNode(handle)
 	if !ok {
@@ -158,7 +165,7 @@ func (l *List[T]) Len() int {
 func (l *List[T]) node(handle Handle) (uint32, *node[T]) {
 	index, n, ok := l.tryNode(handle)
 	if !ok {
-		panic("intrusive: invalid handle")
+		panic("collections: invalid handle")
 	}
 	return index, n
 }
@@ -185,7 +192,7 @@ func (l *List[T]) handle(index uint32) Handle {
 func (h Handle) index() uint32 {
 	index := uint32(h)
 	if index == 0 {
-		panic("intrusive: invalid handle")
+		panic("collections: invalid handle")
 	}
 	return index
 }

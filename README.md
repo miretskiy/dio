@@ -8,7 +8,8 @@ ring control, `iosched` provides a higher-level operation and ticket API with
 io_uring and synchronous POSIX backends.
 
 The supporting packages provide aligned memory, fixed-size buffer allocators,
-portable file operations, and a targeted TLS read-buffer optimization.
+reusable handle-based lists, portable file operations, and a targeted TLS
+read-buffer optimization.
 
 The module requires Go 1.25.11 or newer. The `align`, `alloc`, `sys`, and POSIX
 scheduler APIs work on Linux and Darwin. io_uring support is Linux-only.
@@ -43,6 +44,7 @@ now `alloc`; its allocators return owned `*alloc.Buffer` values.
 | [`iosched`](https://pkg.go.dev/github.com/miretskiy/dio/v2/iosched) | A common operation/ticket API over POSIX and io_uring |
 | [`align`](https://pkg.go.dev/github.com/miretskiy/dio/v2/align) | Page-aligned allocation and range arithmetic |
 | [`alloc`](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc) | Owned aligned buffers and extent and slab allocators |
+| [`collections`](https://pkg.go.dev/github.com/miretskiy/dio/v2/collections) | Slice-backed lists with reusable handles and optional fixed storage |
 | [`sys`](https://pkg.go.dev/github.com/miretskiy/dio/v2/sys) | Portable file allocation, syncing, direct I/O, and hole punching |
 | [`netbuf`](https://pkg.go.dev/github.com/miretskiy/dio/v2/netbuf) | TLS read-buffer pre-sizing for golang/go#47672 |
 
