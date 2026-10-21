@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -38,6 +39,7 @@ func NewPOSIXScheduler() *POSIXScheduler {
 
 // Submit executes op synchronously and returns a completed Ticket.
 func (s *POSIXScheduler) Submit(op Op) (Ticket, error) {
+	started := time.Now()
 	if s.closed.Load() {
 		return Ticket{}, errSchedulerClosed
 	}
@@ -47,7 +49,8 @@ func (s *POSIXScheduler) Submit(op Op) (Ticket, error) {
 		return Ticket{}, err
 	}
 
-	ticket := op.prepareSubmission()
+	ticket := op.prepareSubmission(started)
+	op.completion.markIssued()
 	root := &op
 	for node := root; node != nil; node = node.linked {
 		p := node

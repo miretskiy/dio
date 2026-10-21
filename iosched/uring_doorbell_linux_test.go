@@ -162,7 +162,7 @@ func TestSleepRechecksStagingAfterPublishingSleep(t *testing.T) {
 	newTestDoorbell(t, c)
 	s := c.sched
 	c.armDoorbell() // only the doorbell in the ring: a wait would park
-	request, _ := newSubmission(VReadOp(0, make([]byte, 1), 0), 1)
+	request, _ := newSubmission(VReadOp(0, make([]byte, 1), 0), 1, time.Now())
 	require.True(t, s.tryPush(request)) // pushed, but no doorbell
 
 	slept := make(chan error, 1)
@@ -213,7 +213,7 @@ func TestRunStopsWhenDoorbellReadFails(t *testing.T) {
 	defer func() { require.NoError(t, writeOnly.Close()) }()
 	c.sched.doorbellFD = int(writeOnly.Fd())
 	stuck, _ := blockingRead(t)
-	request, _ := newSubmission(ReadOp(stuck, make([]byte, 8), 0), 1)
+	request, _ := newSubmission(ReadOp(stuck, make([]byte, 8), 0), 1, time.Now())
 	require.True(t, c.sched.tryPush(request))
 
 	err = c.run()

@@ -14,7 +14,7 @@ import (
 func TestTicketErrorReportsLinkedError(t *testing.T) {
 	err := errors.New("linked failure")
 	root := Op{}.Link(Op{})
-	ticket := root.prepareSubmission()
+	ticket := root.prepareSubmission(time.Now())
 	recordResult(&root, root.linked, 0, err)
 	root.finish()
 	_, got := ticket.Wait()
@@ -87,7 +87,7 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 	op := Op{buf: []byte("root")}.
 		Link(Op{buf: []byte("linked")})
 	root := op
-	ticket := root.prepareSubmission()
+	ticket := root.prepareSubmission(time.Now())
 	if op.completion != nil {
 		t.Fatal("preparing the submission copy modified the caller's operation")
 	}
@@ -102,11 +102,11 @@ func TestSubmissionOwnsOpCopy(t *testing.T) {
 	ticket.Wait()
 }
 
-func TestDurableWriteInLinkedChainRejected(t *testing.T) {
+func TestDurableWriteBeforeEndOfChainRejected(t *testing.T) {
 	f := new(os.File)
 	op := WriteOp(f, nil, 0).Durable().Link(DrainOp(f))
 	_, err := countAndValidateOps(&op, nil)
-	if err == nil || !strings.Contains(err.Error(), "Durable cannot be used in a linked chain") {
+	if err == nil || !strings.Contains(err.Error(), "Durable write must be the final operation") {
 		t.Fatalf("validation error: got %v", err)
 	}
 }
@@ -120,10 +120,14 @@ func TestDrainMustEndLinkedChain(t *testing.T) {
 	}
 }
 
-func TestStandaloneDurableWriteAccepted(t *testing.T) {
-	op := WriteOp(new(os.File), nil, 0).Durable()
-	if _, err := countAndValidateOps(&op, nil); err != nil {
-		t.Fatalf("validation error: %v", err)
+func TestDurableWriteAccepted(t *testing.T) {
+	for _, op := range []Op{
+		WriteOp(new(os.File), nil, 0).Durable(),
+		WriteOp(new(os.File), nil, 0).Link(WriteOp(new(os.File), nil, 0).Durable()),
+	} {
+		if _, err := countAndValidateOps(&op, nil); err != nil {
+			t.Fatalf("validation error: %v", err)
+		}
 	}
 }
 
@@ -157,7 +161,7 @@ func TestWriteResultError(t *testing.T) {
 
 func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 	root := Op{}.Link(Op{})
-	ticket := root.prepareSubmission()
+	ticket := root.prepareSubmission(time.Now())
 	done := make(chan struct{})
 	go func() {
 		ticket.Wait()
@@ -181,7 +185,7 @@ func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 
 func BenchmarkTicketCompletion(b *testing.B) {
 	root := Op{}
-	ticket := root.prepareSubmission()
+	ticket := root.prepareSubmission(time.Now())
 	root.finish()
 	ticket.Wait()
 
@@ -189,7 +193,7 @@ func BenchmarkTicketCompletion(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		root := Op{}
-		ticket := root.prepareSubmission()
+		ticket := root.prepareSubmission(time.Now())
 		root.finish()
 		ticket.Wait()
 	}
@@ -202,7 +206,7 @@ func BenchmarkSubmissionState(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		root := Op{}
-		ticket := root.prepareSubmission()
+		ticket := root.prepareSubmission(time.Now())
 		benchmarkSubmission = &root
 		root.finish()
 		benchmarkTicket = ticket
@@ -240,7 +244,7 @@ func BenchmarkOpLinkBatch8(b *testing.B) {
 
 func TestTicketDoneClosesOnCompletion(t *testing.T) {
 	root := Op{}
-	ticket := root.prepareSubmission()
+	ticket := root.prepareSubmission(time.Now())
 	done := ticket.Done()
 	if done != ticket.Done() {
 		t.Fatal("Done returned a different channel on the second call")
@@ -264,7 +268,7 @@ func TestTicketDoneClosesOnCompletion(t *testing.T) {
 
 func TestTicketDoneAfterCompletionIsClosed(t *testing.T) {
 	root := Op{}
-	ticket := root.prepareSubmission()
+	ticket := root.prepareSubmission(time.Now())
 	root.finish()
 	select {
 	case <-ticket.Done():
@@ -317,7 +321,7 @@ func TestWhenDoneRacesWait(t *testing.T) {
 	for range 1000 {
 		var calls atomic.Int32
 		root := Op{whenDone: func(int, error) { calls.Add(1) }}
-		ticket := root.prepareSubmission()
+		ticket := root.prepareSubmission(time.Now())
 		go root.finish()
 		ticket.Wait()
 		for deadline := time.Now().Add(time.Second); calls.Load() == 0 && time.Now().Before(deadline); {
@@ -334,7 +338,7 @@ func TestWhenDoneRacesWait(t *testing.T) {
 func TestTicketConcurrentDoneAndWait(t *testing.T) {
 	for range 500 {
 		root := Op{}
-		ticket := root.prepareSubmission()
+		ticket := root.prepareSubmission(time.Now())
 		var workers sync.WaitGroup
 		channels := make(chan (<-chan struct{}), 8)
 		for range 8 {

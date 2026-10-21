@@ -112,7 +112,7 @@ func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []*submission) {
 	tickets := make([]Ticket, len(ops))
 	var head, tail *submission
 	for i := range ops {
-		request, ticket := newSubmission(ops[i], int32(ops[i].opCount()))
+		request, ticket := newSubmission(ops[i], int32(ops[i].opCount()), time.Now())
 		tickets[i] = ticket
 		if head == nil {
 			head = request
@@ -134,7 +134,7 @@ var benchmarkURingRequest *submission
 func BenchmarkURingSubmissionState(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
-		request, ticket := newSubmission(Op{}, 1)
+		request, ticket := newSubmission(Op{}, 1, time.Now())
 		benchmarkURingRequest = request
 		request.root.finish()
 		benchmarkTicket = ticket
@@ -263,7 +263,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	c := newTestCoordinator(t, 2, 1)
 	s := c.sched
 	op := VReadOp(0, make([]byte, 1), 0)
-	request, ticket := newSubmission(op, 1)
+	request, ticket := newSubmission(op, 1, time.Now())
 	if !s.tryPush(request) {
 		t.Fatal("submission was rejected before close")
 	}
@@ -448,7 +448,7 @@ func TestShutdownDrainsStagedFileGenerationsInOrder(t *testing.T) {
 		VOpenatOp(unix.AT_FDCWD, f.Name(), os.O_WRONLY, 0, 0).Link(VWriteOp(0, []byte("b"), 1)),
 		VCloseOp(0),
 	} {
-		work, ticket := newSubmission(op, int32(op.opCount()))
+		work, ticket := newSubmission(op, int32(op.opCount()), time.Now())
 		require.True(t, c.sched.tryPush(work))
 		tickets = append(tickets, ticket)
 	}
@@ -519,7 +519,7 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	}
 
 	lateRoot := VReadOp(0, make([]byte, 1), 3)
-	lateRequest, late := newSubmission(lateRoot, int32(lateRoot.opCount()))
+	lateRequest, late := newSubmission(lateRoot, int32(lateRoot.opCount()), time.Now())
 	c.accept(lateRequest)
 	_, err := late.Wait()
 	if err == nil {
@@ -613,7 +613,7 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 	}
 
 	retryRoot := VOpenatOp(0, "b", 0, 0, 0)
-	retryRequest, retry := newSubmission(retryRoot, int32(retryRoot.opCount()))
+	retryRequest, retry := newSubmission(retryRoot, int32(retryRoot.opCount()), time.Now())
 	c.accept(retryRequest)
 	_, err := retry.Wait()
 	if err == nil {
@@ -622,7 +622,7 @@ func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
 
 	completeForTest(c, handles[1], 0, 0, syscall.EBADF)
 	finalRoot := VOpenatOp(0, "b", 0, 0, 0)
-	finalRequest, final := newSubmission(finalRoot, int32(finalRoot.opCount()))
+	finalRequest, final := newSubmission(finalRoot, int32(finalRoot.opCount()), time.Now())
 	c.accept(finalRequest)
 	if c.accepted.len != 1 {
 		t.Fatal("retry open was not accepted after prior slot work completed")
@@ -824,9 +824,12 @@ func TestBudgetHoldsWritesNotReads(t *testing.T) {
 	require.Equal(t, workReady, handles[2].state)
 	require.Equal(t, workIssued, handles[3].state, "the read waited for the write budget")
 	require.True(t, room, "reads still have budget, so new work could be placed")
+	require.Zero(t, handles[1].completion.Slat, "budget-held work has not reached the ring")
+	require.Zero(t, handles[2].completion.Slat)
 
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	require.Equal(t, [budgetedClasses]int64{}, c.inFlightCost, "completed work kept its cost")
+	secondIssue := time.Now()
 	placed, _ = c.placeReady(false)
 	require.Equal(t, 1, placed, "want the second write alone")
 	require.Equal(t, workIssued, handles[1].state)
@@ -836,7 +839,11 @@ func TestBudgetHoldsWritesNotReads(t *testing.T) {
 	for i, ticket := range tickets {
 		_, err := ticket.Wait()
 		require.NoErrorf(t, err, "ticket %d", i)
+		require.Positive(t, ticket.Slat)
+		require.Positive(t, ticket.Clat)
 	}
+	require.GreaterOrEqual(t, tickets[1].Slat, secondIssue.Sub(handles[1].completion.started), "slat includes waiting for budget")
+	require.LessOrEqual(t, tickets[1].Clat, time.Since(secondIssue), "clat excludes waiting for budget")
 }
 
 // TestBudgetKeepsClassOrder holds a small read behind a large one that does
@@ -886,12 +893,18 @@ func TestBudgetChargesCoalescedRun(t *testing.T) {
 	for i := range ops {
 		ops[i] = WriteOp(f, make([]byte, 4096), int64(i*4096))
 	}
-	_, handles := acceptOps(c, ops...)
+	tickets, handles := acceptOps(c, ops...)
 	placed, _ := c.placeReady(true)
 	require.Equal(t, 1, placed)
 	require.Equal(t, 4*handles[0].cost[classWrite], c.inFlightCost[classWrite])
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	require.Zero(t, c.inFlightCost[classWrite])
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+		require.Positive(t, ticket.Slat, "every coalesced member records ring placement")
+		require.Positive(t, ticket.Clat)
+	}
 }
 
 // TestBudgetReleaseOfUnchargedWork completes work that was never placed, as

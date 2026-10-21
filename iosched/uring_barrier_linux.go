@@ -11,6 +11,7 @@ import (
 
 type fileState struct {
 	active int32
+	refs   int32 // submissions retaining this state until their whole chain completes
 
 	opening     *submission
 	openWaiters []*submission
@@ -71,7 +72,7 @@ func (f *fileTable) newState() *fileState {
 }
 
 func (f *fileTable) removeIfEmpty(op *Op, state *fileState) {
-	if state.active != 0 || state.opening != nil || state.closing != nil || len(state.openWaiters) != 0 {
+	if state.refs != 0 || state.active != 0 || state.opening != nil || state.closing != nil || len(state.openWaiters) != 0 {
 		return
 	}
 	if op.isVirtual() {
@@ -123,9 +124,9 @@ func fileUses(work *submission, uses []fileUse) []fileUse {
 		default:
 			uses[i].ops++
 		}
-	}
-	if work.durable {
-		uses[0].ops++
+		if op == work.durable {
+			uses[i].ops++ // The sync belongs to this write's file, not the root's.
+		}
 	}
 	return uses
 }
@@ -179,6 +180,7 @@ func (c *coordinator) admit(work *submission, uses []fileUse) {
 			c.files.virtual[use.op.vfd] = state
 		}
 		use.state = state
+		state.refs++
 		if state.opening != nil {
 			state.openWaiters = append(state.openWaiters, work)
 			work.waitCount++
@@ -237,6 +239,7 @@ func (c *coordinator) completedOperation(work *submission, op *Op) {
 func (c *coordinator) completedWork(work *submission) {
 	for _, use := range work.files {
 		state := use.state
+		state.refs--
 		if state.opening == work {
 			state.opening = nil
 			waiters := state.openWaiters

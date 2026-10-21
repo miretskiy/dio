@@ -1,6 +1,10 @@
 package iosched
 
-import "github.com/miretskiy/dio/v2/internal/buildutil"
+import (
+	"time"
+
+	"github.com/miretskiy/dio/v2/internal/buildutil"
+)
 
 // submission is one validated Submit call. Submit builds it and pushes it onto
 // the staging stack; once the coordinator accepts it, it is the coordinator's
@@ -20,9 +24,9 @@ type submission struct {
 	remaining int32
 	// sequence is the acceptance order; coalescing joins only consecutive work.
 	sequence uint64
-	// durable marks a standalone durable write. Its ticket completes only once
-	// an fdatasync placed after its write completed has completed too.
-	durable bool
+	// durable is the final write that needs a sync, if any. Its file's shared
+	// fdatasync must complete before this submission's ticket completes.
+	durable *Op
 	// cost charges every data operation in the chain to its own class.
 	cost    [budgetedClasses]int64
 	charged bool
@@ -57,9 +61,10 @@ const (
 	workDone
 )
 
-func newSubmission(op Op, count int32) (*submission, Ticket) {
+func newSubmission(op Op, count int32, started time.Time) (*submission, Ticket) {
 	request := &submission{root: op, count: count}
 	request.completion.whenDone = op.whenDone
+	request.completion.started = started
 	request.completion.wait.Add(1)
 	request.root.completion = &request.completion
 	return request, Ticket{&request.completion}

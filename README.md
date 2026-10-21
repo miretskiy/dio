@@ -297,8 +297,19 @@ Standalone writes can request durability directly:
 ticket, err := sched.Submit(iosched.WriteOp(f, payload, offset).Durable())
 ```
 
-The ticket completes after `fdatasync`. `Durable` is deliberately rejected in
-a linked chain; use an explicit `FdatasyncOp` there so ordering is visible.
+The ticket completes after `fdatasync`. The final write of a linked chain can
+also be durable, sharing its sync with other durable writes on the same file:
+
+```go
+op := iosched.WriteOp(dataFile, payload, dataOffset).
+    Link(iosched.WriteOp(indexFile, header, indexOffset).Durable())
+ticket, err := sched.Submit(op)
+```
+
+Here the data write must succeed before the index write runs, and the ticket
+waits for the index file's sync. This does not sync the data file. `Durable` is
+rejected on intermediate writes; use an explicit `FdatasyncOp` when later
+operations must wait for a sync.
 
 Separate submissions are otherwise unordered. The io_uring coordinator does
 provide file-lifecycle barriers: a virtual open holds later work for its slot,

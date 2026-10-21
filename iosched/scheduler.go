@@ -32,8 +32,9 @@ type Scheduler interface {
 	// remaining chain after a failure; HardLink continues it. URingScheduler
 	// rejects a chain of more than eight operations, or, on a smaller ring, of
 	// more than its depth less the one entry it keeps for its doorbell. Durable
-	// applies only to standalone writes; put an explicit FdatasyncOp in a linked
-	// chain.
+	// applies to standalone writes and the final write of a chain; its file's
+	// sync may be shared with other durable writes. Use an explicit FdatasyncOp
+	// when later operations in the chain must wait for the sync.
 	//
 	// Separate submissions are unordered except for file lifecycle:
 	//   - A submission containing VOpenatOp holds subsequently accepted operations
@@ -46,7 +47,7 @@ type Scheduler interface {
 	//     have returned. Earlier operations in the same linked chain are ordered
 	//     before the barrier by the chain and are not part of that drain. So a
 	//     completion function may still change a buffer that the held chain
-	//     will write. A standalone Durable write remains active through its
+	//     will write. A Durable write remains active through its
 	//     synthesized fdatasync, so a following barrier waits for the flush too.
 	//   - Operations later in the same linked chain are ordered after a VCloseOp.
 	//     A chain that closes a virtual slot and then opens it again replaces

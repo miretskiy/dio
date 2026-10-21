@@ -76,11 +76,15 @@ func TestDurableWrite(t *testing.T) {
 		f := newEmptyFile(t)
 		want := []byte("durable payload")
 
+		beforeSubmit := time.Now()
 		ticket, err := s.Submit(iosched.WriteOp(f, want, 0).Durable())
 		require.NoError(t, err)
 		n, err := ticket.Wait()
 		require.NoError(t, err)
 		require.Equal(t, len(want), n)
+		require.Positive(t, ticket.Slat)
+		require.Positive(t, ticket.Clat)
+		require.LessOrEqual(t, ticket.Slat+ticket.Clat, time.Since(beforeSubmit))
 
 		got := make([]byte, len(want))
 		read, err := s.Submit(iosched.ReadOp(f, got, 0))

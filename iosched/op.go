@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Opcode identifies the type of I/O operation. The low bits name the operation;
@@ -70,11 +71,13 @@ const (
 	opDurable uint32 = 1 << 0 // flush the write (fdatasync) before the ticket completes
 )
 
-// Durable requests that a standalone write's data be flushed to stable storage
+// Durable requests that a write's data be flushed to stable storage
 // before its Ticket completes. The io_uring backend issues an fdatasync once
 // the write completes and shares it among the durable writes on the same file
 // that completed before it was issued; the POSIX backend syncs inline. For a
-// linked chain, include an explicit FdatasyncOp instead. Durable has no effect
+// linked chain, only the final operation may be a durable write. Its sync covers
+// that write's file, not other files earlier in the chain. Use an explicit
+// FdatasyncOp when later operations must wait for a sync. Durable has no effect
 // on non-write operations.
 func (o Op) Durable() Op {
 	o.opFlags |= opDurable
@@ -333,6 +336,10 @@ type completion struct {
 	n        int
 	err      error
 	whenDone func(n int, err error) // from SubmitNotify; fixed before submission
+	started  time.Time              // entry to Submit; monotonic clock
+
+	Slat time.Duration // Submit entry to ring placement (POSIX: execution starts).
+	Clat time.Duration // Ring placement to ticket completion, including any Durable sync.
 
 	wait sync.WaitGroup                // Wait does not allocate a channel
 	done atomic.Pointer[chan struct{}] // made only when Done is requested
@@ -349,6 +356,9 @@ var closedChan = func() chan struct{} {
 // finish completes the ticket: it closes the done channel, then calls the
 // submission's whenDone, if any, on the calling goroutine.
 func (c *completion) finish() {
+	if c.Slat > 0 {
+		c.Clat = time.Since(c.started) - c.Slat
+	}
 	// Exactly one finish races with any number of Done calls. Either finish
 	// publishes the shared closed channel, or a Done caller wins publication
 	// and finish closes that channel. No mutex or channel allocation on Wait.
@@ -362,12 +372,21 @@ func (c *completion) finish() {
 }
 
 // Ticket is the completion handle returned by a successful Scheduler.Submit.
+// Slat and Clat may be read after Wait returns or Done is closed. Slat includes
+// scheduler queueing and budget waits. Clat covers all linked operations and
+// any Durable sync, ending before notification or callback execution. Ring
+// placement precedes kernel execution, so Clat includes ring submission and
+// completion reaping. Both are zero if the submission failed before placement.
 type Ticket struct {
 	*completion
 }
 
-func (o *Op) prepareSubmission() Ticket {
-	o.completion = &completion{whenDone: o.whenDone}
+func (c *completion) markIssued() {
+	c.Slat = time.Since(c.started)
+}
+
+func (o *Op) prepareSubmission(started time.Time) Ticket {
+	o.completion = &completion{whenDone: o.whenDone, started: started}
 	o.wait.Add(1)
 	return Ticket{o.completion}
 }
@@ -413,11 +432,10 @@ func (t Ticket) Wait() (int, error) {
 
 func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
 	var count int32
-	linked := op.linked != nil
 	for p := op; p != nil; p = p.linked {
 		kind := p.kind()
-		if linked && p.durable() && (kind == OpWrite || kind == OpWritev) {
-			return 0, fmt.Errorf("iosched: Durable cannot be used in a linked chain; add FdatasyncOp explicitly")
+		if p.linked != nil && p.durable() && (kind == OpWrite || kind == OpWritev) {
+			return 0, fmt.Errorf("iosched: Durable write must be the final operation in a linked chain; add FdatasyncOp for an intermediate sync")
 		}
 		if kind == OpOpenat || kind == OpUnlinkat {
 			if len(p.path) <= 1 {

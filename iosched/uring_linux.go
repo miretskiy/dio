@@ -209,6 +209,7 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 
 // Submit enqueues op for asynchronous execution.
 func (s *URingScheduler) Submit(op Op) (Ticket, error) {
+	started := time.Now()
 	if err := s.stopCause(); err != nil {
 		return Ticket{}, err
 	}
@@ -226,7 +227,7 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 		return Ticket{}, err
 	}
 
-	request, ticket := newSubmission(op, n)
+	request, ticket := newSubmission(op, n, started)
 	if !s.tryPush(request) {
 		return Ticket{}, s.stopCause()
 	}
@@ -568,7 +569,13 @@ func (c *coordinator) accept(head *submission) {
 		head = head.staged
 		work.staged = nil
 		root := &work.root
-		work.durable = root.durable() && (root.kind() == OpWrite || root.kind() == OpWritev)
+		last := root
+		for last.linked != nil {
+			last = last.linked
+		}
+		if last.durable() && (last.kind() == OpWrite || last.kind() == OpWritev) {
+			work.durable = last
+		}
 
 		uses := fileUses(work, work.inlineFile[:0])
 		if err := c.files.check(uses); err != nil {
@@ -577,7 +584,7 @@ func (c *coordinator) accept(head *submission) {
 		}
 		work.cost = c.sched.config.budget.costs(root)
 		work.remaining = work.count
-		if work.durable {
+		if work.durable != nil {
 			work.remaining++ // the fdatasync that covers the write
 		}
 		work.sequence = c.nextSequence
@@ -761,6 +768,7 @@ func (c *coordinator) placeChain(work *submission) (next *submission) {
 		if err != nil {
 			panic(fmt.Sprintf("iosched: Ringo rejected a validated operation: %v", err))
 		}
+		work.completion.markIssued()
 		c.place(ringHandle, ringSlot{kind: slotOperation, work: work, op: root})
 		return next
 	}
@@ -774,6 +782,7 @@ func (c *coordinator) placeChain(work *submission) (next *submission) {
 	if err != nil {
 		panic(fmt.Sprintf("iosched: Ringo rejected a validated chain: %v", err))
 	}
+	work.completion.markIssued()
 	op := root
 	for _, ringHandle := range ringHandles {
 		c.place(ringHandle, ringSlot{kind: slotOperation, work: work, op: op})
@@ -806,6 +815,9 @@ func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submi
 	if err != nil {
 		panic(fmt.Sprintf("iosched: Ringo rejected a validated write: %v", err))
 	}
+	for _, member := range members {
+		member.completion.markIssued()
+	}
 	c.place(ringHandle, ringSlot{kind: slotCoalescedWrite, work: leader})
 	return next
 }
@@ -815,7 +827,7 @@ func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submi
 func (c *coordinator) placeSync(state *fileState) {
 	batch := state.syncBatch
 	state.syncBatch = submissionQueue{}
-	sync := batch.head.root.syncOp()
+	sync := batch.head.durable.syncOp()
 	ringHandle, err := c.ring.Push(c.translateOp(&sync))
 	if err != nil {
 		panic(fmt.Sprintf("iosched: Ringo rejected a validated fdatasync: %v", err))
@@ -1020,19 +1032,21 @@ func (c *coordinator) finishOperation(work *submission, op *Op, n int, err error
 	err = writeResultError(op, n, err)
 	recordResult(&work.root, op, n, err)
 	c.operationDone(work, op)
-	switch {
-	case work.durable && err == nil:
-		c.awaitSync(work)
-	case work.durable:
-		c.operationDone(work, op)
+	if op != work.durable {
+		return
 	}
+	if err != nil {
+		c.operationDone(work, op)
+		return
+	}
+	c.awaitSync(work)
 }
 
 // awaitSync adds a durable write whose write has completed to the batch for
 // its file's next fdatasync. Every durable write on the file that completes
 // before that fdatasync is placed shares it.
 func (c *coordinator) awaitSync(work *submission) {
-	state := work.fileState(&work.root)
+	state := work.fileState(work.durable)
 	if state.syncBatch.len == 0 {
 		c.syncPending = append(c.syncPending, state)
 	}
@@ -1045,7 +1059,7 @@ func (c *coordinator) finishSync(batch submissionQueue, err error) {
 	for batch.len != 0 {
 		work := batch.pop()
 		recordError(&work.root, err)
-		c.operationDone(work, &work.root)
+		c.operationDone(work, work.durable)
 	}
 }
 
