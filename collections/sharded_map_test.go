@@ -6,13 +6,12 @@ import (
 	"slices"
 	"sync"
 	"testing"
-	"unsafe"
 
 	"github.com/stretchr/testify/require"
 )
 
 func TestShardedMap(t *testing.T) {
-	m := NewShardedMap[string, int](3, 10, nil)
+	m := NewShardedMap[string, int](3, WithShardCapacity[string](10))
 	require.Zero(t, m.Len())
 	value, ok := m.Get("missing")
 	require.False(t, ok)
@@ -46,24 +45,10 @@ func TestShardedMap(t *testing.T) {
 	require.Equal(t, 3, value)
 }
 
-func TestShardedMapAlignment(t *testing.T) {
-	m := NewShardedMap[int, int](4, 0, nil)
-	require.EqualValues(t, 64, unsafe.Sizeof(*m.ShardAt(0)))
-	require.NoError(t, VerifyAlignment[int, int, Pad32]())
-	require.Error(t, VerifyAlignment[int, int, struct{}]())
-
-	// An unpadded E is permitted; layout checks belong in caller tests.
-	unpadded := NewShardedMapWithExtra[int, int](4, 0, nil, struct{}{})
-	unpadded.Put(1, 2)
-	value, ok := unpadded.Get(1)
-	require.True(t, ok)
-	require.Equal(t, 2, value)
-}
-
 func TestShardedMapShardCounts(t *testing.T) {
 	for _, count := range []int{1, 3, 4, 6, 16} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {
-			m := NewShardedMap[uint64, uint64](count, 0, func(key uint64) uint64 { return key })
+			m := NewShardedMap[uint64, uint64](count, WithHasher(func(key uint64) uint64 { return key }))
 			require.Equal(t, count, m.ShardCount())
 			for key := range uint64(count * 3) {
 				require.Same(t, m.ShardAt(int(key%uint64(count))), m.Shard(key))
@@ -75,14 +60,14 @@ func TestShardedMapShardCounts(t *testing.T) {
 			require.Same(t, m.ShardAt(int(^uint64(0)%uint64(count))), m.Shard(^uint64(0)))
 		})
 	}
-	require.Panics(t, func() { NewShardedMap[int, int](0, 0, nil) })
-	require.Panics(t, func() { NewShardedMap[int, int](-1, 0, nil) })
-	require.Panics(t, func() { NewShardedMap[int, int](4, -1, nil) })
+	require.Panics(t, func() { NewShardedMap[int, int](0) })
+	require.Panics(t, func() { NewShardedMap[int, int](-1) })
+	require.Panics(t, func() { NewShardedMap[int, int](4, WithShardCapacity[int](-1)) })
 }
 
 func TestShardedMapPrehashedKeys(t *testing.T) {
 	type key struct{ lo, hi uint64 }
-	m := NewShardedMap[key, string](4, 0, func(k key) uint64 { return k.lo })
+	m := NewShardedMap[key, string](4, WithHasher(func(k key) uint64 { return k.lo }))
 	first, second := key{lo: 7, hi: 1}, key{lo: 7, hi: 2}
 	require.Same(t, m.Shard(first), m.Shard(second))
 	m.Put(first, "first")
@@ -101,7 +86,10 @@ func TestShardedMapExtra(t *testing.T) {
 		_    [24]byte
 	}
 	require.NoError(t, VerifyAlignment[int, int, state]())
-	m := NewShardedMapWithExtra[int, int](2, 0, func(key int) uint64 { return uint64(key) }, state{hand: 30})
+	m := NewShardedMapWithExtra[int, int](2, state{hand: 30},
+		WithShardCapacity[int](4),
+		WithHasher(func(key int) uint64 { return uint64(key) }),
+	)
 	for i := range m.ShardCount() {
 		require.EqualValues(t, 30, m.ShardAt(i).Extra.hand)
 	}
@@ -130,7 +118,7 @@ func TestShardedMapIterationUnlocks(t *testing.T) {
 	for _, mode := range []string{"ForEach", "All", "Keys", "Values"} {
 		for _, panics := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/panic=%t", mode, panics), func(t *testing.T) {
-				m := NewShardedMap[int, int](4, 0, nil)
+				m := NewShardedMap[int, int](4)
 				for key := range 20 {
 					m.Put(key, key)
 				}
@@ -183,7 +171,7 @@ func TestShardedMapIterationUnlocks(t *testing.T) {
 }
 
 func TestShardedMapInvalidKeyUnlocks(t *testing.T) {
-	m := NewShardedMap[any, int](1, 0, func(any) uint64 { return 0 })
+	m := NewShardedMap[any, int](1, WithHasher(func(any) uint64 { return 0 }))
 	invalid := []int{1}
 	for _, operation := range []func(){
 		func() { m.Put(invalid, 1) },
@@ -199,7 +187,7 @@ func TestShardedMapInvalidKeyUnlocks(t *testing.T) {
 
 func TestShardedMapConcurrent(t *testing.T) {
 	const workers, keys = 8, 256
-	m := NewShardedMap[int, int](6, 0, nil)
+	m := NewShardedMap[int, int](6)
 	var wg sync.WaitGroup
 	for worker := range workers {
 		wg.Add(1)
@@ -231,7 +219,7 @@ func TestShardedMapConcurrent(t *testing.T) {
 }
 
 func ExampleShardedMap_All() {
-	m := NewShardedMap[string, int](4, 0, nil)
+	m := NewShardedMap[string, int](4)
 	m.Put("apple", 2)
 	m.Put("pear", 3)
 	copy := maps.Collect(m.All())

@@ -1,12 +1,10 @@
 package collections
 
 import (
-	"fmt"
 	"hash/maphash"
 	"iter"
 	"slices"
 	"sync"
-	"unsafe"
 )
 
 // ShardedMap is a concurrent map with caller-owned state in each shard.
@@ -28,9 +26,10 @@ type ShardedMap[K comparable, V, E any] struct {
 // Access Items and Extra while holding the appropriate read or write lock.
 // A MapShard must not be copied after first use.
 //
-// E owns the shard layout, including any padding. Use VerifyAlignment in a
-// test to check that the shard size is a multiple of 64 bytes. Other layouts
-// work, but may cause false sharing between shards.
+// E owns the shard layout, including any padding. The VerifyAlignment helper
+// in alignment_test.go can be copied into caller tests to check the shard size
+// and compiler-inserted trailing padding in E. Constructors accept any layout;
+// insufficient padding may cause false sharing between shards.
 type MapShard[K comparable, V, E any] struct {
 	sync.RWMutex
 	Items map[K]V
@@ -41,57 +40,63 @@ type MapShard[K comparable, V, E any] struct {
 // the lock and map occupy 32 bytes, so MapShard[K, V, Pad32] occupies 64 bytes.
 type Pad32 [32]byte
 
-// VerifyAlignment checks that a MapShard's size is a multiple of 64 bytes.
-// Call it from a test to check E's layout; constructors do not enforce it.
-// It checks the slice stride, not the allocation's starting address.
-func VerifyAlignment[K comparable, V, E any]() error {
-	var shard MapShard[K, V, E]
-	if size := unsafe.Sizeof(shard); size%64 != 0 {
-		return fmt.Errorf("collections: shard size %d is not a multiple of 64 bytes; adjust padding in Extra", size)
-	}
-	return nil
+// ShardedMapOption configures a map independently of its value and state types.
+type ShardedMapOption[K comparable] func(*shardedMapOptions[K])
+
+type shardedMapOptions[K comparable] struct {
+	shardCapacity int
+	hash          func(K) uint64
 }
 
-// NewShardedMap creates a map with exactly shards shards and a total capacity
-// hint distributed across them. It uses Pad32 for a 64-byte shard on 64-bit
-// targets. Use NewShardedMapWithExtra for caller-owned per-shard state.
-// It panics if shards is not positive or capacity is negative.
-// The shard count need not be a power of two.
-//
-// A nil hash uses maphash.Comparable with a seed unique to this map. A supplied
-// hash must be safe for concurrent calls, return the same hash for equal keys
-// throughout the map's lifetime, and distribute keys across its output bits.
-// Already-hashed keys can supply their existing hash without hashing again.
-// Hashes select shards; the underlying maps still compare complete keys.
-func NewShardedMap[K comparable, V any](shards, capacity int, hash func(K) uint64) *ShardedMap[K, V, Pad32] {
-	return NewShardedMapWithExtra[K, V](shards, capacity, hash, Pad32{})
+// WithShardCapacity sets the initial capacity hint for each shard's map.
+// The default is zero. A negative capacity causes construction to panic.
+func WithShardCapacity[K comparable](capacity int) ShardedMapOption[K] {
+	return func(o *shardedMapOptions[K]) { o.shardCapacity = capacity }
+}
+
+// WithHasher selects the hash used to choose a shard. A nil hash uses
+// maphash.Comparable with a seed unique to the map, which is also the default.
+// A supplied hash must be safe for concurrent calls, return the same hash for
+// equal keys throughout the map's lifetime, and distribute keys across its
+// output bits. Already-hashed keys can supply their existing hash directly.
+// The underlying maps still compare complete keys.
+func WithHasher[K comparable](hash func(K) uint64) ShardedMapOption[K] {
+	return func(o *shardedMapOptions[K]) { o.hash = hash }
+}
+
+// NewShardedMap creates a map with exactly shards shards. It uses Pad32 for a
+// 64-byte shard on 64-bit targets. Use NewShardedMapWithExtra for caller-owned
+// per-shard state. The shard count must be positive, but need not be a power
+// of two. Options set the per-shard capacity hint and hash function.
+func NewShardedMap[K comparable, V any](shards int, opts ...ShardedMapOption[K]) *ShardedMap[K, V, Pad32] {
+	return NewShardedMapWithExtra[K, V](shards, Pad32{}, opts...)
 }
 
 // NewShardedMapWithExtra is NewShardedMap with caller-owned state and padding.
 // It copies extra into each shard. Any referenced objects remain shared;
 // initialize those separately through ShardAt if each shard needs its own.
 // No padding is added to E, and its layout is not checked at construction.
-func NewShardedMapWithExtra[K comparable, V, E any](shards, capacity int, hash func(K) uint64, extra E) *ShardedMap[K, V, E] {
+func NewShardedMapWithExtra[K comparable, V, E any](shards int, extra E, opts ...ShardedMapOption[K]) *ShardedMap[K, V, E] {
 	if shards <= 0 {
 		panic("collections: shard count must be positive")
 	}
-	if capacity < 0 {
-		panic("collections: map capacity must not be negative")
+	var o shardedMapOptions[K]
+	for _, opt := range opts {
+		opt(&o)
 	}
-	if hash == nil {
+	if o.shardCapacity < 0 {
+		panic("collections: shard capacity must be nonnegative")
+	}
+	if o.hash == nil {
 		seed := maphash.MakeSeed()
-		hash = func(key K) uint64 { return maphash.Comparable(seed, key) }
+		o.hash = func(key K) uint64 { return maphash.Comparable(seed, key) }
 	}
 	m := &ShardedMap[K, V, E]{
 		shards: make([]MapShard[K, V, E], shards),
-		hash:   hash,
-	}
-	shardCapacity := capacity / shards
-	if capacity%shards != 0 {
-		shardCapacity++
+		hash:   o.hash,
 	}
 	for i := range m.shards {
-		m.shards[i].Items = make(map[K]V, shardCapacity)
+		m.shards[i].Items = make(map[K]V, o.shardCapacity)
 		m.shards[i].Extra = extra
 	}
 	return m
