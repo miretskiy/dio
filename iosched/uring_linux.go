@@ -108,6 +108,10 @@ type URingScheduler struct {
 	registeredBuffers *ringo.FixedBuffers
 	stagingHead       atomic.Pointer[submission]
 	done              chan struct{}
+	stagingPeak       atomic.Int64
+	waitingDepth      queueDepth
+	readyDepth        queueDepth
+	inFlightDepth     queueDepth
 
 	// doorbellFD is a blocking eventfd, not registered with the ring, so the
 	// read the coordinator keeps queued on it completes only when Submit or
@@ -127,6 +131,24 @@ type URingScheduler struct {
 	// drainErr records a coordinator failure or shutdown timeout. It is written
 	// before done closes and read after Close observes that close.
 	drainErr error
+}
+
+// QueueStats reports current submission depths and lifetime high-water marks.
+// It is safe to call concurrently with Submit or completion. Staged depth is
+// read from the immutable published head, without traversing the stack or
+// synchronizing with its reversal. A detached batch being accepted is between
+// Staged and the coordinator queues, so these fields are not a total-work count.
+func (s *URingScheduler) QueueStats() QueueStats {
+	var staged int64
+	if head := s.stagingHead.Load(); head != nil && head != &stagingClosed {
+		staged = head.stagedDepth
+	}
+	return QueueStats{
+		Staged:   QueueDepth{Current: staged, Peak: max(staged, s.stagingPeak.Load())},
+		Waiting:  s.waitingDepth.snapshot(),
+		Ready:    s.readyDepth.snapshot(),
+		InFlight: s.inFlightDepth.snapshot(),
+	}
 }
 
 // NewURingScheduler creates an io_uring-backed scheduler. The kernel must
@@ -295,7 +317,12 @@ func (s *URingScheduler) tryPush(request *submission) bool {
 			return false
 		}
 		request.staged = head
+		request.stagedDepth = 1
+		if head != nil {
+			request.stagedDepth += head.stagedDepth
+		}
 		if s.stagingHead.CompareAndSwap(head, request) {
+			observeQueuePeak(&s.stagingPeak, request.stagedDepth)
 			return true
 		}
 	}
@@ -593,6 +620,8 @@ func (c *coordinator) accept(head *submission) {
 		c.admit(work, uses)
 		if work.waitCount == 0 {
 			c.makeReady(work)
+		} else {
+			c.sched.waitingDepth.add(1)
 		}
 	}
 }
@@ -603,6 +632,7 @@ func (c *coordinator) releaseWait(work *submission) {
 		panic(err)
 	}
 	if work.waitCount == 0 {
+		c.sched.waitingDepth.add(-1)
 		c.makeReady(work)
 	}
 }
@@ -693,7 +723,9 @@ func (c *coordinator) fitsBudget(class ioClass, cost int64) bool {
 // cost to its class's budget.
 func (c *coordinator) take(work *submission) {
 	c.ready.remove(work)
+	c.sched.readyDepth.add(-1)
 	work.state = workIssued
+	c.sched.inFlightDepth.add(1)
 	for class, cost := range work.cost {
 		c.inFlightCost[class] += cost
 	}
@@ -1078,6 +1110,7 @@ func (c *coordinator) operationDone(work *submission, op *Op) {
 	c.completedWork(work)
 	c.accepted.remove(work)
 	work.state = workDone
+	c.sched.inFlightDepth.add(-1)
 	work.root.finish()
 }
 
@@ -1087,6 +1120,7 @@ func (c *coordinator) operationDone(work *submission, op *Op) {
 // treat as an unknown outcome rather than a clean failure. Only a drain that
 // gave up leaves placed work behind.
 func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) {
+	c.sched.readyDepth.add(-int64(c.ready.len))
 	for c.ready.len != 0 {
 		c.ready.pop()
 	}
@@ -1095,6 +1129,12 @@ func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) 
 		// Work in a file's sync batch is still linked there; the table goes
 		// away with the coordinator, but the Ticket keeps work reachable.
 		work.links = [2]queueLinks{}
+		switch work.state {
+		case workWaiting:
+			c.sched.waitingDepth.add(-1)
+		case workIssued:
+			c.sched.inFlightDepth.add(-1)
+		}
 		if work.state == workIssued && c.occupied != 0 {
 			completeUnknown(&work.root, placed)
 		} else {

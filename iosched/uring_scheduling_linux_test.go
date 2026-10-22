@@ -90,8 +90,14 @@ func testFile(t *testing.T, size int) *os.File {
 // issueForTest marks accepted work issued without placing it, so a test can
 // deliver its completions itself.
 func issueForTest(c *coordinator, work *submission) {
-	if work.state == workReady {
+	switch work.state {
+	case workReady:
 		c.ready.remove(work)
+		c.sched.readyDepth.add(-1)
+		c.sched.inFlightDepth.add(1)
+	case workWaiting:
+		c.sched.waitingDepth.add(-1)
+		c.sched.inFlightDepth.add(1)
 	}
 	work.state = workIssued
 }

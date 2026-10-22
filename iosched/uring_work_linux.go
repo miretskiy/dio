@@ -8,13 +8,14 @@ import (
 
 // submission is one validated Submit call. Submit builds it and pushes it onto
 // the staging stack; once the coordinator accepts it, it is the coordinator's
-// record of that work until its ticket completes. Only the coordinator touches
-// the fields after staged.
+// record of that work until its ticket completes. stagedDepth is immutable
+// after publication; only the coordinator touches the fields after it.
 type submission struct {
-	root       Op          // scheduler-owned copy of the submitted operation chain
-	completion completion  // result state shared with the returned Ticket
-	count      int32       // validated number of operations in root's chain
-	staged     *submission // next item in the lock-free staging stack
+	root        Op          // scheduler-owned copy of the submitted operation chain
+	completion  completion  // result state shared with the returned Ticket
+	count       int32       // validated number of operations in root's chain
+	staged      *submission // next item in the lock-free staging stack
+	stagedDepth int64       // stack depth at this node's successful publication
 
 	state workState
 	// waitCount counts the lifecycle barriers still holding the work.
@@ -138,4 +139,5 @@ func (c *coordinator) makeReady(work *submission) {
 	}
 	work.state = workReady
 	c.ready.push(work)
+	c.sched.readyDepth.add(1)
 }
