@@ -4,7 +4,6 @@ package iosched
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/v2/ringo"
 )
@@ -23,7 +21,7 @@ import (
 // reaping itself, and blocking files decide when operations complete. Cleanup
 // cancels and drains whatever is still in flight, fails the remaining tickets
 // and closes the ring.
-func newTestCoordinator(t *testing.T, depth int, vfiles uint32) *coordinator {
+func newTestCoordinator(t *testing.T, depth int, vfiles uint32, opts ...Option) *coordinator {
 	t.Helper()
 	if !IOUringAvailable {
 		t.Skip("io_uring not available")
@@ -39,11 +37,12 @@ func newTestCoordinator(t *testing.T, depth int, vfiles uint32) *coordinator {
 		fixedFiles[i], err = ring.FixedFiles().File(uint32(i))
 		require.NoError(t, err)
 	}
+	cfg := makeSchedulerConfig(append([]Option{diskOptions(WithoutIOBudget()), WithVFiles(vfiles)}, opts...))
+	// Manually driven tests use the ring's own depth, below the scheduler's
+	// minimum, and reserve no doorbell entry.
+	cfg.ringDepth = uint32(ring.Capacity())
 	c := newCoordinator(&URingScheduler{
-		config: schedulerConfig{
-			ringDepth: uint32(ring.Capacity()),
-			vfiles:    vfiles,
-		},
+		config:     cfg,
 		ring:       ring,
 		fixedFiles: fixedFiles,
 		doorbellFD: -1,
@@ -90,14 +89,13 @@ func testFile(t *testing.T, size int) *os.File {
 // issueForTest marks accepted work issued without placing it, so a test can
 // deliver its completions itself.
 func issueForTest(c *coordinator, work *submission) {
+	if work.state != workIssued && !c.sched.config.disk.dispatch(work, &c.inFlight) {
+		panic("test exceeded dispatch budget")
+	}
 	switch work.state {
 	case workReady:
 		c.ready.remove(work)
-		c.sched.readyDepth.add(-1)
-		c.sched.inFlightDepth.add(1)
 	case workWaiting:
-		c.sched.waitingDepth.add(-1)
-		c.sched.inFlightDepth.add(1)
 	}
 	work.state = workIssued
 }
@@ -109,7 +107,9 @@ func issueWriteGroupForTest(c *coordinator, works ...*submission) {
 	for _, work := range works {
 		issueForTest(c, work)
 	}
-	works[0].coalesced = works
+	for i, work := range works[1:] {
+		works[i].staged = work
+	}
 }
 
 // acceptOps stages ops in order, has c accept them, and returns their tickets
@@ -118,8 +118,14 @@ func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []*submission) {
 	tickets := make([]Ticket, len(ops))
 	var head, tail *submission
 	for i := range ops {
-		request, ticket := newSubmission(ops[i], int32(ops[i].opCount()), time.Now())
-		tickets[i] = ticket
+		request, err := c.sched.prepareSubmission(&ops[i])
+		if err != nil {
+			panic(err)
+		}
+		if !c.sched.config.disk.admit(request) {
+			panic(ErrRejected)
+		}
+		tickets[i] = Ticket{&request.completion}
 		if head == nil {
 			head = request
 		} else {
@@ -140,9 +146,10 @@ var benchmarkURingRequest *submission
 func BenchmarkURingSubmissionState(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
-		request, ticket := newSubmission(Op{}, 1, time.Now())
+		request := prepareForTest(Op{})
+		ticket := Ticket{&request.completion}
 		benchmarkURingRequest = request
-		request.root.finish()
+		request.finish()
 		benchmarkTicket = ticket
 	}
 }
@@ -212,7 +219,7 @@ func TestSubmitRejectsInvalidVirtualFileBeforeStaging(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &URingScheduler{
-				config: schedulerConfig{ringDepth: 1, vfiles: tc.vfiles},
+				config: schedulerConfig{ringDepth: minRingDepth, vfiles: tc.vfiles, disk: &DiskPolicy{}},
 			}
 			_, err := s.Submit(tc.op(tc.vfd))
 			require.Error(t, err)
@@ -269,7 +276,9 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	c := newTestCoordinator(t, 2, 1)
 	s := c.sched
 	op := VReadOp(0, make([]byte, 1), 0)
-	request, ticket := newSubmission(op, 1, time.Now())
+	request := prepareForTest(op)
+	ticket := Ticket{&request.completion}
+	require.True(t, s.config.disk.admit(request))
 	if !s.tryPush(request) {
 		t.Fatal("submission was rejected before close")
 	}
@@ -368,10 +377,7 @@ func TestDrainOutcomeOverridesEarlierOperationError(t *testing.T) {
 // placing it.
 func completeForTest(c *coordinator, work *submission, index uint32, n int, err error) {
 	issueForTest(c, work)
-	op := &work.root
-	for i := uint32(0); i < index; i++ {
-		op = op.linked
-	}
+	op := work.op(int(index))
 	c.finishOperation(work, op, n, err)
 }
 
@@ -444,56 +450,12 @@ func TestShutdownCancelsBlockedOperation(t *testing.T) {
 	require.Zero(t, c.occupied)
 }
 
-func TestShutdownDrainsStagedFileGenerationsInOrder(t *testing.T) {
-	c := newTestCoordinator(t, 4, 1)
-	f := testFile(t, 2)
-	var tickets []Ticket
-	for _, op := range []Op{
-		VOpenatOp(unix.AT_FDCWD, f.Name(), os.O_WRONLY, 0, 0).Link(VWriteOp(0, []byte("a"), 0)),
-		VCloseOp(0),
-		VOpenatOp(unix.AT_FDCWD, f.Name(), os.O_WRONLY, 0, 0).Link(VWriteOp(0, []byte("b"), 1)),
-		VCloseOp(0),
-	} {
-		work, ticket := newSubmission(op, int32(op.opCount()), time.Now())
-		require.True(t, c.sched.tryPush(work))
-		tickets = append(tickets, ticket)
-	}
-	require.NoError(t, c.shutdown(errSchedulerClosed))
-	for _, ticket := range tickets {
-		_, err := ticket.Wait()
-		require.NoError(t, err)
-	}
-	got := make([]byte, 2)
-	_, err := f.ReadAt(got, 0)
-	require.NoError(t, err)
-	require.Equal(t, "ab", string(got))
-}
-
-func TestFileDependenciesOpenBlocksLaterRead(t *testing.T) {
-	c := newTestCoordinator(t, 4, 2)
-	_, handles := acceptOps(c,
-		VOpenatOp(0, "file", 0, 0, 1),
-		VReadOp(1, make([]byte, 1), 0),
-	)
-
-	if handles[1].waitCount != 1 || handles[1].state == workReady {
-		t.Fatal("read did not wait for open")
-	}
-	waiterCap := cap(c.files.virtual[1].openWaiters)
-	require.NotZero(t, waiterCap)
-	completeForTest(c, handles[0], 0, 0, nil)
-	require.Equal(t, waiterCap, cap(c.files.virtual[1].openWaiters))
-	if handles[1].state != workReady {
-		t.Fatal("read did not become ready at open completion")
-	}
-	completeForTest(c, handles[1], 0, 1, nil)
-}
-
 func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
-	c := newTestCoordinator(t, 4, 2)
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 4)
 	_, handles := acceptOps(c,
-		VReadOp(1, make([]byte, 1), 0),
-		VCloseOp(1),
+		ReadOp(f, make([]byte, 1), 0),
+		DrainOp(f),
 	)
 
 	if handles[1].waitCount != 1 {
@@ -507,12 +469,13 @@ func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
 }
 
 func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
-	c := newTestCoordinator(t, 4, 1)
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 4)
 	_, handles := acceptOps(c,
-		VReadOp(0, make([]byte, 1), 0),
-		VWriteOp(0, make([]byte, 1), 1).Link(
-			VWriteOp(0, make([]byte, 1), 2),
-			VCloseOp(0),
+		ReadOp(f, make([]byte, 1), 0),
+		WriteOp(f, make([]byte, 1), 1).Link(
+			WriteOp(f, make([]byte, 1), 2),
+			DrainOp(f),
 		),
 	)
 
@@ -520,14 +483,15 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 	if chain.waitCount != 1 || chain.state == workReady {
 		t.Fatal("close chain did not wait exactly for older work")
 	}
-	if got := c.files.virtual[0].closeRemaining; got != 1 {
+	if got := c.files.regular[f].closeRemaining; got != 1 {
 		t.Fatalf("close drain counted its own chain: got %d older operations want 1", got)
 	}
 
-	lateRoot := VReadOp(0, make([]byte, 1), 3)
-	lateRequest, late := newSubmission(lateRoot, int32(lateRoot.opCount()), time.Now())
-	c.accept(lateRequest)
-	_, err := late.Wait()
+	lateRoot := ReadOp(f, make([]byte, 1), 3)
+	late, err := c.sched.Submit(lateRoot)
+	require.NoError(t, err)
+	c.accept(c.sched.takeStaged())
+	_, err = late.Wait()
 	if err == nil {
 		t.Fatal("work submitted behind a close at the end of a chain was accepted")
 	}
@@ -542,10 +506,11 @@ func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
 }
 
 func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
-	c := newTestCoordinator(t, 4, 1)
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 4)
 	tickets, handles := acceptOps(c,
-		VCloseOp(0),
-		VReadOp(0, make([]byte, 1), 0),
+		DrainOp(f),
+		ReadOp(f, make([]byte, 1), 0),
 	)
 
 	if len(handles) != 1 {
@@ -556,89 +521,6 @@ func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
 		t.Fatal("work submitted behind close was accepted")
 	}
 	completeForTest(c, handles[0], 0, 0, nil)
-}
-
-func TestDeferredMultiFileWorkIsKnownAtAdmission(t *testing.T) {
-	c := newTestCoordinator(t, 8, 2)
-	_, handles := acceptOps(c,
-		VOpenatOp(0, "a", 0, 0, 0),
-		VReadOp(0, make([]byte, 1), 0).Link(VWriteOp(1, make([]byte, 1), 0)),
-		VCloseOp(1),
-	)
-
-	if handles[1].waitCount != 1 {
-		t.Fatal("linked work did not wait for open")
-	}
-	if handles[2].waitCount != 1 {
-		t.Fatal("close overtook older blocked write")
-	}
-	completeForTest(c, handles[0], 0, 0, nil)
-	completeForTest(c, handles[1], 0, 1, nil)
-	if handles[2].state == workReady {
-		t.Fatal("close became ready before the linked write completed")
-	}
-	completeForTest(c, handles[1], 1, 1, nil)
-	completeForTest(c, handles[2], 0, 0, nil)
-}
-
-func TestOpenBarrierWaitsForWholeLinkedChain(t *testing.T) {
-	c := newTestCoordinator(t, 4, 2)
-	_, handles := acceptOps(c,
-		VOpenatOp(0, "a", 0, 0, 0).Link(
-			VFallocateOp(0, 4096),
-			VReadOp(1, make([]byte, 1), 0),
-		),
-		VReadOp(0, make([]byte, 1), 0),
-	)
-
-	completeForTest(c, handles[0], 0, 0, nil)
-	if handles[1].state == workReady {
-		t.Fatal("open dependent escaped after only the open completed")
-	}
-	completeForTest(c, handles[0], 1, 0, nil)
-	if handles[1].state == workReady {
-		t.Fatal("open dependent escaped before the whole linked chain completed")
-	}
-	completeForTest(c, handles[0], 2, 1, nil)
-	if handles[1].state != workReady {
-		t.Fatal("open dependent did not become ready with the linked chain")
-	}
-	completeForTest(c, handles[1], 0, 1, nil)
-}
-
-func TestFailedOpenRetryWaitsForReleasedSlotWork(t *testing.T) {
-	c := newTestCoordinator(t, 4, 1)
-	_, handles := acceptOps(c,
-		VOpenatOp(0, "a", 0, 0, 0),
-		VWriteOp(0, make([]byte, 1), 0),
-	)
-
-	completeForTest(c, handles[0], 0, 0, syscall.ENOENT)
-	if handles[1].state != workReady {
-		t.Fatal("failed open did not release waiting write")
-	}
-
-	retryRoot := VOpenatOp(0, "b", 0, 0, 0)
-	retryRequest, retry := newSubmission(retryRoot, int32(retryRoot.opCount()), time.Now())
-	c.accept(retryRequest)
-	_, err := retry.Wait()
-	if err == nil {
-		t.Fatal("retry open was accepted while prior slot work remained")
-	}
-
-	completeForTest(c, handles[1], 0, 0, syscall.EBADF)
-	finalRoot := VOpenatOp(0, "b", 0, 0, 0)
-	finalRequest, final := newSubmission(finalRoot, int32(finalRoot.opCount()), time.Now())
-	c.accept(finalRequest)
-	if c.accepted.len != 1 {
-		t.Fatal("retry open was not accepted after prior slot work completed")
-	}
-	handle := c.accepted.head
-	completeForTest(c, handle, 0, 0, nil)
-	_, err = final.Wait()
-	if err != nil {
-		t.Fatalf("final open failed: %v", err)
-	}
 }
 
 // TestCoalescedDurableWritesShareSyncError coalesces two durable writes. Each
@@ -687,210 +569,61 @@ func TestFileTableReusesRegularState(t *testing.T) {
 	var files fileTable
 	firstFile := new(os.File)
 	firstOp := ReadOp(firstFile, nil, 0)
-	first := files.state(&firstOp)
-	files.removeIfEmpty(&firstOp, first)
+	first := files.state(&firstOp.operation)
+	files.removeIfEmpty(&firstOp.operation, first)
 
 	secondFile := new(os.File)
 	secondOp := ReadOp(secondFile, nil, 0)
-	second := files.state(&secondOp)
+	second := files.state(&secondOp.operation)
 	if second != first {
 		t.Fatal("regular file state was not reused")
 	}
 }
 
-// TestOpenBarrierHoldsSlotWorkUntilChainCompletes accepts a same-slot read
-// after the open's chain is already in the ring. The read must stay out of the
-// ring while that chain runs, even after the open itself and unrelated work
-// complete, and be placed once the chain does.
-func TestOpenBarrierHoldsSlotWorkUntilChainCompletes(t *testing.T) {
-	c := newTestCoordinator(t, 8, 1)
-	want := []byte("opened")
-	path := filepath.Join(t.TempDir(), "file")
-	require.NoError(t, os.WriteFile(path, want, 0o600))
-	chainTail, releaseChain := blockingRead(t)
-	other, releaseOther := blockingRead(t)
-	acceptOps(c,
-		VOpenatOp(unix.AT_FDCWD, path, unix.O_RDONLY, 0, 0).Link(ReadOp(chainTail, make([]byte, 8), 0)),
-		ReadOp(other, make([]byte, 8), 0),
-	)
-	c.placeReady(false)
-	require.NoError(t, c.enter(0))
-
-	got := make([]byte, len(want))
-	readTickets, _ := acceptOps(c, VReadOp(0, got, 0))
-	c.placeReady(false)
-	require.Equal(t, 3, c.occupied, "same-slot read reached the ring while the open was in flight")
-
-	releaseOther()
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 1 }) // the open and the unrelated read
-	c.placeReady(false)
-	require.Equal(t, 1, c.occupied, "same-slot read reached the ring before the open's chain completed")
-
-	releaseChain()
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	c.placeReady(false)
-	require.Equal(t, 1, c.occupied, "same-slot read was not placed after the open's chain completed")
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-
-	n, err := readTickets[0].Wait()
-	require.NoError(t, err)
-	require.Equal(t, len(want), n)
-	require.Equal(t, want, got)
-}
-
-// TestCloseDrainHoldsCloseUntilSlotWorkCompletes accepts a close behind a
-// same-slot read that is still in flight. The close must stay out of the ring
-// after unrelated work completes, and be placed once the read does. The slot
-// holds a FIFO, so the read completes when the test writes to it.
-func TestCloseDrainHoldsCloseUntilSlotWorkCompletes(t *testing.T) {
-	c := newTestCoordinator(t, 8, 1)
-	fifo := filepath.Join(t.TempDir(), "fifo")
-	require.NoError(t, unix.Mkfifo(fifo, 0o600))
-	openTickets, _ := acceptOps(c, VOpenatOp(unix.AT_FDCWD, fifo, unix.O_RDWR, 0, 0))
-	c.placeReady(false)
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	_, err := openTickets[0].Wait()
-	require.NoError(t, err)
-
-	other, releaseOther := blockingRead(t)
-	got := make([]byte, 4)
-	readTickets, _ := acceptOps(c, VReadOp(0, got, 0), ReadOp(other, make([]byte, 8), 0))
-	c.placeReady(false)
-	require.NoError(t, c.enter(0))
-	closeTickets, _ := acceptOps(c, VCloseOp(0))
-	c.placeReady(false)
-	require.Equal(t, 2, c.occupied, "close reached the ring before the older same-slot read completed")
-
-	releaseOther()
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 1 })
-	c.placeReady(false)
-	require.Equal(t, 1, c.occupied, "unrelated completion released the close")
-
-	// The slot's FIFO is open for reading, so this open does not block.
-	writer, err := os.OpenFile(fifo, os.O_WRONLY, 0)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, writer.Close()) }()
-	_, err = writer.Write([]byte("ping"))
-	require.NoError(t, err)
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	c.placeReady(false)
-	require.Equal(t, 1, c.occupied, "close was not placed after the same-slot read completed")
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-
-	n, err := readTickets[0].Wait()
-	require.NoError(t, err)
-	require.Equal(t, "ping", string(got[:n]))
-	_, err = closeTickets[0].Wait()
-	require.NoError(t, err)
-}
-
-// TestChainWaitsOnceForAnOpen accepts a chain with two operations on a slot
-// whose open is unfinished: the chain waits for the open once, not once per
-// operation, and is released when the open's chain completes.
-func TestChainWaitsOnceForAnOpen(t *testing.T) {
-	c := newTestCoordinator(t, 4, 1)
-	_, handles := acceptOps(c,
-		VOpenatOp(0, "file", 0, 0, 0),
-		VReadOp(0, make([]byte, 1), 0).Link(VReadOp(0, make([]byte, 1), 1)),
-	)
-	require.EqualValues(t, 1, handles[1].waitCount)
-	require.Len(t, c.files.virtual[0].openWaiters, 1)
-
-	completeForTest(c, handles[0], 0, 0, nil)
-	require.Equal(t, workReady, handles[1].state, "the chain was not released by the open")
-	completeForTest(c, handles[1], 0, 1, nil)
-	completeForTest(c, handles[1], 1, 1, nil)
-}
-
-// withDefaultBudget gives a test coordinator the scheduler's default in-flight
-// budget, which newTestCoordinator leaves off.
+// withDefaultBudget enables admission limits, which test coordinators leave off.
 func withDefaultBudget(c *coordinator) *coordinator {
-	c.sched.config.budget = defaultBudget()
+	c.sched.config.disk = NewDiskPolicy()
 	return c
 }
 
-// TestBudgetHoldsWritesNotReads queues more writes than the write budget
-// allows, then a read. The read is placed past the held writes, and the next
-// write is placed once the first one completes and returns its cost.
-func TestBudgetHoldsWritesNotReads(t *testing.T) {
+func TestBudgetQueuesWritesAndServesReads(t *testing.T) {
 	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
 	f := testFile(t, 3<<20)
-	mib := make([]byte, 1<<20)
-	tickets, handles := acceptOps(c,
-		WriteOp(f, mib, 0),
-		WriteOp(f, mib, 1<<20),
-		WriteOp(f, mib, 2<<20),
-		ReadOp(f, make([]byte, 4096), 0),
-	)
-	// A 1 MiB write costs 0.86 ms of the 1.5 ms goal, so only one fits.
-	placed, room := c.placeReady(false)
-	require.Equal(t, 2, placed, "want the first write and the read")
-	require.Equal(t, workIssued, handles[0].state)
-	require.Equal(t, workReady, handles[1].state)
-	require.Equal(t, workReady, handles[2].state)
-	require.Equal(t, workIssued, handles[3].state, "the read waited for the write budget")
-	require.True(t, room, "reads still have budget, so new work could be placed")
-	require.Zero(t, handles[1].completion.Slat, "budget-held work has not reached the ring")
-	require.Zero(t, handles[2].completion.Slat)
-
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	require.Equal(t, [budgetedClasses]int64{}, c.inFlightCost, "completed work kept its cost")
-	secondIssue := time.Now()
-	placed, _ = c.placeReady(false)
-	require.Equal(t, 1, placed, "want the second write alone")
-	require.Equal(t, workIssued, handles[1].state)
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	c.placeReady(false)
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	for i, ticket := range tickets {
-		_, err := ticket.Wait()
-		require.NoErrorf(t, err, "ticket %d", i)
-		require.Positive(t, ticket.Slat)
-		require.Positive(t, ticket.Clat)
-	}
-	require.GreaterOrEqual(t, tickets[1].Slat, secondIssue.Sub(handles[1].completion.started), "slat includes waiting for budget")
-	require.LessOrEqual(t, tickets[1].Clat, time.Since(secondIssue), "clat excludes waiting for budget")
-}
-
-// TestBudgetKeepsClassOrder holds a small read behind a large one that does
-// not fit: within a class, later work waits for earlier work, so a large
-// operation is never overtaken indefinitely.
-func TestBudgetKeepsClassOrder(t *testing.T) {
-	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
-	f := testFile(t, 4<<20)
-	_, handles := acceptOps(c,
-		ReadOp(f, make([]byte, 1<<20), 0),
-		ReadOp(f, make([]byte, 1<<20), 1<<20),
-		ReadOp(f, make([]byte, 1<<20), 2<<20),
-		ReadOp(f, make([]byte, 1<<20), 3<<20), // 4 × 0.41 ms > 1.5 ms
-		ReadOp(f, make([]byte, 4096), 0),
-	)
-	placed, room := c.placeReady(false)
-	require.Equal(t, 3, placed)
-	require.Equal(t, workReady, handles[3].state)
-	require.Equal(t, workReady, handles[4].state, "a small read overtook a large one")
-	require.True(t, room, "writes still have budget")
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-}
-
-// TestBudgetAdmitsOneOversizedOperation places an operation that costs more
-// than the whole goal when its class has nothing in flight.
-func TestBudgetAdmitsOneOversizedOperation(t *testing.T) {
-	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
-	f := testFile(t, 4<<20)
-	big := make([]byte, 2<<20) // 1.7 ms of write time, more than the 1.5 ms goal
-	_, handles := acceptOps(c, WriteOp(f, big, 0), WriteOp(f, big, 2<<20))
-	placed, room := c.placeReady(false)
-	require.Equal(t, 1, placed, "want the first oversized write alone")
-	require.Equal(t, workReady, handles[1].state)
-	require.True(t, room)
+	tickets, works := acceptOps(c, WriteOp(f, make([]byte, 1<<20), 0),
+		WriteOp(f, make([]byte, 1<<20), 1<<20), ReadOp(f, make([]byte, 4096), 0))
+	require.Zero(t, c.sched.config.disk.Stats().Writes.ServiceTime)
+	placed, _ := c.placeReady(false)
+	require.Equal(t, 2, placed)
+	require.Equal(t, workReady, works[1].state)
+	require.Equal(t, workIssued, works[2].state, "read bypasses a queued write")
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	placed, _ = c.placeReady(false)
 	require.Equal(t, 1, placed)
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	submitAndReapUntil(t, c, func() bool { return c.accepted.len == 0 })
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	require.Equal(t, DiskStats{}, c.sched.config.disk.Stats())
 }
 
-// TestBudgetChargesCoalescedRun charges a coalesced run the cost of all its
+func TestBudgetDispatchesOneOversizedOperation(t *testing.T) {
+	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
+	f := testFile(t, 4<<20)
+	big := make([]byte, 2<<20)
+	tickets, works := acceptOps(c, WriteOp(f, big, 0), WriteOp(f, big, 2<<20))
+	for i := range tickets {
+		placed, _ := c.placeReady(true)
+		require.Equal(t, 1, placed, "coalescing cannot enlarge the oversized-request exception")
+		require.Equal(t, workIssued, works[i].state)
+		submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+		_, err := tickets[i].Wait()
+		require.NoError(t, err)
+	}
+	require.Equal(t, DiskStats{}, c.sched.config.disk.Stats())
+}
+
+// TestBudgetChargesCoalescedRun charges a coalesced run the service time of all its
 // members and returns it when the run's write completes.
 func TestBudgetChargesCoalescedRun(t *testing.T) {
 	c := withDefaultBudget(newTestCoordinator(t, 16, 0))
@@ -902,9 +635,9 @@ func TestBudgetChargesCoalescedRun(t *testing.T) {
 	tickets, handles := acceptOps(c, ops...)
 	placed, _ := c.placeReady(true)
 	require.Equal(t, 1, placed)
-	require.Equal(t, 4*handles[0].cost[classWrite], c.inFlightCost[classWrite])
+	require.EqualValues(t, 4*handles[0].writes.serviceTime, c.sched.config.disk.Stats().Writes.ServiceTime)
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	require.Zero(t, c.inFlightCost[classWrite])
+	require.Zero(t, c.sched.config.disk.Stats().Writes.ServiceTime)
 	for _, ticket := range tickets {
 		_, err := ticket.Wait()
 		require.NoError(t, err)
@@ -913,57 +646,24 @@ func TestBudgetChargesCoalescedRun(t *testing.T) {
 	}
 }
 
-// TestBudgetReleaseOfUnchargedWork completes work that was never placed, as
-// tests and shutdown do: there is nothing to return to the budget.
-func TestBudgetReleaseOfUnchargedWork(t *testing.T) {
+func TestBudgetReleaseOfUnplacedWork(t *testing.T) {
 	c := withDefaultBudget(newTestCoordinator(t, 4, 1))
 	_, handles := acceptOps(c, VReadOp(0, make([]byte, 4096), 0))
+	require.Zero(t, c.sched.config.disk.Stats().Reads.ServiceTime)
 	completeForTest(c, handles[0], 0, 4096, nil)
-	require.Zero(t, c.inFlightCost[classRead])
+	require.Zero(t, c.sched.config.disk.Stats().Reads.ServiceTime)
 }
 
-func TestNewURingSchedulerValidatesBudget(t *testing.T) {
+func TestNewURingSchedulerWithZeroBudget(t *testing.T) {
 	if !IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
-	_, err := NewURingScheduler(WithLatencyGoal(0))
-	require.ErrorContains(t, err, "WithoutIOBudget")
-	s, err := NewURingScheduler(WithoutIOBudget())
-	require.NoError(t, err)
-	require.NoError(t, s.Close())
-}
-
-func TestBudgetLimitsMergedWritesAndPreservesOversizedProgress(t *testing.T) {
-	for _, size := range []int{512 << 10, 1 << 20, 2 << 20} {
-		t.Run(fmt.Sprint(size), func(t *testing.T) {
-			c := withDefaultBudget(newTestCoordinator(t, 16, 0))
-			f := testFile(t, 4*size)
-			var ops []Op
-			for i := range 4 {
-				ops = append(ops, WriteOp(f, make([]byte, size), int64(i*size)))
-			}
-			tickets, handles := acceptOps(c, ops...)
-			for c.accepted.len != 0 {
-				c.placeReady(true)
-				require.Positive(t, c.occupied, "an oversized record must make progress")
-				issued := 0
-				for _, w := range handles {
-					if w.state == workIssued {
-						issued++
-					}
-				}
-				if handles[0].cost[classWrite] > int64(DefaultLatencyGoal) {
-					require.Equal(t, 1, issued, "only one oversized record may bypass the budget")
-				} else {
-					require.LessOrEqual(t, c.inFlightCost[classWrite], int64(DefaultLatencyGoal), "coalescing exceeded the budget")
-				}
-				submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-			}
-			for _, ticket := range tickets {
-				_, err := ticket.Wait()
-				require.NoError(t, err)
-			}
-		})
+	for _, option := range []DiskPolicyOption{WithLatencyGoal(0), WithLatencyGoal(-1), WithoutIOBudget()} {
+		s, err := NewURingScheduler(diskOptions(option))
+		require.NoError(t, err)
+		require.Zero(t, s.config.disk.device.reads.latency)
+		require.Zero(t, s.config.disk.device.writes.latency)
+		require.NoError(t, s.Close())
 	}
 }
 
@@ -971,62 +671,30 @@ func TestBudgetChargesOpenFollowersUntilTheirCompletion(t *testing.T) {
 	c := withDefaultBudget(newTestCoordinator(t, 16, 1))
 	_, works := acceptOps(c,
 		VOpenatOp(0, "unused", 0, 0, 0).Link(VWriteOp(0, make([]byte, 1<<20), 0)),
-		VWriteOp(0, make([]byte, 1<<20), 1<<20),
 	)
-	require.Positive(t, works[0].cost[classWrite])
-	c.take(works[0]) // model CQEs without accessing the fake path
+	require.Positive(t, works[0].writes.serviceTime)
+	issueForTest(c, works[0]) // model CQEs without accessing the fake path
 	completeForTest(c, works[0], 0, 0, nil)
-	require.Positive(t, c.inFlightCost[classWrite], "open CQE released its follower's write charge")
+	require.Positive(t, c.sched.config.disk.Stats().Writes.ServiceTime, "open CQE released its follower's write charge")
 	completeForTest(c, works[0], 1, 1<<20, nil)
-	require.Zero(t, c.inFlightCost[classWrite])
-	completeForTest(c, works[1], 0, 1<<20, nil)
+	require.Zero(t, c.sched.config.disk.Stats().Writes.ServiceTime)
 }
 
-func TestVirtualGenerationsQueueBehindClose(t *testing.T) {
-	c := newTestCoordinator(t, 16, 1)
-	var ops []Op
-	for range 3 {
-		ops = append(ops, VOpenatOp(0, "unused", 0, 0, 0),
-			VWriteOp(0, make([]byte, 1), 0),
-			VCloseOp(0))
-	}
-	tickets, works := acceptOps(c, ops...)
-	require.Len(t, works, len(ops), "a queued reopen was rejected")
-	for i := range works {
-		require.Equal(t, workReady, works[i].state, "next operation %d", i)
-		for _, later := range works[i+1:] {
-			require.Equal(t, workWaiting, later.state)
-		}
-		completeForTest(c, works[i], 0, 1, nil)
-	}
-	for _, ticket := range tickets {
-		_, err := ticket.Wait()
-		require.NoError(t, err)
-	}
-	require.Len(t, c.files.free, 2, "old generations should be reusable")
-}
-
-func TestQueuedOpenWriteCloseChainsKeepGenerationsSeparate(t *testing.T) {
-	c := withDefaultBudget(newTestCoordinator(t, 16, 1))
-	var ops []Op
-	for range 3 {
-		ops = append(ops, VOpenatOp(0, "unused", 0, 0, 0).Link(
-			VWriteOp(0, make([]byte, 4096), 0), VCloseOp(0)))
-	}
-	tickets, works := acceptOps(c, ops...)
-	require.Len(t, works, 3)
-	for i, work := range works {
+func TestVirtualOperationsHaveNoLifecycleBarriers(t *testing.T) {
+	c := newTestCoordinator(t, 8, 1)
+	tickets, works := acceptOps(c,
+		VOpenatOp(0, "unused", 0, 0, 0),
+		VReadOp(0, make([]byte, 1), 0),
+		VCloseOp(0),
+		VOpenatOp(0, "another", 0, 0, 0),
+	)
+	require.Len(t, works, len(tickets))
+	for _, work := range works {
 		require.Equal(t, workReady, work.state)
-		completeForTest(c, work, 0, 0, nil)
-		completeForTest(c, work, 1, 4096, nil)
-		if i+1 < len(works) {
-			require.Equal(t, workWaiting, works[i+1].state)
-		}
-		completeForTest(c, work, 2, 0, nil)
+		require.Zero(t, work.waitCount)
 	}
-	for _, ticket := range tickets {
-		_, err := ticket.Wait()
-		require.NoError(t, err)
+	for _, work := range works {
+		completeForTest(c, work, 0, 0, nil)
 	}
 }
 
@@ -1034,4 +702,28 @@ func TestShutdownReportsCoordinatorFailure(t *testing.T) {
 	c := newTestCoordinator(t, 2, 0)
 	cause := errors.New("ring failed")
 	require.ErrorIs(t, c.shutdown(cause), cause)
+}
+
+// Unbudgeted reads remain admissible while the write allowance is full.
+func TestUnbudgetedReadsPassFullWriteAllowance(t *testing.T) {
+	c := newTestCoordinator(t, 16, 0, diskOptions(WithLatencyGoal(DefaultLatencyGoal), WithoutReadIOBudget()))
+	f := testFile(t, 5<<20)
+	mib := make([]byte, 1<<20)
+	ops := []Op{WriteOp(f, mib, 0)}
+	for i := range 5 {
+		ops = append(ops, ReadOp(f, make([]byte, 1<<20), int64(i<<20)))
+	}
+	tickets, handles := acceptOps(c, ops...)
+	placed, _ := c.placeReady(false)
+	require.Equal(t, 6, placed)
+	for _, h := range handles {
+		require.Equal(t, workIssued, h.state)
+	}
+	require.Zero(t, c.sched.config.disk.Stats().Reads.ServiceTime)
+	require.Positive(t, c.sched.config.disk.Stats().Writes.ServiceTime)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
 }

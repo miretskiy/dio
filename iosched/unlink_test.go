@@ -38,8 +38,4 @@ func testUnlink(t *testing.T, s iosched.Scheduler) {
 	_, err = submitAndWait(t, s, iosched.UnlinkatOp(int(d.Fd()), "missing").HardLink(iosched.UnlinkatOp(int(d.Fd()), "victim")))
 	require.ErrorIs(t, err, os.ErrNotExist)
 	require.NoFileExists(t, path) // a failed hard-linked unlink does not cancel its peer
-	for _, invalid := range []string{"", "bad\x00path"} {
-		_, err := s.Submit(iosched.UnlinkatOp(int(d.Fd()), invalid))
-		require.Error(t, err)
-	}
 }

@@ -162,7 +162,8 @@ func TestSleepRechecksStagingAfterPublishingSleep(t *testing.T) {
 	newTestDoorbell(t, c)
 	s := c.sched
 	c.armDoorbell() // only the doorbell in the ring: a wait would park
-	request, _ := newSubmission(VReadOp(0, make([]byte, 1), 0), 1, time.Now())
+	request := prepareForTest(VReadOp(0, make([]byte, 1), 0))
+	require.True(t, s.config.disk.admit(request))
 	require.True(t, s.tryPush(request)) // pushed, but no doorbell
 
 	slept := make(chan error, 1)
@@ -213,7 +214,8 @@ func TestRunStopsWhenDoorbellReadFails(t *testing.T) {
 	defer func() { require.NoError(t, writeOnly.Close()) }()
 	c.sched.doorbellFD = int(writeOnly.Fd())
 	stuck, _ := blockingRead(t)
-	request, _ := newSubmission(ReadOp(stuck, make([]byte, 8), 0), 1, time.Now())
+	request := prepareForTest(ReadOp(stuck, make([]byte, 8), 0))
+	require.True(t, c.sched.config.disk.admit(request))
 	require.True(t, c.sched.tryPush(request))
 
 	err = c.run()
@@ -254,7 +256,7 @@ func newURingForDoorbellTest(t *testing.T, opts ...Option) *URingScheduler {
 	if !IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
-	s, err := NewURingScheduler(opts...)
+	s, err := NewURingScheduler(append([]Option{diskOptions(WithoutIOBudget())}, opts...)...)
 	require.NoError(t, err)
 	return s
 }
@@ -382,27 +384,68 @@ func TestURingConcurrentSubmittersAreAllServed(t *testing.T) {
 	require.NoError(t, s.Close())
 }
 
-func TestURingChainUsesAllButTheDoorbellEntry(t *testing.T) {
+func TestURingSmallRingDepthKeepsFullChainLimit(t *testing.T) {
 	s := newURingForDoorbellTest(t, WithRingDepth(4))
 	defer func() { require.NoError(t, s.Close()) }()
+	require.GreaterOrEqual(t, s.config.ringDepth, uint32(minRingDepth))
 	f, err := os.Create(filepath.Join(t.TempDir(), "data"))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, f.Close()) }()
 	buf := make([]byte, 4096)
+	chain := func(n int) Op {
+		rest := make([]Op, n-1)
+		for i := range rest {
+			rest[i] = WriteOp(f, buf, int64(i+1)*4096)
+		}
+		return WriteOp(f, buf, 0).Link(rest...)
+	}
 
-	ticket, err := s.Submit(WriteOp(f, buf, 0).Link(WriteOp(f, buf, 4096), WriteOp(f, buf, 8192)))
+	ticket, err := s.Submit(chain(maxChainLength))
 	require.NoError(t, err)
 	_, err = waitTicket(t, ticket, 5*time.Second)
 	require.NoError(t, err)
 
-	_, err = s.Submit(WriteOp(f, buf, 0).Link(WriteOp(f, buf, 4096), WriteOp(f, buf, 8192), WriteOp(f, buf, 12288)))
-	require.ErrorContains(t, err, "exceeds the limit of 3")
+	_, err = s.Submit(chain(maxChainLength + 1))
+	require.ErrorContains(t, err, "exceeds the limit of 8")
 }
 
-func TestNewURingSchedulerNeedsRoomBesideDoorbell(t *testing.T) {
+func TestNewURingSchedulerRaisesTinyRingDepth(t *testing.T) {
 	if !IOUringAvailable {
 		t.Skip("io_uring not available")
 	}
-	_, err := NewURingScheduler(WithRingDepth(1))
-	require.ErrorContains(t, err, "doorbell")
+	s, err := NewURingScheduler(WithRingDepth(1))
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, s.config.ringDepth, uint32(minRingDepth))
+	require.NoError(t, s.Close())
+}
+
+func TestSubmitDoorbellFailureCancelsAsynchronously(t *testing.T) {
+	s := newURingForDoorbellTest(t)
+	blocked, _ := blockingRead(t)
+	first, err := s.Submit(ReadOp(blocked, make([]byte, 8), 0))
+	require.NoError(t, err)
+	waitUntilWaiting(t, s, wakeDoorbell)
+	// The coordinator is in io_uring_enter. Make the submitting goroutine's
+	// doorbell write fail; recovery must cancel the blocking read and join
+	// before ring teardown. The registered read still holds the original fd.
+	fd := s.doorbellFD
+	s.doorbellFD = -1
+	second, err := s.Submit(ReadOp(blocked, make([]byte, 8), 0))
+	require.NoError(t, err)
+	select {
+	case <-s.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("doorbell failure did not stop the coordinator")
+	}
+	s.doorbellFD = fd
+	require.ErrorIs(t, s.Close(), syscall.EBADF)
+	_, err = first.Wait()
+	require.ErrorIs(t, err, syscall.ECANCELED)
+	_, err = second.Wait()
+	require.ErrorIs(t, err, syscall.EBADF)
+	select {
+	case <-s.cancelDone:
+	default:
+		t.Fatal("Close did not join cancellation")
+	}
 }

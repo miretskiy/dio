@@ -2,7 +2,7 @@ package collections
 
 import "iter"
 
-// Handle identifies a value in the list that created it until it is removed.
+// Handle identifies a value in the list that created it until it is removed or recycled.
 // Its zero value is invalid; handles must not be used with another list.
 type Handle uint64
 
@@ -23,8 +23,8 @@ type node[T any] struct {
 // The zero value is an empty list. A List must not be copied after first use.
 // It is not safe for concurrent access.
 //
-// Value, Next, Prev, and Remove require a live handle from this list and panic
-// if it is invalid or stale. Use TryValue when a handle may have been removed.
+// Value, Next, Prev, Remove, and Recycle require a live handle from this list
+// and panic if it is invalid or stale. Use TryValue when a handle may be stale.
 type List[T any] struct {
 	nodes []node[T]
 	head  uint32
@@ -74,9 +74,15 @@ func (l *List[T]) pushBack() (uint32, *node[T]) {
 	return index, &l.nodes[index-1]
 }
 
-// Remove removes handle from l. References held by its value are cleared.
+// Remove removes handle from l, invalidates it, and clears its value.
 func (l *List[T]) Remove(handle Handle) {
 	l.remove(handle, true)
+}
+
+// Recycle removes handle from l and invalidates it without clearing its value.
+// The value is retained until PushBack reuses the node and overwrites it.
+func (l *List[T]) Recycle(handle Handle) {
+	l.remove(handle, false)
 }
 
 func (l *List[T]) remove(handle Handle, clearValue bool) {
@@ -143,8 +149,8 @@ func (l *List[T]) Prev(handle Handle) (Handle, bool) {
 	return l.handle(n.prev), n.prev != 0
 }
 
-// All yields entries in list order. The current entry may be removed during
-// iteration; other mutations are unsupported.
+// All yields entries in list order. The current entry may be removed or recycled
+// during iteration; other mutations are unsupported.
 func (l *List[T]) All() iter.Seq2[Handle, *T] {
 	return func(yield func(Handle, *T) bool) {
 		for handle, ok := l.Front(); ok; {

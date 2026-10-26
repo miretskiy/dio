@@ -3,8 +3,8 @@ package collections
 import "iter"
 
 // FixedList is a fixed-capacity List whose values remain in stable storage.
-// Removed values are retained for reuse; callers must clear references they
-// no longer need. Construct one with MakeFixedList. A FixedList must not be
+// Remove clears values; Recycle retains them for reuse by PushBack.
+// Construct one with MakeFixedList. A FixedList must not be
 // copied after first use. It is not safe for concurrent access.
 type FixedList[T any] struct {
 	list List[T]
@@ -48,9 +48,15 @@ func (l *FixedList[T]) TryPushBack() (Handle, bool) {
 	return l.list.handle(index), true
 }
 
-// Remove returns handle to the list without clearing its value.
+// Remove removes handle from l, invalidates it, and clears its value.
 func (l *FixedList[T]) Remove(handle Handle) {
-	l.list.remove(handle, false)
+	l.list.Remove(handle)
+}
+
+// Recycle removes handle from l and invalidates it without clearing its value.
+// PushBack preserves the retained value when it reuses the slot.
+func (l *FixedList[T]) Recycle(handle Handle) {
+	l.list.Recycle(handle)
 }
 
 // Value returns the value identified by handle. Its address remains stable.
@@ -84,8 +90,8 @@ func (l *FixedList[T]) Prev(handle Handle) (Handle, bool) {
 	return l.list.Prev(handle)
 }
 
-// All yields occupied slots in list order. The current slot may be removed
-// during iteration; other mutations are unsupported.
+// All yields occupied slots in list order. The current slot may be removed or
+// recycled during iteration; other mutations are unsupported.
 func (l *FixedList[T]) All() iter.Seq2[Handle, *T] {
 	return l.list.All()
 }

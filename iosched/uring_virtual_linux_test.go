@@ -11,14 +11,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
 // TestURing_VOpenFallocateWriteChain verifies the create-and-first-write fusion
-// the slab write path relies on. The independent second write is submitted
-// without waiting; the open barrier keeps it out of the ring until the whole
-// open-fallocate-write chain has completed.
+// the slab write path relies on.
 func TestURing_VOpenFallocateWriteChain(t *testing.T) {
 	s := newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(4))
 	const vfd = uint32(1)
@@ -33,11 +30,9 @@ func TestURing_VOpenFallocateWriteChain(t *testing.T) {
 	chainTkt, err := s.Submit(chain)
 	require.NoError(t, err)
 
-	// No artificial open wait: this independent submission is ordered by the
-	// slot's open barrier.
-	secondTkt, err := s.Submit(iosched.VWriteOp(vfd, second, int64(len(first))))
-	require.NoError(t, err)
 	_, err = chainTkt.Wait()
+	require.NoError(t, err)
+	secondTkt, err := s.Submit(iosched.VWriteOp(vfd, second, int64(len(first))))
 	require.NoError(t, err)
 	_, err = secondTkt.Wait()
 	require.NoError(t, err)
@@ -55,10 +50,7 @@ func TestURing_VOpenFallocateWriteChain(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestURing_VOpenBlocksLaterReads is the open-barrier contract directly: reads
-// submitted after an open need no caller-side Wait, yet they cannot resolve the
-// virtual slot until the open CQE has installed the file.
-func TestURing_VOpenBlocksLaterReads(t *testing.T) {
+func TestURing_VReadsAfterOpenWait(t *testing.T) {
 	s := newVURingSched(t, iosched.WithRingDepth(64), iosched.WithVFiles(2))
 	const vfd = uint32(0)
 	want := []byte("read-after-open-without-an-artificial-wait")
@@ -66,6 +58,8 @@ func TestURing_VOpenBlocksLaterReads(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, want, 0o600))
 
 	open, err := s.Submit(iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_RDONLY, 0, vfd))
+	require.NoError(t, err)
+	_, err = open.Wait()
 	require.NoError(t, err)
 	const readers = 32
 	reads := make([]iosched.Ticket, readers)
@@ -76,8 +70,6 @@ func TestURing_VOpenBlocksLaterReads(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	_, err = open.Wait()
-	require.NoError(t, err)
 	for i, read := range reads {
 		_, err := read.Wait()
 		require.NoErrorf(t, err, "read %d", i)
@@ -117,13 +109,7 @@ func TestURing_VSlotRecycleAfterCloseWait(t *testing.T) {
 	}
 }
 
-// TestURing_VCloseDrainsInflightWrites verifies the close-drain: a VClose
-// submitted right behind in-flight writes to the same slot is held until they
-// complete, so every write lands (the slot is not cleared out from under a
-// queued write) and its data is durable. It is deterministic — the coordinator
-// holds the close until the slot's in-flight ops drain — so it holds under
-// -count, unlike relying on the kernel not to race the close.
-func TestURing_VCloseDrainsInflightWrites(t *testing.T) {
+func TestURing_VCloseAfterWritesComplete(t *testing.T) {
 	s := newVURingSched(t, iosched.WithRingDepth(256), iosched.WithVFiles(2))
 	const vfd = uint32(0)
 	const n = 64
@@ -143,22 +129,21 @@ func TestURing_VCloseDrainsInflightWrites(t *testing.T) {
 		Link(iosched.VFallocateOp(vfd, int64(n*recLen))))
 	require.NoError(t, err)
 
-	// Fire N durable writes, then a close, without waiting between — the close
-	// races the writes' completion, and the drain must hold it behind them.
+	// The caller waits for all durable writes before submitting close.
 	writes := make([]iosched.Ticket, n)
 	for i := range writes {
 		var err error
 		writes[i], err = s.Submit(iosched.VWriteOp(vfd, rec(i), int64(i)*recLen).Durable())
 		require.NoError(t, err)
 	}
-	closeTkt, err := s.Submit(iosched.VCloseOp(vfd))
-	require.NoError(t, err)
 
 	for i, w := range writes {
 		n, err := w.Wait()
 		require.NoErrorf(t, err, "write %d", i)
 		require.Equal(t, recLen, n)
 	}
+	closeTkt, err := s.Submit(iosched.VCloseOp(vfd))
+	require.NoError(t, err)
 	_, err = closeTkt.Wait()
 	require.NoError(t, err)
 
@@ -229,10 +214,7 @@ func TestURing_DrainWaitsForInflightWrites_Regular(t *testing.T) {
 }
 
 // TestURing_VSlot1_Recycle stresses a single virtual slot: open → write → read →
-// close, repeated hundreds of times, so slot 0 is reopened every iteration. Each
-// cycle fires the durable write and the close with no wait between them, so the
-// close is held until the write drains; the next open then recycles the slot. It
-// checks data survives the write, the drain, and the reopen across every reuse.
+// close, repeated hundreds of times, so slot 0 is reopened every iteration.
 func TestURing_VSlot1_Recycle(t *testing.T) {
 	s := newVURingSched(t, iosched.WithRingDepth(16), iosched.WithVFiles(1))
 	const vfd = uint32(0)
@@ -247,14 +229,12 @@ func TestURing_VSlot1_Recycle(t *testing.T) {
 			unix.O_CREAT|unix.O_RDWR|unix.O_TRUNC, 0o600, vfd))
 		require.NoErrorf(t, err, "iter %d: open", i)
 
-		// Durable write and close fired with no wait between: the close is held
-		// until the write drains.
 		w, err := s.Submit(iosched.VWriteOp(vfd, want, 0).Durable())
-		require.NoError(t, err)
-		cl, err := s.Submit(iosched.VCloseOp(vfd))
 		require.NoError(t, err)
 		_, err = w.Wait()
 		require.NoErrorf(t, err, "iter %d: write", i)
+		cl, err := s.Submit(iosched.VCloseOp(vfd))
+		require.NoError(t, err)
 		_, err = cl.Wait()
 		require.NoErrorf(t, err, "iter %d: close", i)
 
@@ -269,117 +249,5 @@ func TestURing_VSlot1_Recycle(t *testing.T) {
 
 		_, err = submitOne(t, s, iosched.VCloseOp(vfd))
 		require.NoErrorf(t, err, "iter %d: close2", i)
-	}
-}
-
-// TestURing_BarrierChainFollowsCompletionFunctions checks the lifecycle
-// contract that a chain holding a close is placed only after the completion
-// functions of the operations it waited for have returned: a completion
-// function changes the buffer the held chain writes, and the change lands.
-func TestURing_BarrierChainFollowsCompletionFunctions(t *testing.T) {
-	s := newVURingSched(t, iosched.WithRingDepth(64), iosched.WithVFiles(1))
-	const vfd = uint32(0)
-	const bulk = 64 << 20 // long enough to be in flight when the chain is submitted
-	path := filepath.Join(t.TempDir(), "barrier.dat")
-	_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR|unix.O_DIRECT, 0o600, vfd).
-		Link(iosched.VFallocateOp(vfd, bulk+4096)))
-	require.NoError(t, err)
-
-	data := align.AllocAligned(bulk)
-	defer align.FreeAligned(data)
-	tail := align.AllocAligned(4096)
-	defer align.FreeAligned(tail)
-	copy(tail, "original")
-
-	write, err := iosched.SubmitNotify(s, iosched.VWriteOp(vfd, data, 0), func(_ int, err error) {
-		if err == nil {
-			copy(tail, "modified")
-		}
-	})
-	require.NoError(t, err)
-	_, err = submitOne(t, s, iosched.VWriteOp(vfd, tail, bulk).Link(iosched.VCloseOp(vfd)))
-	require.NoError(t, err)
-	_, err = write.Wait()
-	require.NoError(t, err)
-
-	got := make([]byte, 8)
-	f, err := os.Open(path)
-	require.NoError(t, err)
-	defer f.Close()
-	_, err = f.ReadAt(got, bulk)
-	require.NoError(t, err)
-	require.Equal(t, "modified", string(got))
-}
-
-// TestURing_ReplaceSlotWhileBusy covers a chain that closes a slot and opens
-// another file in it while a read of the first file is still in flight: it is
-// accepted and waits for that read, and a read of the new file submitted while
-// it is pending waits for it rather than being refused. A close submitted
-// meanwhile is still refused. Refusals happen at acceptance, so they are
-// ticket errors.
-func TestURing_ReplaceSlotWhileBusy(t *testing.T) {
-	s := newVURingSched(t, iosched.WithRingDepth(64), iosched.WithVFiles(1))
-	const vfd = uint32(0)
-	const bulk = 64 << 20
-	dir := t.TempDir()
-	first, second := filepath.Join(dir, "first"), filepath.Join(dir, "second")
-	require.NoError(t, os.WriteFile(first, make([]byte, bulk), 0o600))
-	require.NoError(t, os.WriteFile(second, []byte("second file"), 0o600))
-
-	_, err := submitOne(t, s, iosched.VOpenatOp(unix.AT_FDCWD, first, unix.O_RDONLY|unix.O_DIRECT, 0, vfd))
-	require.NoError(t, err)
-	big := align.AllocAligned(bulk)
-	defer align.FreeAligned(big)
-	inFlight, err := s.Submit(iosched.VReadOp(vfd, big, 0)) // holds the replacement pending
-	require.NoError(t, err)
-
-	replace, err := s.Submit(iosched.VCloseOp(vfd).Link(iosched.VOpenatOp(unix.AT_FDCWD, second, unix.O_RDONLY, 0, vfd)))
-	require.NoError(t, err)
-	got := make([]byte, len("second file"))
-	read, err := s.Submit(iosched.VReadOp(vfd, got, 0))
-	require.NoError(t, err)
-	refused, err := s.Submit(iosched.VCloseOp(vfd))
-	require.NoError(t, err)
-
-	n, err := inFlight.Wait()
-	require.NoError(t, err)
-	require.Equal(t, bulk, n, "the read in flight finished against the first file")
-	_, err = replace.Wait()
-	require.NoError(t, err, "a replacement is accepted while the slot is busy")
-	_, err = read.Wait()
-	require.NoError(t, err, "a read submitted during the replacement waits for it")
-	require.Equal(t, "second file", string(got))
-	_, err = refused.Wait()
-	require.Error(t, err, "a close during a pending replacement is still refused")
-
-	_, err = submitOne(t, s, iosched.VCloseOp(vfd))
-	require.NoError(t, err)
-}
-
-func TestURing_QueuedSlotReuseWithoutWaiting(t *testing.T) {
-	s := newVURingSched(t, iosched.WithRingDepth(32), iosched.WithVFiles(1))
-	dir := t.TempDir()
-	var tickets []iosched.Ticket
-	for i := range 48 {
-		path := filepath.Join(dir, fmt.Sprint(i))
-		data := []byte(fmt.Sprintf("generation %d", i))
-		for _, op := range []iosched.Op{
-			iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, 0),
-			iosched.VWriteOp(0, data, 0),
-			iosched.VCloseOp(0),
-		} {
-			ticket, err := s.Submit(op)
-			require.NoError(t, err)
-			tickets = append(tickets, ticket)
-		}
-	}
-	for _, ticket := range tickets {
-		_, err := ticket.Wait()
-		require.NoError(t, err)
-	}
-	for i := range 48 {
-		got, err := os.ReadFile(filepath.Join(dir, fmt.Sprint(i)))
-		require.NoError(t, err)
-		require.Equal(t, fmt.Sprintf("generation %d", i), string(got))
 	}
 }

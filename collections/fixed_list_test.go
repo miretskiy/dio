@@ -20,10 +20,49 @@ func TestFixedListCapacityAndReuse(t *testing.T) {
 	if reused.index() != first.index() || reused == first {
 		t.Fatalf("reused handle: old=%d new=%d", first, reused)
 	}
-	if *list.Value(reused) != 42 {
-		t.Fatalf("retained value: got %d want 42", *list.Value(reused))
+	if *list.Value(reused) != 0 {
+		t.Fatalf("removed value: got %d want 0", *list.Value(reused))
 	}
 	assertPanics(t, "stale handle", func() { list.Value(first) })
+}
+
+func TestFixedListRecycle(t *testing.T) {
+	list := MakeFixedList[*int](1)
+	value := 42
+	handle := list.PushBack()
+	slot := list.Value(handle)
+	*slot = &value
+	list.Recycle(handle)
+	if list.Len() != 0 || *slot != &value {
+		t.Fatal("Recycle did not free the slot and retain its value")
+	}
+	if _, ok := list.TryValue(handle); ok {
+		t.Fatal("Recycle did not invalidate the handle")
+	}
+	assertPanics(t, "recycled handle", func() { list.Recycle(handle) })
+
+	reused := list.PushBack()
+	if reused.index() != handle.index() || reused == handle {
+		t.Fatalf("reused handle: old=%d new=%d", handle, reused)
+	}
+	if list.Value(reused) != slot || *list.Value(reused) != &value {
+		t.Fatal("PushBack did not preserve the recycled slot and value")
+	}
+	assertPanics(t, "stale handle", func() { list.Value(handle) })
+
+	list.Remove(reused)
+	if *slot != nil {
+		t.Fatal("Remove did not clear the retained reference")
+	}
+}
+
+func TestFixedListRecycleAllocs(t *testing.T) {
+	list := MakeFixedList[int](1)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		list.Recycle(list.PushBack())
+	}); allocations != 0 {
+		t.Fatalf("PushBack/Recycle allocated %g times, want 0", allocations)
+	}
 }
 
 func TestFixedListTryOperations(t *testing.T) {
@@ -89,7 +128,7 @@ func TestFixedListAllSlots(t *testing.T) {
 	*list.Value(first) = 10
 	second := list.PushBack()
 	*list.Value(second) = 20
-	list.Remove(first)
+	list.Recycle(first)
 
 	// Include a returned slot, an occupied slot, and a never-used slot.
 	want := []int{10, 20, 0}

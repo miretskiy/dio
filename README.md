@@ -238,43 +238,87 @@ setup is best effort: failures are logged and the loop continues. Pinning does
 not reserve a CPU or set kernel-worker or interrupt affinity. The thread exits
 with the coordinator so restricted affinity cannot leak into unrelated Go work.
 
-The scheduler does not provide application-level backpressure: `Submit` never
-blocks or refuses work for lack of capacity. Callers that need to bound what
-they submit should own the semaphore, queue, or buffer pool that defines it.
-Submitted buffers must remain valid until the ticket completes.
+`Submit` validates the whole chain and checks the shared rejection state before
+enqueueing. When a coordinator has closed admission, Submit returns `ErrRejected`
+immediately, with no ticket or executed operations. The caller retains its buffers and descriptors and decides whether
+to retry. Admitted buffers must remain valid until the ticket completes.
 
-### In-flight budget
+### Shared disk admission
 
-The io_uring backend does bound what it hands to the device. Queueing more than
-the device needs to reach its ceiling adds only latency (by Little's law, the
-device queue's latency is what is in flight divided by throughput), and a deep
-queue of writes makes every read wait behind it. So reads and writes each keep
-at most a latency goal of device time in flight; the rest waits in the
-scheduler, oldest first within each class, and a read never waits for the write
-budget. An operation costs `max(bytes / bandwidth, 1 / IOPS)` at its class's
-limits; a linked chain costs its first operation.
+`DiskPolicy` holds the device model, the admission limits and the atomic
+counters. Construct it with `NewDiskPolicy(...DiskPolicyOption)` and share one
+pointer across the rings serving a device with `WithDiskPolicy(policy)`. Device
+and admission options exist only on `NewDiskPolicy`; ring depth, CPU and file
+table settings are scheduler options. Without a policy, each scheduler uses its
+own `NewDiskPolicy()`.
+
+Reads and writes have independent service-time, outstanding-byte and
+operation-count allowances. The estimated service time of each data operation is
+`max(bytes / bandwidth, 1 / IOPS)`; linked chains sum every operation's service time.
+Coordinators count bytes and operations when accepting staged submissions,
+until ticket completion, including durable sync. Submit only observes a shared
+rejection flag for each class; it does no admission accounting or rollback.
+Staged requests can overshoot a threshold before a coordinator closes admission.
+
+Separately, the coordinator reserves modeled service time before dispatch and
+returns it as each I/O completes. Work that does not fit queues without being
+rejected, in order within its class; unbudgeted reads can pass queued writes.
+A coordinator always dispatches the next chain of a class when it has none of
+that class in flight itself, whatever its size and whatever other rings hold.
+So a blocked ring always has its own completion coming to wake it: there are
+no timers, polling or cross-ring notifications, every wait is bounded by the
+ring's own I/O, and the shared cap is exceeded by at most one chain per ring.
+
+Non-positive values never fail: a non-positive rate keeps its default, and a
+non-positive limit or latency goal disables it.
 
 | Option | Default |
 |---|---|
 | `WithReadBandwidth(bytesPerSecond)` | 2.56 GB/s |
 | `WithReadIOPS(iops)` | 500k |
 | `WithWriteBandwidth(bytesPerSecond)` | 1.22 GB/s |
-| `WithWriteIOPS(iops)` | 83k (writes into freshly allocated space) |
-| `WithLatencyGoal(d)` | 1.5 ms |
-| `WithoutIOBudget()` | — places work as soon as it fits in the ring |
+| `WithWriteIOPS(iops)` | 83k |
+| `WithLatencyGoal(d)` | 1.5 ms per class |
+| `WithRejectReadBacklog(bytes)`, `WithRejectWriteBacklog(bytes)` | unlimited |
+| `WithWriteBacklogLowWatermark(bytes)` | negative (recovery disabled) |
+| `WithRejectReadQueueDepth(n)`, `WithRejectWriteQueueDepth(n)` | unlimited |
 
-The defaults were measured on an AWS m7gd.8xlarge instance store. On another
-disk, measure them with `scripts/disk-model.sh DIR` (fio, about 10 minutes):
-take the 4 KiB IOPS and the 1 MiB bandwidth of each class, and a latency goal at
-least as large as the in-flight time at which the depth sweep reaches its
-ceiling. Leave margin above that knee: the scheduler takes some time to place
-the next operation after one completes, which fio does not. On the m7gd disk
-the knee was 0.86 ms, yet a 1 ms goal left the device 3% idle under a mixed
-read/write load, while 1.5 ms matched the throughput of no budget at a seventh
-of its device latency. The script also checks the two assumptions the model makes: that IOPS
-and bandwidth are independent limits, and that reads and writes reach their
-ceilings together. Limits set too low leave a faster disk underused; too high,
-they let the device queue grow.
+`WithoutIOBudget()` disables both service-time limits; `WithoutReadIOBudget()`
+disables only the read time limit. Byte and operation-count thresholds close admission
+until coordinators observe counts below their limits, unless timed recovery is enabled.
+`MustAdmit()` exempts a submission from every throttle: it is never rejected,
+never waits for the service-time allowance, and is not charged, so it is
+excluded from `Stats()`.
+
+For backlog recovery, configure a low watermark below `WithRejectWriteBacklog`.
+At the threshold, a coordinator closes write admission until a deadline: now plus
+the estimated drain interval. Submit compares the clock with that deadline only
+while admission is closed, so the pause ends on time even when every coordinator
+is idle, with no timer.
+
+The pause estimate is `(outstanding bytes - low watermark) / configured write
+bandwidth`, or the outstanding operation count divided by IOPS if larger.
+Active pauses are not extended. For 2 GB down to 250 MB at 1.22 GB/s, the
+estimate is about 1.43 s. Reads and `MustAdmit` continue. If the coordinator
+still observes a full backlog after expiry, it can start another pause.
+A zero low watermark targets a full drain; a negative one disables timed recovery.
+The watermark is an estimation target; actual bytes at expiry depend on device progress.
+Keep the service-time allowance enabled to limit device queue pressure while
+admitted work drains.
+
+The default device rates were measured on an AWS m7gd.8xlarge instance store.
+Use `scripts/disk-model.sh DIR` to measure another device. Service time is a
+model, not measured latency or a bandwidth rate limiter. `DiskPolicy.Stats()`
+reports coordinator-accounted bytes/operations and dispatched service time across
+its rings. Staged submissions are not yet counted.
+Each field is counted only when
+its corresponding limit is enabled; disabled limits report zero.
+
+Accounting and release operate on prepared submissions inside the coordinator.
+`SubmitNotify` carries its callback into preparation; only the prepared submission
+owns the runtime callback. `completion` contains the ticket result and signal.
+`Op` uses a flat follower slice, with three inline operand slots for short chains,
+so building a chain of up to four operations does not allocate.
 
 ### Operations and ordering
 
@@ -309,14 +353,26 @@ ticket, err := sched.Submit(op)
 ```
 
 Here the data write must succeed before the index write runs, and the ticket
-waits for the index file's sync. This does not sync the data file. `Durable` is
-rejected on intermediate writes; use an explicit `FdatasyncOp` when later
-operations must wait for a sync.
+waits for the index file's sync. This does not sync the data file.
 
-Separate submissions are otherwise unordered. The io_uring coordinator does
-provide file-lifecycle barriers: a virtual open holds later work for its slot,
-and close waits for previously accepted work on the file. Racing `Submit`
-calls do not create an application-visible order.
+A durable write may also be followed by other operations. The scheduler then
+inserts an `fdatasync` right after the write, linked the way the write links to
+its successor, so the following operations run after the flush:
+
+```go
+op := iosched.VWriteOp(slot, payload, 0).Durable().
+    HardLink(iosched.VCloseOp(slot))
+```
+
+The inserted sync occupies one of the chain's eight entries and reports into
+the write's `Result`. Call `Durable` on the write before linking; on a chain it
+marks the root. A chain holds at most eight operations on every backend; the
+io_uring scheduler raises a smaller ring depth to fit one beside its doorbell.
+
+Separate submissions are otherwise unordered. The one barrier is `DrainOp`,
+which waits for previously accepted work on a regular file. Virtual-file work is
+ordered only by links and completion waits. Racing `Submit` calls do not create
+an application-visible order.
 
 ### Virtual files
 
@@ -341,7 +397,12 @@ open := iosched.VOpenatOp(
 ticket, err := sched.Submit(open)
 ```
 
-Wait for a close-containing ticket before reusing its slot. Contiguous,
+Wait for a close-containing ticket before reusing its slot. `AllocateVFD` on a
+root `VOpenatOp` picks a free slot; its followers name the same slot with
+`AllocateVFD`, and `Ticket.Wait` returns the index. A successful virtual close
+frees an allocated slot. Hard-link the close (`open.Link(write.HardLink(close))`)
+so it runs even when the write fails; with a soft link a failed write cancels
+the close and the caller must submit `VCloseOp(index)` itself. Contiguous,
 standalone writes accepted next to one another may be coalesced into a single
 `writev`; each original submission still receives its own ticket and count.
 Durable writes on the same file whose writes complete before the next

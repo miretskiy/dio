@@ -6,20 +6,27 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestAcceptMarksDurableWrites(t *testing.T) {
 	regular := os.NewFile(100, "regular")
 	durable := func(op Op) bool {
 		c := newTestCoordinator(t, 8, 1)
+		if op.isFixed() {
+			buffers, err := c.ring.RegisterBuffers(op.buf)
+			require.NoError(t, err)
+			c.sched.registeredBuffers = buffers
+		}
 		_, handles := acceptOps(c, op)
-		return handles[0].durable != nil
+		return handles[0].durable() != nil
 	}
 	require.True(t, durable(VWriteOp(0, make([]byte, 8), 0).Durable()))
 	require.True(t, durable(WriteOp(regular, make([]byte, 8), 0).Durable()))
@@ -101,7 +108,7 @@ func TestLinkedDurableWritesShareSync(t *testing.T) {
 	require.Equal(t, 4, c.accepted.len, "all tickets must wait for their file's sync")
 	require.Len(t, c.syncPending, 2)
 	require.Zero(t, work[0].fileState(&work[0].root).active, "the data file owes no sync")
-	require.EqualValues(t, 3, work[0].fileState(work[0].durable).active)
+	require.EqualValues(t, 3, work[0].fileState(work[0].durable()).active)
 
 	c.placeReady(false)
 	require.Equal(t, 2, c.occupied, "one sync per file, shared across chained and standalone writes")
@@ -327,4 +334,24 @@ func TestURingConcurrentDurableWrites(t *testing.T) {
 		want := bytes.Repeat([]byte{byte(w + 1)}, writes*block)
 		require.Equalf(t, want, got[w*writes*block:(w+1)*writes*block], "writer %d", w)
 	}
+}
+
+// A durable write followed by a close gets its own fdatasync between them.
+func TestIntermediateDurableWriteThenClose(t *testing.T) {
+	s := newURingForDoorbellTest(t, WithVFiles(1))
+	defer func() { require.NoError(t, s.Close()) }()
+	path := filepath.Join(t.TempDir(), "data")
+	data := []byte("durable")
+	op := VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, AllocateVFD).Link(
+		VWriteOp(AllocateVFD, data, 0).Durable(), VCloseOp(AllocateVFD))
+	ticket, err := s.Submit(op)
+	require.NoError(t, err)
+	_, err = waitTicket(t, ticket, 5*time.Second)
+	require.NoError(t, err)
+	results := ticket.AllResults()
+	require.Len(t, results, 3, "the synthesized fdatasync reports into its write")
+	require.Equal(t, Result{N: len(data)}, results[1])
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, data, got)
 }

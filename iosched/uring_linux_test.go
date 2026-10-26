@@ -28,7 +28,8 @@ func newURingSched(t *testing.T, opts ...iosched.Option) *iosched.URingScheduler
 	if len(opts) == 0 {
 		opts = []iosched.Option{iosched.WithRingDepth(64)}
 	}
-	s, err := iosched.NewURingScheduler(opts...)
+	s, err := iosched.NewURingScheduler(append([]iosched.Option{
+		iosched.WithDiskPolicy(iosched.NewDiskPolicy(iosched.WithoutIOBudget()))}, opts...)...)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
 	return s
@@ -39,7 +40,8 @@ func newVURingSched(t *testing.T, opts ...iosched.Option) *iosched.URingSchedule
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	s, err := iosched.NewURingScheduler(opts...)
+	s, err := iosched.NewURingScheduler(append([]iosched.Option{
+		iosched.WithDiskPolicy(iosched.NewDiskPolicy(iosched.WithoutIOBudget()))}, opts...)...)
 	if err != nil {
 		switch {
 		case errors.Is(err, unix.EINVAL), errors.Is(err, unix.EOPNOTSUPP), errors.Is(err, unix.ENOSYS):
@@ -207,18 +209,15 @@ func TestURing_Concurrent(t *testing.T) {
 	}
 }
 
-func TestURing_LinkedChainTooLargeIsRejected(t *testing.T) {
-	// One of the two entries is the coordinator's doorbell, so a chain of two
-	// cannot fit.
-	const ringDepth = 2
-	s := newURingSched(t, iosched.WithRingDepth(ringDepth))
+func TestURing_TinyRingDepthStillRunsChains(t *testing.T) {
+	// The scheduler raises a tiny depth so a chain and the doorbell both fit.
+	s := newURingSched(t, iosched.WithRingDepth(2))
 	path, _ := writeUringFile(t, 4096)
 	f := openRW(t, path)
 
 	buf := make([]byte, 4096)
-	ticket, err := s.Submit(iosched.ReadOp(f, buf, 0).Link(iosched.ReadOp(f, buf, 0)))
-	require.Equal(t, iosched.Ticket{}, ticket)
-	require.ErrorContains(t, err, "exceeds the limit of 1")
+	_, err := submitOne(t, s, iosched.ReadOp(f, buf, 0).Link(iosched.ReadOp(f, buf, 0)))
+	require.NoError(t, err)
 }
 
 func TestURing_DurableWriteFitsBesideDoorbell(t *testing.T) {
@@ -369,8 +368,7 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 	))
 	require.NoError(t, err)
 
-	// This basic path waits each result before the next operation. The no-wait
-	// open-barrier path is covered in uring_virtual_linux_test.go.
+	// This basic path waits each result before the next operation.
 	n, err := submitOne(t, s, iosched.VWriteOp(vfd, payload, 0))
 	require.NoError(t, err)
 	require.Equal(t, len(payload), n)
@@ -535,5 +533,6 @@ func TestURing_ChainLengthIsLimited(t *testing.T) {
 	_, err := submitOne(t, s, reads(8))
 	require.NoError(t, err)
 	_, err = s.Submit(reads(9))
-	require.ErrorContains(t, err, "linked chain of 9 operations exceeds the limit of 8")
+	require.ErrorContains(t, err, "linked chain of 9 operations")
+	require.ErrorContains(t, err, "exceeds the limit of 8")
 }

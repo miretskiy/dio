@@ -106,13 +106,9 @@ func TestPinnedSchedulersHaveIndependentSlotsAndBarriers(t *testing.T) {
 	wait(scheds[0].Submit(VCloseOp(0)))
 }
 
-func TestCoordinatorCPUValidation(t *testing.T) {
-	if !IOUringAvailable {
-		t.Skip("io_uring unavailable")
-	}
-	s, err := NewURingScheduler(WithCoordinatorCPU(-2))
-	require.Error(t, err)
-	require.Nil(t, s)
+func TestCoordinatorCPUNegativeLeavesAffinity(t *testing.T) {
+	cfg := makeSchedulerConfig([]Option{WithCoordinatorCPU(-2)})
+	require.Negative(t, cfg.coordinatorCPU, "any negative CPU leaves affinity unchanged")
 }
 
 // Affinity is an optimization: an unavailable CPU must not prevent I/O.

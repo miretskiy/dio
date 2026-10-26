@@ -115,7 +115,7 @@ func testVectoredOffsetAndEmpty(t *testing.T, s iosched.Scheduler) {
 }
 
 // testVectoredVirtual exercises writev/readv against a virtual descriptor
-// (io_uring FIXED_FILE path; POSIX emulates via its descriptor table), reading
+// (io_uring FIXED_FILE path), reading
 // back with a different chunk count than the write.
 func testVectoredVirtual(t *testing.T, s iosched.Scheduler) {
 	const vfd = uint32(0)

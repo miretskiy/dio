@@ -79,7 +79,7 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 
 	c.placeReady(true)
 	require.Equal(t, 1, c.occupied, "the run was not placed as one write")
-	require.Equal(t, handles, handles[0].coalesced, "the leader does not list the run in writev order")
+	require.Equal(t, handles, coalescedRunForTest(handles[0]), "the leader does not link the run in writev order")
 
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	for i, want := range []int{4, 6, 2} {
@@ -87,7 +87,9 @@ func TestPlaceReadyCoalescesWrites(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, want, n)
 	}
-	require.Nil(t, handles[0].coalesced, "the completed leader still references its run")
+	for _, member := range handles {
+		require.Nil(t, member.staged, "a completed member still links its run")
+	}
 }
 
 // TestCoalescedRunCompletesEveryMember checks that finishing the leader, which
@@ -102,7 +104,7 @@ func TestCoalescedRunCompletesEveryMember(t *testing.T) {
 	tickets, handles := acceptOps(c, ops...)
 
 	c.placeReady(true)
-	require.Len(t, handles[0].coalesced, len(ops))
+	require.Len(t, coalescedRunForTest(handles[0]), len(ops))
 
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	for _, ticket := range tickets {
@@ -147,5 +149,14 @@ func TestSingleShortWriteCompletion(t *testing.T) {
 
 func TestOpBytes(t *testing.T) {
 	writev := WritevOp(os.NewFile(100, "a"), [][]byte{make([]byte, 3), nil, make([]byte, 5)}, 0)
-	require.Equal(t, 8, opBytes(&writev))
+	require.Equal(t, 8, opBytes(&writev.operation))
+}
+
+// coalescedRunForTest lists a placed run's members, linked from its leader.
+func coalescedRunForTest(leader *submission) []*submission {
+	var run []*submission
+	for member := leader; member != nil; member = member.staged {
+		run = append(run, member)
+	}
+	return run
 }

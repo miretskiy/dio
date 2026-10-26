@@ -1,9 +1,8 @@
 package iosched
 
 import (
-	"bytes"
-	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -38,25 +37,51 @@ const (
 	opVirtual uint8 = 1 << 7
 )
 
-// Op describes one I/O operation. Use Link or HardLink to form a chain.
-type Op struct {
-	opcode   uint8
-	sqeFlags uint8
-	f        *os.File
-	vfd      uint32
-	dfd      int
-	path     []byte
-	openFlag int
-	mode     uint32
-	buf      []byte
-	bufs     [][]byte // vectored buffers (readv/writev); iovecs are built at placement
-	offset   int64
-	length   int64 // byte count for ops without a buffer (fallocate)
-	opFlags  uint32
-	linked   *Op
-	whenDone func(n int, err error) // set by SubmitNotify on the root operation
+// AllocateVFD asks a root VOpenatOp to allocate a free virtual-file slot in the
+// coordinator. Its linked I/O operations and final virtual close use AllocateVFD
+// to address the same slot. Ticket.Wait returns the allocated index and any chain
+// error; Ticket.AllResults distinguishes open success from a follower's failure.
+// Use allocation consistently within a scheduler: do not combine it with opens
+// into caller-chosen slots. Closing an allocated slot relinquishes its index;
+// obtain a new allocation before using a virtual file again.
+// Allocation failure completes the open with ENFILE: Link cancels followers,
+// while HardLink continues them. Followers using an unallocated slot fail with
+// EBADF.
+// Submission copies the operands; the coordinator resolves the placeholders
+// in that private copy. The caller keeps buffers valid through completion.
+const AllocateVFD uint32 = math.MaxUint32
 
-	*completion
+// Op is the caller-facing description of an I/O operation and its followers.
+// Submit copies the operation records into a private submission; it does not
+// retain the Op. Referenced buffers and files remain caller-owned and must stay
+// valid until the ticket completes.
+//
+// Link and HardLink return independent values; short chains use inline storage.
+type Op struct {
+	operation
+	linked    []operation // overflow beyond the inline slots
+	linkCount uint8       // number of inline followers
+	linkAlloc [3]operation
+	whenDone  func(n int, err error) // construction input from SubmitNotify
+}
+
+// operation contains only the operands and flags for one I/O operation.
+// It carries neither a chain nor completion state.
+type operation struct {
+	opcode      uint8
+	sqeFlags    uint8
+	resultIndex uint8
+	f           *os.File
+	vfd         uint32
+	dfd         int
+	path        []byte
+	openFlag    int
+	mode        uint32
+	buf         []byte
+	bufs        [][]byte
+	offset      int64
+	length      int64
+	opFlags     uint32
 }
 
 // SQE linking flag bits stored in Op.sqeFlags, marking how a linked follower is
@@ -68,86 +93,102 @@ const (
 
 // opFlags bits stored in Op.opFlags.
 const (
-	opDurable uint32 = 1 << 0 // flush the write (fdatasync) before the ticket completes
+	opDurable      uint32 = 1 << 0 // flush the write (fdatasync) before the ticket completes
+	opAllocatedVFD uint32 = 1 << 1 // root open reserved a virtual-file slot
+	opReleaseVFD   uint32 = 1 << 2 // failed root open returns its slot after the chain
+	opMustAdmit    uint32 = 1 << 3 // root bypasses admission limits for the whole submission
+	opWriteSync    uint32 = 1 << 4 // synthesized fdatasync after a non-final Durable write
 )
 
-// Durable requests that a write's data be flushed to stable storage
-// before its Ticket completes. The io_uring backend issues an fdatasync once
-// the write completes and shares it among the durable writes on the same file
-// that completed before it was issued; the POSIX backend syncs inline. For a
-// linked chain, only the final operation may be a durable write. Its sync covers
-// that write's file, not other files earlier in the chain. Use an explicit
-// FdatasyncOp when later operations must wait for a sync. Durable has no effect
-// on non-write operations.
+// MustAdmit exempts the whole submission from every DiskPolicy throttle: it is
+// never rejected and never waits for the in-flight service-time allowance. Its
+// I/O is not charged, so DiskPolicy.Stats excludes it. Apply it to the root of
+// a chain. Other Submit errors (closed scheduler, invalid operands) and
+// execution failures remain possible.
+func (o Op) MustAdmit() Op {
+	o.opFlags |= opMustAdmit
+	return o
+}
+
+// Durable requests that a write's data be flushed to stable storage before its
+// Ticket completes. Call it on the write itself, before linking: on a chain it
+// marks the root. Durable has no effect on non-write operations.
+//
+// A final durable write gets an fdatasync after it completes; the io_uring
+// backend shares that sync among the durable writes on the same file that
+// completed before it was issued. A durable write followed by other operations
+// (write → Durable → close) gets its own fdatasync, linked the way the write
+// links to its successor, so those operations run after the flush. That sync
+// occupies one of the chain's eight entries and reports into the write's result.
 func (o Op) Durable() Op {
 	o.opFlags |= opDurable
 	return o
 }
 
 // durable reports whether o requests a post-write fdatasync.
-func (o *Op) durable() bool { return o.opFlags&opDurable != 0 }
+func (o *operation) durable() bool { return o.opFlags&opDurable != 0 }
 
-func (o Op) syncOp() Op {
+func (o operation) syncOp() operation {
 	if o.isVirtual() {
-		return VFdatasyncOp(o.vfd)
+		return VFdatasyncOp(o.vfd).operation
 	}
-	return FdatasyncOp(o.f)
+	return FdatasyncOp(o.f).operation
 }
 
 // ReadOp constructs a positioned-read operation.
 func ReadOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpRead, f: f, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpRead, f: f, buf: buf, offset: offset}}
 }
 
 // WriteOp constructs a positioned-write operation.
 func WriteOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpWrite, f: f, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpWrite, f: f, buf: buf, offset: offset}}
 }
 
 // FsyncOp constructs a full fsync operation.
 func FsyncOp(f *os.File) Op {
-	return Op{opcode: OpFsync, f: f}
+	return Op{operation: operation{opcode: OpFsync, f: f}}
 }
 
 // FdatasyncOp constructs an fdatasync operation.
 func FdatasyncOp(f *os.File) Op {
-	return Op{opcode: OpFdatasync, f: f}
+	return Op{operation: operation{opcode: OpFdatasync, f: f}}
 }
 
 // ReadFixedOp constructs a positioned read using a pre-registered fixed buffer.
 func ReadFixedOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpRead | opFixed, f: f, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpRead | opFixed, f: f, buf: buf, offset: offset}}
 }
 
 // WriteFixedOp constructs a positioned write using a pre-registered fixed buffer.
 func WriteFixedOp(f *os.File, buf []byte, offset int64) Op {
-	return Op{opcode: OpWrite | opFixed, f: f, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpWrite | opFixed, f: f, buf: buf, offset: offset}}
 }
 
 // ReadvOp constructs a vectored positioned read: bufs are filled from
 // consecutive file offsets starting at offset (preadv semantics). Ticket.Wait
 // returns the total bytes read across all buffers.
 func ReadvOp(f *os.File, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpReadv, f: f, bufs: bufs, offset: offset}
+	return Op{operation: operation{opcode: OpReadv, f: f, bufs: bufs, offset: offset}}
 }
 
 // WritevOp constructs a vectored positioned write: bufs are written to
 // consecutive file offsets starting at offset (pwritev semantics). Ticket.Wait
 // returns the total bytes written across all buffers.
 func WritevOp(f *os.File, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpWritev, f: f, bufs: bufs, offset: offset}
+	return Op{operation: operation{opcode: OpWritev, f: f, bufs: bufs, offset: offset}}
 }
 
 // VReadvOp constructs a vectored positioned read against an io_uring virtual
 // descriptor.
 func VReadvOp(vfd uint32, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpReadv | opVirtual, vfd: vfd, bufs: bufs, offset: offset}
+	return Op{operation: operation{opcode: OpReadv | opVirtual, vfd: vfd, bufs: bufs, offset: offset}}
 }
 
 // VWritevOp constructs a vectored positioned write against an io_uring virtual
 // descriptor.
 func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
-	return Op{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, offset: offset}
+	return Op{operation: operation{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, offset: offset}}
 }
 
 // OpenatOp constructs a plain openat operation that opens path and returns the
@@ -158,47 +199,45 @@ func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
 // The dfd argument is the directory fd passed to openat(2), for example
 // unix.AT_FDCWD.
 func OpenatOp(dfd int, path string, flags int, mode uint32) Op {
-	return Op{
+	return Op{operation: operation{
 		opcode:   OpOpenat,
 		dfd:      dfd,
 		path:     append([]byte(path), 0),
 		openFlag: flags,
 		mode:     mode,
-	}
+	}}
 }
 
 // UnlinkatOp removes path relative to dfd. It does not wait for operations on
 // already-open files; those descriptors remain usable until closed. Missing
 // paths report ENOENT. Keep dfd open until the ticket completes.
 func UnlinkatOp(dfd int, path string) Op {
-	return Op{opcode: OpUnlinkat, dfd: dfd, path: append([]byte(path), 0)}
+	return Op{operation: operation{opcode: OpUnlinkat, dfd: dfd, path: append([]byte(path), 0)}}
 }
 
 // VOpenatOp constructs an openat operation that installs the opened file into
-// vfd's virtual descriptor slot. Separately submitted operations accepted later
-// for the slot wait for the entire chain containing this open to complete, but
-// do not inherit its error; use Link when an open failure must cancel its
-// follower. If an idle slot already contains a file, a successful open replaces
-// and closes it, matching io_uring direct-open semantics.
+// vfd's virtual descriptor slot. Use AllocateVFD on the root operation to allocate
+// a free slot before placing the chain and return its index as the open result.
+// The caller orders all uses of the slot with links or completion waits.
+// Opening directly into an occupied slot replaces its file, as in io_uring.
 //
 // The dfd argument is the regular directory fd passed to openat(2), for
-// example unix.AT_FDCWD. vfd is the registered-file table index.
+// example unix.AT_FDCWD. vfd is the registered-file table index or AllocateVFD.
 func VOpenatOp(dfd int, path string, flags int, mode uint32, vfd uint32) Op {
-	return Op{
+	return Op{operation: operation{
 		opcode:   OpOpenat | opVirtual,
 		vfd:      vfd,
 		dfd:      dfd,
 		path:     append([]byte(path), 0),
 		openFlag: flags,
 		mode:     mode,
-	}
+	}}
 }
 
-// VCloseOp constructs a close operation for an io_uring virtual descriptor. It
-// waits for previously accepted operations on the slot. Do not separately submit
-// more work for the slot until the close-containing Ticket completes.
+// VCloseOp closes a virtual descriptor and returns its slot for allocation on
+// success. The caller must finish all other uses of the slot before closing it.
 func VCloseOp(vfd uint32) Op {
-	return Op{opcode: OpClose | opVirtual, vfd: vfd}
+	return Op{operation: operation{opcode: OpClose | opVirtual, vfd: vfd}}
 }
 
 // DrainOp waits for previously accepted operations on f, including the
@@ -209,136 +248,135 @@ func VCloseOp(vfd uint32) Op {
 // outlive the os.File and no caller-side runtime.KeepAlive is needed. Callers
 // must stop submitting work for f before submitting DrainOp.
 func DrainOp(f *os.File) Op {
-	return Op{opcode: OpClose, f: f}
+	return Op{operation: operation{opcode: OpClose, f: f}}
 }
 
 // VReadOp constructs a positioned read using an io_uring virtual descriptor.
 func VReadOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpRead | opVirtual, vfd: vfd, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpRead | opVirtual, vfd: vfd, buf: buf, offset: offset}}
 }
 
 // VWriteOp constructs a positioned write using an io_uring virtual descriptor.
 func VWriteOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpWrite | opVirtual, vfd: vfd, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpWrite | opVirtual, vfd: vfd, buf: buf, offset: offset}}
 }
 
 // VFsyncOp constructs an fsync operation using an io_uring virtual descriptor.
 func VFsyncOp(vfd uint32) Op {
-	return Op{opcode: OpFsync | opVirtual, vfd: vfd}
+	return Op{operation: operation{opcode: OpFsync | opVirtual, vfd: vfd}}
 }
 
 // VFdatasyncOp constructs an fdatasync operation using an io_uring virtual descriptor.
 func VFdatasyncOp(vfd uint32) Op {
-	return Op{opcode: OpFdatasync | opVirtual, vfd: vfd}
+	return Op{operation: operation{opcode: OpFdatasync | opVirtual, vfd: vfd}}
 }
 
 // VReadFixedOp constructs a positioned read using both a virtual descriptor
 // and a pre-registered fixed buffer.
 func VReadFixedOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpRead | opVirtual | opFixed, vfd: vfd, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpRead | opVirtual | opFixed, vfd: vfd, buf: buf, offset: offset}}
 }
 
 // VWriteFixedOp constructs a positioned write using both a virtual
 // descriptor and a pre-registered fixed buffer.
 func VWriteFixedOp(vfd uint32, buf []byte, offset int64) Op {
-	return Op{opcode: OpWrite | opVirtual | opFixed, vfd: vfd, buf: buf, offset: offset}
+	return Op{operation: operation{opcode: OpWrite | opVirtual | opFixed, vfd: vfd, buf: buf, offset: offset}}
 }
 
 // FallocateOp constructs an operation that preallocates size bytes of file
 // space from offset 0 (fallocate mode 0: reserve blocks and grow the file to
 // at least size). It mirrors sys.Fallocate.
 func FallocateOp(f *os.File, size int64) Op {
-	return Op{opcode: OpFallocate, f: f, length: size}
+	return Op{operation: operation{opcode: OpFallocate, f: f, length: size}}
 }
 
 // VFallocateOp constructs a FallocateOp targeting an io_uring virtual
 // descriptor. Compose it into an open→fallocate→write chain with Op.Link to fuse a
-// slab's creation and first write into one submission. Independent later writes to
-// the slot need not be linked: the scheduler orders them after the slot's open (see
-// Scheduler.Submit).
+// slab's creation and first write into one submission. Wait for that chain to
+// complete before independently submitting later operations on the slot.
 func VFallocateOp(vfd uint32, size int64) Op {
-	return Op{opcode: OpFallocate | opVirtual, vfd: vfd, length: size}
+	return Op{operation: operation{opcode: OpFallocate | opVirtual, vfd: vfd, length: size}}
 }
 
-// Link returns a copy of o with next chained after it (IOSQE_IO_LINK): if any op
-// in the chain fails, the rest are canceled. Any chains in next are flattened
-// into the returned chain. Passing the whole tail in one call builds the chain
-// with one allocation; repeated calls remain supported but rebuild the immutable
-// chain each time.
+// Link returns a copy of o with next chained after it. A failed operation
+// cancels its soft-linked followers. Nested chains are flattened.
 func (o Op) Link(next ...Op) Op { return o.chain(next, sqeLink) }
 
-// HardLink is like Link but with IOSQE_IO_HARDLINK: a failure does not cancel the
-// rest of the chain — each linked op runs regardless of the previous result.
+// HardLink continues the next operation even when its predecessor fails.
 func (o Op) HardLink(next ...Op) Op { return o.chain(next, sqeHardLink) }
 
 func (o Op) chain(next []Op, flag uint8) Op {
-	base := o.opCount()
-	total := base
-	for i := range next {
-		total += next[i].opCount()
-	}
-	if total == base {
+	if len(next) == 0 {
 		return o
 	}
-
-	// The nodes are one allocation, while linked pointers expose the flat chain
-	// to the scheduler. Rebuilding makes Op value copies independent: extending a
-	// copied Op cannot mutate the source's tail flags or next pointer.
-	root := o
-	root.linked = nil
-	nodes := make([]Op, total-1)
-	tail := &root
-	nextNode := 0
-	appendChain := func(src *Op) {
-		for src != nil {
-			nodes[nextNode] = *src
-			nodes[nextNode].linked = nil
-			tail.linked = &nodes[nextNode]
-			tail = &nodes[nextNode]
-			nextNode++
-			src = src.linked
-		}
-	}
-	appendChain(o.linked)
+	count := len(o.followers())
 	for i := range next {
-		tail.sqeFlags |= flag
-		appendChain(&next[i])
+		count += next[i].opCount()
 	}
-	return root
+	out := Op{operation: o.operation, whenDone: o.whenDone}
+	// A slice stored back into a value-type Op would point into its old copy.
+	// Keep inline links as values and form the slice only while accessing them.
+	var links []operation
+	if count <= len(out.linkAlloc) {
+		out.linkCount = uint8(count)
+		links = out.linkAlloc[:count]
+	} else {
+		out.linked = make([]operation, count)
+		links = out.linked
+	}
+	n := copy(links, o.followers())
+	for i := range next {
+		tail := &out.operation
+		if n != 0 {
+			tail = &links[n-1]
+		}
+		tail.sqeFlags = flag
+		links[n] = next[i].operation
+		n++
+		n += copy(links[n:], next[i].followers())
+	}
+	return out
 }
 
-func (o *Op) opCount() int {
-	count := 0
-	for p := o; p != nil; p = p.linked {
-		count++
+func (o *Op) followers() []operation {
+	if o.linked != nil {
+		return o.linked
 	}
-	return count
+	return o.linkAlloc[:o.linkCount]
 }
 
-func (o *Op) isLinked() bool { return o.sqeFlags&(sqeLink|sqeHardLink) != 0 }
+func (o *Op) opCount() int          { return 1 + len(o.followers()) }
+func (o *operation) isLinked() bool { return o.sqeFlags&(sqeLink|sqeHardLink) != 0 }
 
 // isVirtual reports whether o addresses its file by virtual-table index (vfd)
 // rather than *os.File — i.e. the opVirtual bit is set.
-func (o *Op) isVirtual() bool { return o.opcode&opVirtual != 0 }
+func (o *operation) isVirtual() bool { return o.opcode&opVirtual != 0 }
 
 // isFixed reports whether o uses a pre-registered fixed buffer — the opFixed bit.
-func (o *Op) isFixed() bool { return o.opcode&opFixed != 0 }
+func (o *operation) isFixed() bool { return o.opcode&opFixed != 0 }
 
 // kind returns the operation with the opVirtual/opFixed flags masked off, so the
 // scheduler switches on the operation regardless of addressing or buffer mode.
-func (o *Op) kind() uint8 { return o.opcode &^ (opVirtual | opFixed) }
+func (o *operation) kind() uint8 { return o.opcode &^ (opVirtual | opFixed) }
+
+// Result is one operation's byte count (or opened descriptor) and error.
+// A linked operation canceled by an earlier failure has its own cancellation error.
+type Result struct {
+	N   int
+	Err error
+}
 
 // completion is a submission's result and its completion signal. The
 // scheduler records n and err, then calls finish exactly once. The done
 // channel is allocated only by Done. Wait uses a WaitGroup directly; completion
 // publishes a shared closed channel if no caller needed selectable completion.
 type completion struct {
-	n        int
-	err      error
-	whenDone func(n int, err error) // from SubmitNotify; fixed before submission
-	started  time.Time              // entry to Submit; monotonic clock
+	results []Result // root and followers for linked submissions
+	n       int
+	err     error
+	started time.Time // submission preparation; monotonic clock
 
-	Slat time.Duration // Submit entry to ring placement (POSIX: execution starts).
+	Slat time.Duration // Preparation to ring placement (POSIX: execution starts).
 	Clat time.Duration // Ring placement to ticket completion, including any Durable sync.
 
 	wait sync.WaitGroup                // Wait does not allocate a channel
@@ -353,8 +391,7 @@ var closedChan = func() chan struct{} {
 	return c
 }()
 
-// finish completes the ticket: it closes the done channel, then calls the
-// submission's whenDone, if any, on the calling goroutine.
+// finish publishes the result and releases ticket waiters.
 func (c *completion) finish() {
 	if c.Slat > 0 {
 		c.Clat = time.Since(c.started) - c.Slat
@@ -366,14 +403,11 @@ func (c *completion) finish() {
 		close(*c.done.Load())
 	}
 	c.wait.Done()
-	if c.whenDone != nil {
-		c.whenDone(c.n, c.err)
-	}
 }
 
 // Ticket is the completion handle returned by a successful Scheduler.Submit.
 // Slat and Clat may be read after Wait returns or Done is closed. Slat includes
-// scheduler queueing and budget waits. Clat covers all linked operations and
+// preparation and scheduler queueing. Clat covers all linked operations and
 // any Durable sync, ending before notification or callback execution. Ring
 // placement precedes kernel execution, so Clat includes ring submission and
 // completion reaping. Both are zero if the submission failed before placement.
@@ -383,12 +417,6 @@ type Ticket struct {
 
 func (c *completion) markIssued() {
 	c.Slat = time.Since(c.started)
-}
-
-func (o *Op) prepareSubmission(started time.Time) Ticket {
-	o.completion = &completion{whenDone: o.whenDone, started: started}
-	o.wait.Add(1)
-	return Ticket{o.completion}
 }
 
 // SubmitNotify submits op to s, like s.Submit, and has whenDone called with
@@ -430,54 +458,20 @@ func (t Ticket) Wait() (int, error) {
 	return t.n, t.err
 }
 
-func countAndValidateOps(op *Op, cfg *schedulerConfig) (int32, error) {
-	var count int32
-	for p := op; p != nil; p = p.linked {
-		kind := p.kind()
-		if p.linked != nil && p.durable() && (kind == OpWrite || kind == OpWritev) {
-			return 0, fmt.Errorf("iosched: Durable write must be the final operation in a linked chain; add FdatasyncOp for an intermediate sync")
-		}
-		if kind == OpOpenat || kind == OpUnlinkat {
-			if len(p.path) <= 1 {
-				return 0, fmt.Errorf("iosched: op %d has empty path", count)
-			}
-			if bytes.IndexByte(p.path[:len(p.path)-1], 0) >= 0 {
-				return 0, fmt.Errorf("iosched: op %d path contains NUL", count)
-			}
-			if int(int32(p.dfd)) != p.dfd {
-				return 0, fmt.Errorf("iosched: op %d directory descriptor does not fit the kernel ABI", count)
-			}
-		}
-		if (kind == OpReadv || kind == OpWritev) && len(p.bufs) > maxCoalescedWrites {
-			return 0, fmt.Errorf(
-				"iosched: op %d has %d buffers, exceeds Linux IOV_MAX %d",
-				count, len(p.bufs), maxCoalescedWrites,
-			)
-		}
-		if kind == OpFallocate && (p.offset < 0 || p.length < 0) {
-			return 0, fmt.Errorf("iosched: op %d has negative fallocate range", count)
-		}
-		if kind == OpClose && !p.isVirtual() && p.linked != nil {
-			return 0, fmt.Errorf("iosched: DrainOp must be the final operation in a linked chain")
-		}
-		if p.isVirtual() {
-			if cfg != nil {
-				if cfg.vfiles == 0 {
-					return 0, fmt.Errorf("iosched: virtual file ops require WithVFiles")
-				}
-				if p.vfd >= cfg.vfiles {
-					return 0, fmt.Errorf("iosched: virtual file index %d outside configured table", p.vfd)
-				}
-			}
-		} else if kind != OpOpenat && kind != OpUnlinkat && p.f == nil {
-			return 0, fmt.Errorf("iosched: op %d has nil file", count)
-		}
-		count++
+// AllResults returns the individual outcomes in submission order, including
+// the root. Call after Wait returns or Done closes. For a linked submission it
+// exposes the ticket's retained results without allocating; a standalone result
+// slice is allocated only when this method is called. Treat the slice as read-only.
+// Wait returns the root count and first chain error; each AllResults entry
+// contains only that operation's error.
+func (t Ticket) AllResults() []Result {
+	if t.results != nil {
+		return t.results
 	}
-	return count, nil
+	return []Result{{N: t.n, Err: t.err}}
 }
 
-func opBytes(op *Op) int {
+func opBytes(op *operation) int {
 	switch op.kind() {
 	case OpWritev, OpReadv:
 		total := 0
@@ -490,7 +484,7 @@ func opBytes(op *Op) int {
 	}
 }
 
-func writeResultError(op *Op, n int, err error) error {
+func writeResultError(op *operation, n int, err error) error {
 	if err != nil {
 		return err
 	}
@@ -501,18 +495,4 @@ func writeResultError(op *Op, n int, err error) error {
 		}
 	}
 	return nil
-}
-
-func recordResult(root, op *Op, n int, err error) {
-	if op == root {
-		root.n = n
-	}
-	recordError(root, err)
-}
-
-// recordError keeps the first error reported for root's ticket.
-func recordError(root *Op, err error) {
-	if err != nil && root.err == nil {
-		root.err = err
-	}
 }

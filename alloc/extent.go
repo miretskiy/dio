@@ -133,7 +133,7 @@ func (p *ExtentAllocator) release(handles ...collections.Handle) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, handle := range handles {
-		p.slots.Remove(handle)
+		p.slots.Recycle(handle)
 	}
 	p.available.Broadcast()
 }

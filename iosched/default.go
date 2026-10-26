@@ -5,9 +5,8 @@ package iosched
 // On Linux with io_uring support, it returns a [URingScheduler]; otherwise (or
 // if io_uring setup fails) a [POSIXScheduler]. Options configure the io_uring
 // backend — e.g. WithVFiles(n) to register a virtual-file table, the
-// prerequisite for virtual-file ops. The POSIX backend emulates virtual files
-// with an unbounded userspace table and ignores these knobs, so virtual-file
-// consumers get a working scheduler on either host.
+// prerequisite for virtual-file ops. The POSIX backend honors WithVFiles with a
+// userspace table and ignores the io_uring-specific options.
 //
 // Callers that require io_uring can pass the same options to
 // [NewURingScheduler] directly and handle its setup error.
@@ -17,5 +16,5 @@ func NewDefaultScheduler(opts ...Option) Scheduler {
 			return s
 		}
 	}
-	return NewPOSIXScheduler()
+	return NewPOSIXScheduler(opts...)
 }

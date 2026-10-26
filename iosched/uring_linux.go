@@ -49,14 +49,11 @@ type ringSlot struct {
 	handle ringo.Handle
 	kind   slotKind
 	work   *submission     // the work the operation belongs to, or a coalesced run's leader
-	op     *Op             // the operation, for slotOperation
+	op     *operation      // the operation, for slotOperation
 	batch  submissionQueue // the durable writes an fdatasync covers, for slotSync
 }
 
 var stagingClosed submission
-
-// doorbellSlots is the ring entry the coordinator keeps for its doorbell read.
-const doorbellSlots = 1
 
 // doorbellMaxInFlight is how many operations may be in flight while the
 // coordinator still asks Submit to ring the doorbell. With more, the next
@@ -84,13 +81,6 @@ var doorbellIncrement = func() (value [8]byte) {
 	return value
 }()
 
-// maxChainLength bounds a linked chain. A chain is placed whole, so a long one
-// at the head of the ready queue holds back everything behind it until that
-// many ring entries are free. Eight covers an open, fallocate, writes, a sync
-// and a close in one chain. A ring with fewer entries limits chains to what
-// fits beside the doorbell.
-const maxChainLength = 8
-
 // URingScheduler is an asynchronous Scheduler backed by io_uring.
 //
 // A single coordinator goroutine owns the SQ and CQ. Submitters publish Ops to
@@ -101,17 +91,14 @@ const maxChainLength = 8
 // the read. Close owns the ring lifetime and may issue synchronous cancellation
 // through its fd before tearing it down.
 type URingScheduler struct {
-	config schedulerConfig
+	config     schedulerConfig
+	cancelDone chan struct{} // exceptional doorbell-error recovery, joined by Close
 
 	ring              *ringo.Ring
 	fixedFiles        []ringo.FixedFile
 	registeredBuffers *ringo.FixedBuffers
 	stagingHead       atomic.Pointer[submission]
 	done              chan struct{}
-	stagingPeak       atomic.Int64
-	waitingDepth      queueDepth
-	readyDepth        queueDepth
-	inFlightDepth     queueDepth
 
 	// doorbellFD is a blocking eventfd, not registered with the ring, so the
 	// read the coordinator keeps queued on it completes only when Submit or
@@ -133,24 +120,6 @@ type URingScheduler struct {
 	drainErr error
 }
 
-// QueueStats reports current submission depths and lifetime high-water marks.
-// It is safe to call concurrently with Submit or completion. Staged depth is
-// read from the immutable published head, without traversing the stack or
-// synchronizing with its reversal. A detached batch being accepted is between
-// Staged and the coordinator queues, so these fields are not a total-work count.
-func (s *URingScheduler) QueueStats() QueueStats {
-	var staged int64
-	if head := s.stagingHead.Load(); head != nil && head != &stagingClosed {
-		staged = head.stagedDepth
-	}
-	return QueueStats{
-		Staged:   QueueDepth{Current: staged, Peak: max(staged, s.stagingPeak.Load())},
-		Waiting:  s.waitingDepth.snapshot(),
-		Ready:    s.readyDepth.snapshot(),
-		InFlight: s.inFlightDepth.snapshot(),
-	}
-}
-
 // NewURingScheduler creates an io_uring-backed scheduler. The kernel must
 // provide the setup and feature guarantees required by ringo.New.
 func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
@@ -159,12 +128,6 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	}
 
 	cfg := makeSchedulerConfig(opts)
-	if err := cfg.budget.validate(); err != nil {
-		return nil, err
-	}
-	if cfg.coordinatorCPU < -1 {
-		return nil, fmt.Errorf("iosched: invalid coordinator CPU %d", cfg.coordinatorCPU)
-	}
 	data := make([][]byte, len(cfg.dmaBuffers))
 	for i, buffer := range cfg.dmaBuffers {
 		chunks := buffer.Chunks()
@@ -196,11 +159,6 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	abandon := func(err error) error {
 		return errors.Join(err, ring.Close(), unix.Close(doorbellFD))
 	}
-	if cfg.ringDepth <= doorbellSlots {
-		return nil, abandon(fmt.Errorf(
-			"iosched: ring depth %d leaves no entries beside the coordinator's doorbell", cfg.ringDepth,
-		))
-	}
 
 	fixedFiles := make([]ringo.FixedFile, cfg.vfiles)
 	for index := range fixedFiles {
@@ -225,55 +183,85 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 		}
 		s.registeredBuffers = buffers
 	}
-	go s.loop()
+	go s.loop(newCoordinator(s))
 	return s, nil
 }
 
-// Submit enqueues op for asynchronous execution.
+// Submit validates the chain and checks the shared rejection state before staging it.
+// Rejection returns ErrRejected immediately, with no operations executed or ticket.
 func (s *URingScheduler) Submit(op Op) (Ticket, error) {
-	started := time.Now()
 	if err := s.stopCause(); err != nil {
 		return Ticket{}, err
 	}
-
-	n, err := countAndValidateOps(&op, &s.config)
+	work, err := s.prepareSubmission(&op)
 	if err != nil {
 		return Ticket{}, err
 	}
-	if limit := min(maxChainLength, int(s.config.ringDepth)-doorbellSlots); int(n) > limit {
-		return Ticket{}, fmt.Errorf(
-			"iosched: linked chain of %d operations exceeds the limit of %d", n, limit,
-		)
+	if !s.config.disk.admit(work) {
+		return Ticket{}, ErrRejected
 	}
-	if err := s.validateFixedBuffers(&op); err != nil {
-		return Ticket{}, err
-	}
-
-	request, ticket := newSubmission(op, n, started)
-	if !s.tryPush(request) {
+	if !s.tryPush(work) {
 		return Ticket{}, s.stopCause()
 	}
-	// Wake the coordinator only if it asked to be woken. Clearing the request
-	// makes this the one Submit that wakes it from that wait. The push came
-	// first and the coordinator sets the request before it rechecks the staging
-	// stack; Go atomics behave as though executed in one sequentially
-	// consistent order, so either that recheck sees this push or this swap sees
-	// the request.
+	s.wakeCoordinator()
+	return Ticket{&work.completion}, nil
+}
+
+// prepareSubmission copies the operands, checks ring limits and buffer
+// registration, and collects the whole chain's request totals.
+func (s *URingScheduler) prepareSubmission(op *Op) (*submission, error) {
+	work, err := copySubmission(op, maxChainLength)
+	if err != nil {
+		return nil, err
+	}
+	for i := range work.opCount() {
+		current := work.op(i)
+		if current.isVirtual() {
+			if s.config.vfiles == 0 {
+				return nil, syscall.EOPNOTSUPP
+			}
+			if current.vfd != AllocateVFD && current.vfd >= s.config.vfiles {
+				return nil, fmt.Errorf("iosched: virtual file index %d outside configured table", current.vfd)
+			}
+		}
+		if current.isFixed() {
+			if err := s.validateFixedBuffer(current.buf); err != nil {
+				return nil, err
+			}
+		}
+		switch current.kind() {
+		case OpRead, OpReadv:
+			bytes := int64(opBytes(current))
+			work.reads.ops++
+			work.reads.bytes += bytes
+			work.reads.serviceTime += s.config.disk.device.reads.serviceTime(bytes)
+		case OpWrite, OpWritev:
+			bytes := int64(opBytes(current))
+			work.writes.ops++
+			work.writes.bytes += bytes
+			work.writes.serviceTime += s.config.disk.device.writes.serviceTime(bytes)
+		}
+	}
+	return work, nil
+}
+
+// Enqueue before claiming the wake request: either the coordinator sees the
+// staged work on its final recheck, or this submitter wakes it after that check.
+func (s *URingScheduler) wakeCoordinator() {
 	switch s.wake.Swap(wakeNone) {
 	case wakeChannel:
 		s.wakeChannel()
 	case wakeDoorbell:
-		if err := s.ringDoorbell(); err != nil {
-			// The coordinator may be asleep with only the doorbell read in
-			// flight, so the work just staged would never be placed. Stop the
-			// scheduler, and cancel the ring's operations so that the
-			// coordinator's wait ends and it sees the stop; cancellation is best
-			// effort, exactly as in Close.
-			s.signalShutdown(err)
-			_ = s.ring.CancelAll(shutdownCancelTimeout)
+		if err := s.ringDoorbell(); err != nil && s.signalShutdown(err) {
+			// Submit returns without waiting for cancellation. Close follows
+			// the caller's last Submit and joins recovery before ring teardown.
+			s.cancelDone = make(chan struct{})
+			go func() {
+				_ = s.ring.CancelAll(shutdownCancelTimeout)
+				close(s.cancelDone)
+			}()
 		}
 	}
-	return ticket, nil
 }
 
 // wakeChannel wakes a parked coordinator, or leaves the wakeup buffered for
@@ -295,17 +283,12 @@ func (s *URingScheduler) ringDoorbell() error {
 	return nil
 }
 
-func (s *URingScheduler) validateFixedBuffers(root *Op) error {
-	for op := root; op != nil; op = op.linked {
-		if !op.isFixed() {
-			continue
-		}
-		if s.registeredBuffers == nil {
-			return errors.New("iosched: fixed-buffer operation requires WithDMABuffers")
-		}
-		if _, err := s.registeredBuffers.Bind(op.buf); err != nil {
-			return fmt.Errorf("iosched: fixed buffer is outside the registered DMA buffers: %w", err)
-		}
+func (s *URingScheduler) validateFixedBuffer(buf []byte) error {
+	if s.registeredBuffers == nil {
+		return errors.New("iosched: fixed-buffer operation requires WithDMABuffers")
+	}
+	if _, err := s.registeredBuffers.Bind(buf); err != nil {
+		return fmt.Errorf("iosched: fixed buffer is outside the registered DMA buffers: %w", err)
 	}
 	return nil
 }
@@ -317,12 +300,7 @@ func (s *URingScheduler) tryPush(request *submission) bool {
 			return false
 		}
 		request.staged = head
-		request.stagedDepth = 1
-		if head != nil {
-			request.stagedDepth += head.stagedDepth
-		}
 		if s.stagingHead.CompareAndSwap(head, request) {
-			observeQueuePeak(&s.stagingPeak, request.stagedDepth)
 			return true
 		}
 	}
@@ -353,6 +331,9 @@ func (s *URingScheduler) Close() error {
 		}
 	}
 	<-s.done
+	if s.cancelDone != nil {
+		<-s.cancelDone
+	}
 	ringErr := s.ring.Close()
 	err := errors.Join(s.drainErr, ringErr)
 	if ringErr != nil {
@@ -398,13 +379,15 @@ type coordinator struct {
 	// ready holds the accepted work eligible for placement, oldest first. Work
 	// waiting for a barrier stays out of it until the barrier releases it.
 	ready submissionQueue
+	// inFlight is this ring's dispatched service time per class. A class with
+	// none in flight always dispatches, so blocked work always has an own
+	// completion coming that ends the coordinator's wait.
+	inFlight ringInFlight
 
+	vfiles       []uint64 // bitmap of slots reserved through AllocateVFD
+	nextVFile    int      // first bitmap word to search
 	files        fileTable
 	nextSequence uint64
-
-	// inFlightCost is the cost of each class's operations in flight, in
-	// nanoseconds of device time; see ioBudget.
-	inFlightCost [budgetedClasses]int64
 
 	// syncPending holds the files with durable writes waiting for an fdatasync
 	// that is not placed yet, in the order their first write completed.
@@ -413,10 +396,17 @@ type coordinator struct {
 	// alloc recycles Ringo operation objects. Only this goroutine builds them
 	// and only this goroutine reaps them, so its lock is never contended.
 	alloc ringo.OpAlloc
+
+	// doorbellBuffer receives the doorbell read. One read is in the ring at a
+	// time and is re-armed only after its completion is reaped.
+	doorbellBuffer [8]byte
+	// coalesceBuffers is the writev buffer list for a coalesced run. Ringo
+	// copies it into the operation it builds, so one list serves every run.
+	coalesceBuffers [][]byte
 }
 
 func newCoordinator(s *URingScheduler) *coordinator {
-	return &coordinator{
+	c := &coordinator{
 		sched:    s,
 		ring:     s.ring,
 		slots:    make([]ringSlot, s.config.ringDepth),
@@ -424,9 +414,11 @@ func newCoordinator(s *URingScheduler) *coordinator {
 		ready:    submissionQueue{links: placementLinks},
 		files:    newFileTable(s.config.vfiles),
 	}
+	c.initVFiles(s.config.vfiles)
+	return c
 }
 
-func (s *URingScheduler) loop() {
+func (s *URingScheduler) loop(c *coordinator) {
 	runtime.LockOSThread()
 	// Exit locked so the runtime cannot reuse a thread with restricted affinity.
 	if cpu := s.config.coordinatorCPU; cpu >= 0 {
@@ -437,7 +429,6 @@ func (s *URingScheduler) loop() {
 		}
 	}
 	defer close(s.done)
-	c := newCoordinator(s)
 	s.drainErr = c.shutdown(c.run())
 }
 
@@ -461,7 +452,7 @@ func (c *coordinator) shutdown(cause error) error {
 
 // How work moves through the coordinator, with its workState in brackets:
 //
-//	Submit ──► staging stack ──takeStaged──► accept ──check rejects──► ticket fails
+//	Submit ──admit──► staging stack ──takeStaged──► accept
 //	                                           │
 //	                     every accepted submission is on the accepted queue
 //	                     until its ticket completes
@@ -503,8 +494,7 @@ func (c *coordinator) run() error {
 		c.accept(c.sched.takeStaged())
 		placed, room := c.placeReady(c.sched.config.coalescing)
 
-		// After placement, accepted work requires at least one occupied ring slot
-		// besides the doorbell.
+		// Accepted work needs an issued operation to make progress.
 		if err := buildutil.Assert(c.occupied > doorbellSlots || c.accepted.len == 0); err != nil {
 			return fmt.Errorf("iosched: accepted work has no runnable or issued operation: %w", err)
 		}
@@ -551,8 +541,6 @@ func (c *coordinator) submitAndWait(placed int, room bool) error {
 		return c.enter(0)
 	}
 	if idle {
-		// Nothing is in flight but the doorbell read, which only a Submit could
-		// complete, so there is nothing to submit or reap until one arrives.
 		<-s.wakeup
 		return nil
 	}
@@ -564,9 +552,9 @@ func (c *coordinator) submitAndWait(placed int, room bool) error {
 // entry reserved for it. The pass that arms it does so before placing caller
 // work, and the read's own completion freed the entry it needs, so the push
 // cannot find the ring full. Ringo retains the buffer until the read
-// completes, so each read gets its own.
+// completes, which is before the next read reuses it.
 func (c *coordinator) armDoorbell() ringo.Handle {
-	read := ringo.Read(ringo.BorrowedFD(c.sched.doorbellFD), make([]byte, 8), 0, ringo.WithAlloc(&c.alloc))
+	read := ringo.Read(ringo.BorrowedFD(c.sched.doorbellFD), c.doorbellBuffer[:], 0, ringo.WithAlloc(&c.alloc))
 	handle, err := c.ring.Push(read)
 	if err != nil {
 		panic(fmt.Sprintf("iosched: Ringo rejected the doorbell read: %v", err))
@@ -595,24 +583,16 @@ func (c *coordinator) accept(head *submission) {
 		work := head
 		head = head.staged
 		work.staged = nil
+		c.sched.config.disk.account(work)
 		root := &work.root
-		last := root
-		for last.linked != nil {
-			last = last.linked
-		}
-		if last.durable() && (last.kind() == OpWrite || last.kind() == OpWritev) {
-			work.durable = last
-		}
+		work.err = c.prepareVFiles(work)
 
 		uses := fileUses(work, work.inlineFile[:0])
 		if err := c.files.check(uses); err != nil {
-			completeFailed(root, err)
+			c.releaseVFDReservation(root)
+			c.sched.config.disk.release(work, &c.inFlight)
+			work.fail(err)
 			continue
-		}
-		work.cost = c.sched.config.budget.costs(root)
-		work.remaining = work.count
-		if work.durable != nil {
-			work.remaining++ // the fdatasync that covers the write
 		}
 		work.sequence = c.nextSequence
 		c.nextSequence++
@@ -620,10 +600,9 @@ func (c *coordinator) accept(head *submission) {
 		c.admit(work, uses)
 		if work.waitCount == 0 {
 			c.makeReady(work)
-		} else {
-			c.sched.waitingDepth.add(1)
 		}
 	}
+	c.sched.config.disk.updateAdmission()
 }
 
 func (c *coordinator) releaseWait(work *submission) {
@@ -632,20 +611,13 @@ func (c *coordinator) releaseWait(work *submission) {
 		panic(err)
 	}
 	if work.waitCount == 0 {
-		c.sched.waitingDepth.add(-1)
 		c.makeReady(work)
 	}
 }
 
-// placeReady places what waits for the ring and returns how many entries it
-// placed, and whether new work could still be placed now. Pending fdatasyncs
-// go first: the writes they cover have completed, so each one only completes
-// tickets. Ready work follows, oldest first, while it fits in the ring and in
-// its class's in-flight budget. Once one item of a class does not fit its
-// budget, later items of that class wait too, so a large operation is not
-// overtaken indefinitely, but other classes go on: a read never waits for the
-// write budget. A run of adjacent contiguous writes becomes one write; anything
-// else is placed as its own linked chain, one entry per operation.
+// placeReady places accepted work in ring order. Pending fdatasyncs go first;
+// file barriers, ring capacity, and the shared in-flight allowance determine
+// when other work can execute. Backlog admission was already decided by Submit.
 func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 	start := c.occupied
 	free := func() int { return int(c.sched.config.ringDepth) - c.occupied }
@@ -663,13 +635,23 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 		return c.occupied - start, false
 	}
 
-	var overBudget [budgetedClasses]bool
+	readsBlocked, writesBlocked := false, false
 	for work := c.ready.head; work != nil; {
-		blocked := false
-		for class, cost := range work.cost {
-			blocked = blocked || (cost != 0 && overBudget[class])
+		need := work.opCount()
+		if work.err != nil {
+			need-- // The failed open completes without an SQE.
+			if work.root.sqeFlags&sqeHardLink == 0 {
+				need = 0
+			}
 		}
-		if blocked {
+		if need > free() {
+			return c.occupied - start, false
+		}
+		blocked := (readsBlocked && work.reads.serviceTime > 0) ||
+			(writesBlocked && work.writes.serviceTime > 0)
+		if blocked || !c.sched.config.disk.dispatch(work, &c.inFlight) {
+			readsBlocked = readsBlocked || work.reads.serviceTime > 0
+			writesBlocked = writesBlocked || work.writes.serviceTime > 0
 			work = c.ready.next(work)
 			continue
 		}
@@ -677,84 +659,31 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 		if coalesce {
 			run = c.coalescedRun(work)
 		}
-		need, cost := work.root.opCount(), work.cost
-		if run > 1 {
-			need = 1
-			for member, i := c.ready.next(work), 1; i < run; member, i = c.ready.next(member), i+1 {
-				cost[classWrite] += member.cost[classWrite]
-			}
-		}
-		if need > free() {
-			return c.occupied - start, false
-		}
-		for class, amount := range cost {
-			if amount != 0 && !c.fitsBudget(ioClass(class), amount) {
-				overBudget[class], blocked = true, true
-			}
-		}
-		if blocked {
-			if overBudget[classRead] && overBudget[classWrite] {
-				break
-			}
-			work = c.ready.next(work)
-			continue
-		}
 		if run > 1 {
 			work = c.placeCoalescedRun(work, run)
 		} else {
 			work = c.placeChain(work)
 		}
 	}
-	return c.occupied - start, free() > 0 && !(overBudget[classRead] && overBudget[classWrite])
+	return c.occupied - start, free() > 0
 }
 
-// fitsBudget reports whether cost more of class may be placed. A class with
-// nothing in flight takes any one operation, however costly, so none waits
-// forever.
-func (c *coordinator) fitsBudget(class ioClass, cost int64) bool {
-	if class == classOther {
-		return true
-	}
-	inFlight := c.inFlightCost[class]
-	return inFlight == 0 || inFlight+cost <= int64(c.sched.config.budget.goal)
-}
-
-// take removes work from the ready queue, marks it issued and charges its
-// cost to its class's budget.
+// take removes work from the ready queue and marks it issued.
 func (c *coordinator) take(work *submission) {
 	c.ready.remove(work)
-	c.sched.readyDepth.add(-1)
 	work.state = workIssued
-	c.sched.inFlightDepth.add(1)
-	for class, cost := range work.cost {
-		c.inFlightCost[class] += cost
-	}
-	work.charged = true
-}
-
-// release returns each operation's cost at its own completion, including
-// canceled followers. Metadata operations have no charge.
-func (c *coordinator) release(work *submission, op *Op) {
-	if work.charged {
-		class, cost := c.sched.config.budget.cost(op)
-		if class != classOther {
-			c.inFlightCost[class] -= cost
-		}
-	}
 }
 
 // coalescedRun returns how many ready entries, starting at first, form one run
 // of writes that can be coalesced into a writev: adjacent submissions writing
 // contiguous ranges of the same file. A head that cannot be coalesced is a run
-// of one.
+// of one. The first entry already holds its allowance; followers claim theirs here.
 func (c *coordinator) coalescedRun(first *submission) int {
 	firstOp := &first.root
-	if firstOp.linked != nil || !firstOp.coalescibleWrite() {
+	if len(first.linked) != 0 || !firstOp.coalescibleWrite() {
 		return 1
 	}
 	run := 1
-	cost := first.cost[classWrite]
-	goal := int64(c.sched.config.budget.goal)
 	sequence := first.sequence
 	runEnd := firstOp.offset + int64(len(firstOp.buf))
 	// Only adjacent submissions are coalesced. Searching past unrelated work
@@ -764,90 +693,115 @@ func (c *coordinator) coalescedRun(first *submission) int {
 	for work := c.ready.next(first); work != nil && run < maxCoalescedWrites; work = c.ready.next(work) {
 		op := &work.root
 		sequence++
-		if work.sequence != sequence || op.linked != nil || !op.coalescibleWrite() ||
+		if work.sequence != sequence || len(work.linked) != 0 || !op.coalescibleWrite() ||
 			!sameFile(firstOp, op) || op.offset != runEnd {
 			break
 		}
-		// The oversized-operation escape is for one caller operation, never an
-		// oversized batch manufactured by coalescing. Use the remaining budget.
-		nextCost := cost + work.cost[classWrite]
-		if goal > 0 && c.inFlightCost[classWrite]+nextCost > goal {
+		if !c.sched.config.disk.dispatch(work, &c.inFlight) {
 			break
 		}
-		cost = nextCost
 		runEnd += int64(len(op.buf))
 		run++
 	}
 	return run
 }
 
-func ringoLinkType(op *Op) ringo.LinkType {
+func ringoLinkType(op *operation) ringo.LinkType {
 	if op.sqeFlags&sqeHardLink != 0 {
 		return ringo.LinkHard
 	}
 	return ringo.LinkSoft
 }
 
-// placeChain places work as one linked chain, one ring entry per operation,
-// linked as the caller linked them, and returns the ready work after it.
+// placeChain places a whole chain, preserving its soft/hard link boundaries.
 func (c *coordinator) placeChain(work *submission) (next *submission) {
 	next = c.ready.next(work)
 	c.take(work)
-	root := &work.root
-	first := c.translateOp(root)
-	if root.linked == nil {
-		ringHandle, err := c.ring.Push(first)
-		if err != nil {
-			panic(fmt.Sprintf("iosched: Ringo rejected a validated operation: %v", err))
+	start := 0
+	if work.err != nil {
+		start = c.finishFailedOpen(work)
+		if start == work.opCount() {
+			return next
 		}
-		work.completion.markIssued()
-		c.place(ringHandle, ringSlot{kind: slotOperation, work: work, op: root})
+	}
+	first := c.translateOp(work.op(start))
+	if start+1 == work.opCount() {
+		handle, err := c.ring.Push(first)
+		if err != nil {
+			c.failPlacement(work, start, err)
+			return next
+		}
+		work.markIssued()
+		c.place(handle, ringSlot{kind: slotOperation, work: work, op: work.op(start)})
 		return next
 	}
-
-	// PushLinked does not retain links.
-	links := make([]ringo.Link, 0, root.opCount()-1)
-	for op := root; op.linked != nil; op = op.linked {
-		links = append(links, ringo.Then(ringoLinkType(op), c.translateOp(op.linked)))
+	var storage [maxChainLength - 1]ringo.Link
+	links := storage[:0]
+	for i := start + 1; i < work.opCount(); i++ {
+		links = append(links, ringo.Then(ringoLinkType(work.op(i-1)), c.translateOp(work.op(i))))
 	}
-	ringHandles, err := c.ring.PushLinked(first, links[0], links[1:]...)
+	handles, err := c.ring.PushLinked(first, links[0], links[1:]...)
 	if err != nil {
-		panic(fmt.Sprintf("iosched: Ringo rejected a validated chain: %v", err))
+		c.failPlacement(work, start, err)
+		return next
 	}
-	work.completion.markIssued()
-	op := root
-	for _, ringHandle := range ringHandles {
-		c.place(ringHandle, ringSlot{kind: slotOperation, work: work, op: op})
-		op = op.linked
+	work.markIssued()
+	for i, handle := range handles {
+		c.place(handle, ringSlot{kind: slotOperation, work: work, op: work.op(start + i)})
 	}
 	return next
 }
 
+func (c *coordinator) failPlacement(work *submission, first int, err error) {
+	for i := first; i < work.opCount(); i++ {
+		c.finishOperation(work, work.op(i), 0, err)
+	}
+}
+
+func (c *coordinator) finishFailedOpen(work *submission) int {
+	c.finishOperation(work, &work.root, 0, work.err)
+	if work.root.sqeFlags&sqeHardLink != 0 {
+		return 1
+	}
+	for i := 1; i < work.opCount(); i++ {
+		c.finishOperation(work, work.op(i), 0, syscall.ECANCELED)
+	}
+	return work.opCount()
+}
+
 // placeCoalescedRun places the run ready entries starting at first, adjacent
 // writes to contiguous ranges of one file, as one writev of their buffers, and
-// returns the ready work after them. The leader records every member, so the
-// one completion can be split back into each member's result.
+// returns the ready work after them. The members stay linked from the leader
+// through staged, in writev order, so the one completion can be split back
+// into each member's result.
 func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submission) {
-	members := make([]*submission, run)
-	// Ringo snapshots the buffer list into the Op it builds.
-	bufs := make([][]byte, run)
-	next = first
-	for i := range members {
-		members[i] = next
-		next = c.ready.next(next)
-		c.take(members[i])
-		bufs[i] = members[i].root.buf
+	if c.coalesceBuffers == nil {
+		c.coalesceBuffers = make([][]byte, maxCoalescedWrites)
 	}
-	leader := members[0]
-	leader.coalesced = members
+	bufs := c.coalesceBuffers[:run]
+	leader := first
+	var last *submission
+	next = first
+	for i := range bufs {
+		member := next
+		next = c.ready.next(member)
+		c.take(member)
+		bufs[i] = member.root.buf
+		if last != nil {
+			last.staged = member
+		}
+		last = member
+	}
 	writev := leader.root
 	writev.opcode = OpWritev | (leader.root.opcode & opVirtual)
 	writev.bufs = bufs
 	ringHandle, err := c.ring.Push(c.translateOp(&writev))
+	clear(bufs) // Ringo copied the list; do not retain the callers' buffers.
 	if err != nil {
-		panic(fmt.Sprintf("iosched: Ringo rejected a validated write: %v", err))
+		c.finishWrite(leader, 0, err)
+		return next
 	}
-	for _, member := range members {
+	for member := leader; member != nil; member = member.staged {
 		member.completion.markIssued()
 	}
 	c.place(ringHandle, ringSlot{kind: slotCoalescedWrite, work: leader})
@@ -859,21 +813,26 @@ func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submi
 func (c *coordinator) placeSync(state *fileState) {
 	batch := state.syncBatch
 	state.syncBatch = submissionQueue{}
-	sync := batch.head.durable.syncOp()
+	sync := batch.head.durable().syncOp()
 	ringHandle, err := c.ring.Push(c.translateOp(&sync))
 	if err != nil {
-		panic(fmt.Sprintf("iosched: Ringo rejected a validated fdatasync: %v", err))
+		c.finishSync(batch, err)
+		return
 	}
 	c.place(ringHandle, ringSlot{kind: slotSync, batch: batch})
 }
 
-func (c *coordinator) translateOp(op *Op) ringo.Op {
+func (c *coordinator) translateOp(op *operation) ringo.Op {
 	recycle := ringo.WithAlloc(&c.alloc)
 	var direct ringo.FixedFile
 	fd := ringo.FileFD(op.f)
 	if op.isVirtual() {
-		direct = c.sched.fixedFiles[op.vfd]
-		fd = ringo.FixedFD(direct)
+		if op.vfd == AllocateVFD {
+			fd = ringo.BorrowedFD(-1)
+		} else {
+			direct = c.sched.fixedFiles[op.vfd]
+			fd = ringo.FixedFD(direct)
+		}
 	}
 
 	switch op.kind() {
@@ -928,6 +887,9 @@ func (c *coordinator) translateOp(op *Op) ringo.Op {
 		)
 	case OpClose:
 		if op.isVirtual() {
+			if op.vfd == AllocateVFD {
+				return ringo.CloseFD(-1, recycle)
+			}
 			return ringo.CloseDirect(direct, recycle)
 		}
 		return ringo.Nop(recycle)
@@ -1019,6 +981,18 @@ func (c *coordinator) reapOne(completion ringo.Completion) {
 	c.slots[index] = ringSlot{}
 	c.occupied--
 
+	// Operation errors pass through unchanged, including a spurious -EAGAIN on
+	// a regular-file read or write that never set RWF_NOWAIT. Before Linux
+	// 6.14, io_rw_should_reissue declines the kernel's io-wq reissue when the
+	// completion runs outside the submitting thread group or task context.
+	// Observed on 6.8.0-aws (XFS direct read): the kernel's own IOCB_NOWAIT
+	// first attempt fails xfs_ilock_nowait after part of the read is issued,
+	// the dio completes on a kworker, and the CQE carries -EAGAIN. Upstream
+	// b08e02045002 ("io_uring/rw: don't gate retry on completion context")
+	// removes that check; it was not tagged for stable. Callers on older
+	// kernels must treat EAGAIN as retryable. Retrying here would mean resuming
+	// a chain from the failed operation, since the kernel has already cancelled
+	// or run its linked followers, and it could not push from reapOne.
 	n, err := completion.Result, completion.Err
 	if errors.Is(err, syscall.ECANCELED) && c.sched.stopCause() == errSchedulerClosed {
 		err = errSchedulerClosed
@@ -1044,27 +1018,38 @@ func (c *coordinator) reapOne(completion ringo.Completion) {
 // finishWrite splits a coalesced run's result into each member's, in writev
 // order: each member gets the bytes written within its own buffer.
 func (c *coordinator) finishWrite(leader *submission, n int, err error) {
-	members := leader.coalesced
-	leader.coalesced = nil
-	for _, member := range members {
+	for member := leader; member != nil; {
+		next := member.staged
+		member.staged = nil
 		written := 0
 		if err == nil {
 			written = min(len(member.root.buf), n)
 			n -= written
 		}
 		c.finishOperation(member, &member.root, written, err)
+		member = next
 	}
 }
 
 // finishOperation records the result of one of the work's operations. A
 // durable write that succeeded then waits for its file's next fdatasync; one
 // that failed has nothing to make durable, so its fdatasync is retired with it.
-func (c *coordinator) finishOperation(work *submission, op *Op, n int, err error) {
-	c.release(work, op)
+func (c *coordinator) finishOperation(work *submission, op *operation, n int, err error) {
+	if op.opFlags&opAllocatedVFD != 0 {
+		if err != nil {
+			op.opFlags |= opReleaseVFD
+		} else {
+			n = int(op.vfd)
+		}
+	}
+	if op.isVirtual() && op.kind() == OpClose && err == nil {
+		c.freeVFD(op.vfd)
+	}
 	err = writeResultError(op, n, err)
-	recordResult(&work.root, op, n, err)
+	work.recordResult(op, n, err)
+	c.sched.config.disk.completeIO(work, op, &c.inFlight)
 	c.operationDone(work, op)
-	if op != work.durable {
+	if op != work.durable() {
 		return
 	}
 	if err != nil {
@@ -1078,7 +1063,7 @@ func (c *coordinator) finishOperation(work *submission, op *Op, n int, err error
 // its file's next fdatasync. Every durable write on the file that completes
 // before that fdatasync is placed shares it.
 func (c *coordinator) awaitSync(work *submission) {
-	state := work.fileState(work.durable)
+	state := work.fileState(work.durable())
 	if state.syncBatch.len == 0 {
 		c.syncPending = append(c.syncPending, state)
 	}
@@ -1090,15 +1075,21 @@ func (c *coordinator) awaitSync(work *submission) {
 func (c *coordinator) finishSync(batch submissionQueue, err error) {
 	for batch.len != 0 {
 		work := batch.pop()
-		recordError(&work.root, err)
-		c.operationDone(work, work.durable)
+		if err != nil && work.err == nil {
+			work.err = err
+		}
+		durable := work.durable()
+		if err != nil && work.results != nil {
+			work.results[durable.resultIndex].Err = err
+		}
+		c.operationDone(work, durable)
 	}
 }
 
 // operationDone retires one completion the work owed: op's file bookkeeping,
 // then the work itself once nothing more is owed. The fdatasync covering a
 // durable write is retired as its write, the operation it makes durable.
-func (c *coordinator) operationDone(work *submission, op *Op) {
+func (c *coordinator) operationDone(work *submission, op *operation) {
 	if err := buildutil.Assert(work.state == workIssued); err != nil {
 		panic(err)
 	}
@@ -1108,10 +1099,13 @@ func (c *coordinator) operationDone(work *submission, op *Op) {
 		return
 	}
 	c.completedWork(work)
+	if work.root.opFlags&opReleaseVFD != 0 {
+		c.freeVFD(work.root.vfd)
+	}
 	c.accepted.remove(work)
+	c.sched.config.disk.release(work, &c.inFlight)
 	work.state = workDone
-	c.sched.inFlightDepth.add(-1)
-	work.root.finish()
+	work.finish()
 }
 
 // failRemaining completes every ticket the coordinator still owns, staged
@@ -1120,7 +1114,6 @@ func (c *coordinator) operationDone(work *submission, op *Op) {
 // treat as an unknown outcome rather than a clean failure. Only a drain that
 // gave up leaves placed work behind.
 func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) {
-	c.sched.readyDepth.add(-int64(c.ready.len))
 	for c.ready.len != 0 {
 		c.ready.pop()
 	}
@@ -1129,40 +1122,28 @@ func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) 
 		// Work in a file's sync batch is still linked there; the table goes
 		// away with the coordinator, but the Ticket keeps work reachable.
 		work.links = [2]queueLinks{}
-		switch work.state {
-		case workWaiting:
-			c.sched.waitingDepth.add(-1)
-		case workIssued:
-			c.sched.inFlightDepth.add(-1)
-		}
+		work.staged = nil
+		c.sched.config.disk.release(work, &c.inFlight)
 		if work.state == workIssued && c.occupied != 0 {
-			completeUnknown(&work.root, placed)
+			work.abandon(placed)
 		} else {
-			completeFailed(&work.root, unplaced)
+			work.fail(unplaced)
 		}
 		work.state = workDone
 	}
 	for staged != nil {
 		next := staged.staged
 		staged.staged = nil
-		completeFailed(&staged.root, unplaced)
+		staged.fail(unplaced)
 		staged = next
 	}
 }
 
-func completeFailed(root *Op, err error) {
-	if root.err == nil {
-		root.err = err
+// makeReady moves work whose file barriers have all released to the ready queue.
+func (c *coordinator) makeReady(work *submission) {
+	if err := buildutil.Assert(work.state == workWaiting); err != nil {
+		panic(err)
 	}
-	root.finish()
-}
-
-// completeUnknown reports a forced shutdown without releasing operands whose
-// kernel completions have not been reaped.
-func completeUnknown(root *Op, err error) {
-	root.err = err
-	// A forced close cannot release resources still borrowed by kernel I/O.
-	// Report the ticket error, but leave its resource-release callback alone.
-	root.completion.whenDone = nil
-	root.finish()
+	work.state = workReady
+	c.ready.push(work)
 }

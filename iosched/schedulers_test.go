@@ -1,6 +1,7 @@
 package iosched_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,6 +41,9 @@ func newPOSIX(t *testing.T) iosched.Scheduler {
 func runOp(t *testing.T, s iosched.Scheduler, op iosched.Op) int {
 	t.Helper()
 	ticket, err := s.Submit(op)
+	if errors.Is(err, unix.EOPNOTSUPP) {
+		t.Skip("virtual-file operations require io_uring")
+	}
 	require.NoError(t, err)
 	n, err := ticket.Wait()
 	require.NoError(t, err)

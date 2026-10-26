@@ -17,31 +17,28 @@ var errSchedulerClosed = errors.New("iosched: scheduler closed")
 type Scheduler interface {
 	// Submit schedules op and returns its completion Ticket. URingScheduler is a
 	// non-blocking handoff; POSIXScheduler executes the operation before returning.
-	// Neither provides application-level backpressure.
+	// URingScheduler can reject excess outstanding I/O with ErrRejected when
+	// its shared DiskPolicy is full. Byte/count limits are disabled by default;
+	// the default service-time allowance is 1.5 ms per class.
 	//
 	// After an accepted submission, Ticket.Wait returns its result and
 	// Ticket.Done offers completion to a select; SubmitNotify also runs a brief
 	// function on completion, without a waiting goroutine. Waiting is optional
 	// when the caller does not need the result. A Submit error means the
-	// operation was not accepted and the returned Ticket is invalid; execution and
-	// asynchronous admission errors are returned by a valid Ticket's Wait.
+	// operation was not accepted and the returned Ticket is invalid; execution
+	// errors are returned by a valid Ticket's Wait.
 	// Reads absorb EINTR and may complete with a short count. Writes are not
 	// retried; a short write reports io.ErrShortWrite together with its count.
 	//
 	// Operations in a Link or HardLink chain execute in order. Link cancels the
-	// remaining chain after a failure; HardLink continues it. URingScheduler
-	// rejects a chain of more than eight operations, or, on a smaller ring, of
-	// more than its depth less the one entry it keeps for its doorbell. Durable
-	// applies to standalone writes and the final write of a chain; its file's
-	// sync may be shared with other durable writes. Use an explicit FdatasyncOp
-	// when later operations in the chain must wait for the sync.
+	// remaining chain after a failure; HardLink continues it. A chain holds at
+	// most eight operations. A final Durable write's sync may be shared with
+	// other durable writes on its file; a Durable write followed by other
+	// operations gets its own fdatasync before them, which counts as one of
+	// the eight.
 	//
-	// Separate submissions are unordered except for file lifecycle:
-	//   - A submission containing VOpenatOp holds subsequently accepted operations
-	//     on the same virtual slot until its entire linked chain completes. This is
-	//     an ordering barrier, not error propagation; use Link when followers must
-	//     be canceled if open fails.
-	//   - A submission containing DrainOp or VCloseOp is held whole, every
+	// Separate submissions are unordered except for DrainOp:
+	//   - A submission containing DrainOp is held whole, every
 	//     operation of its chain, until the operations previously accepted on
 	//     that file have completed and their completion functions (SubmitNotify)
 	//     have returned. Earlier operations in the same linked chain are ordered
@@ -49,15 +46,6 @@ type Scheduler interface {
 	//     completion function may still change a buffer that the held chain
 	//     will write. A Durable write remains active through its
 	//     synthesized fdatasync, so a following barrier waits for the flush too.
-	//   - Operations later in the same linked chain are ordered after a VCloseOp.
-	//     A chain that closes a virtual slot and then opens it again replaces
-	//     the slot's file: it is accepted while earlier work on the slot remains
-	//     (its close drains that work), and plain operations submitted for the
-	//     slot while it is pending wait for it, as they wait for an open.
-	//   - A VOpenatOp submitted after a chain that leaves its slot closed waits
-	//     for that chain and starts the slot's next generation. Its following
-	//     operations wait for this new open. No caller-side close wait is needed.
-	//     Other separate work after a close without a new open is rejected.
 	//     Callers must stop using a regular file before DrainOp and may close it
 	//     after the Ticket completes.
 	//

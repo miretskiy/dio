@@ -3,10 +3,10 @@ package iosched
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -16,132 +16,179 @@ import (
 // POSIXScheduler executes each submitted operation synchronously with POSIX
 // file operations and returns an already-completed Ticket.
 //
-// It also emulates the URingScheduler's virtual-file ops (VOpenatOp and friends)
-// with a userspace descriptor table: VOpenat opens a real fd and records it
-// under the requested index; subsequent fixed-file ops resolve the fd from the
-// table. This keeps virtual-file consumers portable to non-io_uring hosts (and
-// runnable in tests). Because each op runs synchronously to completion before
-// Submit returns, the scheduler's ordering guarantees hold here for free: a close
-// submitted after a slot's writes runs after them, and later operations run
-// after an open. Those guarantees are synchronous consequences here and are
-// explicitly coordinated by the io_uring backend.
+// WithVFiles(n) enables a userspace virtual-file table with the io_uring
+// backend's semantics: VOpenatOp installs a descriptor in its slot, AllocateVFD
+// reserves a free slot for the chain (ENFILE when full), and a successful
+// virtual close frees it. Without a table, virtual operations fail with
+// EOPNOTSUPP. The table lock guards only slot state; I/O runs outside it.
 type POSIXScheduler struct {
 	closed atomic.Bool
 
 	mu     sync.Mutex
-	vfiles map[uint32]*os.File // virtual descriptor table, lazily created
+	vfiles []posixVFile
+}
+
+type posixVFile struct {
+	file     *os.File
+	reserved bool // an AllocateVFD chain owns the slot before its open completes
 }
 
 // NewPOSIXScheduler creates a synchronous scheduler backed by POSIX file I/O.
-func NewPOSIXScheduler() *POSIXScheduler {
-	return &POSIXScheduler{}
+// It honors WithVFiles and ignores the io_uring-specific options.
+func NewPOSIXScheduler(opts ...Option) *POSIXScheduler {
+	cfg := makeSchedulerConfig(opts)
+	return &POSIXScheduler{vfiles: make([]posixVFile, cfg.vfiles)}
 }
 
 // Submit executes op synchronously and returns a completed Ticket.
 func (s *POSIXScheduler) Submit(op Op) (Ticket, error) {
-	started := time.Now()
 	if s.closed.Load() {
 		return Ticket{}, errSchedulerClosed
 	}
 
-	_, err := countAndValidateOps(&op, nil)
+	work, err := s.prepareSubmission(&op)
 	if err != nil {
 		return Ticket{}, err
 	}
-
-	ticket := op.prepareSubmission(started)
-	op.completion.markIssued()
-	root := &op
-	for node := root; node != nil; node = node.linked {
-		p := node
-		var n int
-		var opErr error
-		if p.isVirtual() {
-			n, opErr = s.runVirtualOp(p)
-		} else {
-			n, opErr = runPOSIXOp(p, p.f)
+	work.markIssued()
+	s.allocateVFD(work)
+	for i := range work.opCount() {
+		current := work.op(i)
+		n, err := s.run(current)
+		if current.opFlags&opAllocatedVFD != 0 {
+			if err != nil {
+				current.opFlags |= opReleaseVFD
+			} else {
+				n = int(current.vfd)
+			}
 		}
-		softLink := p.sqeFlags&sqeLink != 0
-		recordResult(root, p, n, opErr)
-		if opErr != nil && softLink {
-			for canceled := node.linked; canceled != nil; canceled = canceled.linked {
-				recordResult(root, canceled, 0, syscall.ECANCELED)
+		work.recordResult(current, n, err)
+		if err != nil && current.sqeFlags&sqeLink != 0 {
+			for j := i + 1; j < work.opCount(); j++ {
+				work.recordResult(work.op(j), 0, syscall.ECANCELED)
 			}
 			break
 		}
 	}
-	root.finish()
-	return ticket, nil
+	// Like the io_uring backend, a failed open's slot stays reserved until its
+	// chain ends so followers cannot address a slot reallocated meanwhile.
+	if work.root.opFlags&opReleaseVFD != 0 {
+		s.mu.Lock()
+		s.vfiles[work.root.vfd] = posixVFile{}
+		s.mu.Unlock()
+	}
+	work.finish()
+	return Ticket{&work.completion}, nil
 }
 
-// Close marks the scheduler closed and closes any descriptors still held in the
-// virtual-file table.
-func (s *POSIXScheduler) Close() error {
-	s.closed.Store(true)
+func (s *POSIXScheduler) prepareSubmission(op *Op) (*submission, error) {
+	work, err := copySubmission(op, maxChainLength)
+	if err != nil {
+		return nil, err
+	}
+	for i := range work.opCount() {
+		current := work.op(i)
+		if !current.isVirtual() {
+			continue
+		}
+		if len(s.vfiles) == 0 {
+			return nil, syscall.EOPNOTSUPP
+		}
+		if current.vfd != AllocateVFD && int(current.vfd) >= len(s.vfiles) {
+			return nil, fmt.Errorf("iosched: virtual file index %d outside configured table", current.vfd)
+		}
+	}
+	return work, nil
+}
+
+// allocateVFD resolves AllocateVFD placeholders when the root is a virtual open.
+// On exhaustion the placeholders remain: the open reports ENFILE and followers EBADF.
+func (s *POSIXScheduler) allocateVFD(work *submission) {
+	root := &work.root
+	if !root.isVirtual() || root.kind() != OpOpenat || root.vfd != AllocateVFD {
+		return
+	}
 	s.mu.Lock()
-	for vfd, f := range s.vfiles {
-		_ = f.Close()
-		delete(s.vfiles, vfd)
+	i := slices.IndexFunc(s.vfiles, func(v posixVFile) bool { return v.file == nil && !v.reserved })
+	if i >= 0 {
+		s.vfiles[i].reserved = true
 	}
 	s.mu.Unlock()
-	return nil
+	if i < 0 {
+		return
+	}
+	root.opFlags |= opAllocatedVFD
+	for j := range work.opCount() {
+		if op := work.op(j); op.isVirtual() && op.vfd == AllocateVFD {
+			op.vfd = uint32(i)
+		}
+	}
 }
 
-// runVirtualOp emulates a virtual-file op against the userspace descriptor
-// table. Open and close mutate the table; every other op just resolves its
-// descriptor and runs the same I/O as a regular op. The descriptor is resolved
-// under the lock but the I/O runs outside it, so virtual ops are as concurrent
-// as regular ones (the lock guards only the table) — this backend must not
-// serialize I/O, or it would mask the races the uring backend exposes.
-func (s *POSIXScheduler) runVirtualOp(op *Op) (int, error) {
+// run executes one operation, resolving a virtual descriptor from the table.
+func (s *POSIXScheduler) run(op *operation) (int, error) {
+	if !op.isVirtual() {
+		return runPOSIXOp(op, op.f)
+	}
+	if op.vfd == AllocateVFD {
+		if op.kind() == OpOpenat {
+			return 0, syscall.ENFILE
+		}
+		return 0, syscall.EBADF
+	}
 	switch op.kind() {
 	case OpOpenat:
-		// op.path is NUL-terminated (VOpenatOp appends it for the uring path);
-		// Openat wants a Go string.
 		name := string(op.path[:len(op.path)-1])
 		fd, err := unix.Openat(op.dfd, name, op.openFlag, op.mode)
 		if err != nil {
 			return 0, err
 		}
 		s.mu.Lock()
-		if s.vfiles == nil {
-			s.vfiles = make(map[uint32]*os.File)
-		}
-		old := s.vfiles[op.vfd]
-		s.vfiles[op.vfd] = os.NewFile(uintptr(fd), name)
+		old := s.vfiles[op.vfd].file
+		s.vfiles[op.vfd] = posixVFile{file: os.NewFile(uintptr(fd), name)}
 		s.mu.Unlock()
 		if old != nil {
 			_ = old.Close()
 		}
+		return 0, nil
 	case OpClose:
 		s.mu.Lock()
-		f := s.vfiles[op.vfd]
-		delete(s.vfiles, op.vfd)
+		f := s.vfiles[op.vfd].file
+		if f != nil {
+			s.vfiles[op.vfd] = posixVFile{}
+		}
 		s.mu.Unlock()
 		if f == nil {
 			return 0, syscall.EBADF
 		}
 		return 0, f.Close()
 	default:
-		// Resolve the descriptor under the lock, but run the I/O outside it.
-		if f := s.vFile(op.vfd); f != nil {
-			return runPOSIXOp(op, f)
+		s.mu.Lock()
+		f := s.vfiles[op.vfd].file
+		s.mu.Unlock()
+		if f == nil {
+			return 0, syscall.EBADF
 		}
-		return 0, syscall.EBADF
+		return runPOSIXOp(op, f)
 	}
-	return 0, nil
 }
 
-// vFile returns the descriptor installed at vfd, or nil if the slot is empty.
-func (s *POSIXScheduler) vFile(vfd uint32) *os.File {
+// Close marks the scheduler closed and closes descriptors left in the table.
+func (s *POSIXScheduler) Close() error {
+	s.closed.Store(true)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.vfiles[vfd]
+	for i, v := range s.vfiles {
+		if v.file != nil {
+			_ = v.file.Close()
+		}
+		s.vfiles[i] = posixVFile{}
+	}
+	return nil
 }
 
-// runPOSIXOp executes a positioned-I/O or sync op against f synchronously. f is
-// op.f for regular ops and the table-resolved descriptor for virtual ops.
-func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
+// runPOSIXOp executes an operation synchronously.
+func runPOSIXOp(op *operation, f *os.File) (n int, err error) {
 	switch op.kind() {
 	case OpRead:
 		if len(op.buf) == 0 {
@@ -176,7 +223,7 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 		err = unix.Unlinkat(op.dfd, string(op.path[:len(op.path)-1]), 0)
 	case OpOpenat:
 		// Plain openat: open the path and return the raw fd through Ticket.Wait;
-		// the caller owns it. (The virtual/direct form is handled in runVirtualOp.)
+		// the caller owns it.
 		name := string(op.path[:len(op.path)-1])
 		fd, err := unix.Openat(op.dfd, name, op.openFlag, op.mode)
 		if err != nil {
@@ -192,7 +239,7 @@ func runPOSIXOp(op *Op, f *os.File) (n int, err error) {
 // posixDurable applies a write's requested post-write sync (Op.Durable)
 // inline — the POSIX backend has no linked-sync mechanism, so it syncs here after
 // the write completes. It is a no-op if the write errored or wanted no sync.
-func posixDurable(op *Op, f *os.File, err error) error {
+func posixDurable(op *operation, f *os.File, err error) error {
 	if err != nil || !op.durable() {
 		return err
 	}

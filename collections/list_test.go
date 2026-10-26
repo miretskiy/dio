@@ -141,6 +141,46 @@ func TestListHandlesSurviveGrowth(t *testing.T) {
 	}
 }
 
+func TestListRecycle(t *testing.T) {
+	list := MakeList[*int](3)
+	value := 42
+	first := list.PushBack(nil)
+	handle := list.PushBack(&value)
+	last := list.PushBack(nil)
+	list.Recycle(handle)
+	if list.Len() != 2 || list.nodes[handle.index()-1].value != &value {
+		t.Fatal("Recycle did not free the node and retain its value")
+	}
+	if next, ok := list.Next(first); !ok || next != last {
+		t.Fatal("Recycle did not link the preceding node to the following node")
+	}
+	if prev, ok := list.Prev(last); !ok || prev != first {
+		t.Fatal("Recycle did not link the following node to the preceding node")
+	}
+	if _, ok := list.TryValue(handle); ok {
+		t.Fatal("Recycle did not invalidate the handle")
+	}
+	assertPanics(t, "recycled handle", func() { list.Recycle(handle) })
+
+	reused := list.PushBack(nil)
+	if reused.index() != handle.index() || reused == handle {
+		t.Fatalf("reused handle: old=%d new=%d", handle, reused)
+	}
+	if *list.Value(reused) != nil {
+		t.Fatal("PushBack did not overwrite the recycled value")
+	}
+	assertPanics(t, "stale handle", func() { list.Value(handle) })
+}
+
+func TestListRecycleAllocs(t *testing.T) {
+	list := MakeList[int](1)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		list.Recycle(list.PushBack(42))
+	}); allocations != 0 {
+		t.Fatalf("PushBack/Recycle allocated %g times, want 0", allocations)
+	}
+}
+
 func TestListRejectsInvalidOrRemovedHandle(t *testing.T) {
 	var list List[int]
 	handle := list.PushBack(1)

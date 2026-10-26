@@ -4,9 +4,9 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -14,9 +14,10 @@ import (
 func TestTicketErrorReportsLinkedError(t *testing.T) {
 	err := errors.New("linked failure")
 	root := Op{}.Link(Op{})
-	ticket := root.prepareSubmission(time.Now())
-	recordResult(&root, root.linked, 0, err)
-	root.finish()
+	work := prepareForTest(root)
+	ticket := Ticket{&work.completion}
+	work.recordResult(work.op(1), 0, err)
+	work.finish()
 	_, got := ticket.Wait()
 	if got != err {
 		t.Fatalf("ticket error: got %v want %v", got, err)
@@ -73,61 +74,88 @@ func TestOpLinkFlattensLinkedInputAndPreservesFlags(t *testing.T) {
 	}
 }
 
-func linkedOpAt(op *Op, index int) *Op {
-	for p := op; p != nil; p = p.linked {
-		if index == 0 {
-			return p
-		}
-		index--
+func linkedOpAt(op *Op, index int) *operation {
+	if index == 0 {
+		return &op.operation
 	}
-	panic("operation index outside linked chain")
+	return &op.followers()[index-1]
+}
+
+func prepareForTest(op Op) *submission {
+	work, err := copySubmission(&op, maxChainLength)
+	if err != nil {
+		panic(err)
+	}
+	return work
 }
 
 func TestSubmissionOwnsOpCopy(t *testing.T) {
-	op := Op{buf: []byte("root")}.
-		Link(Op{buf: []byte("linked")})
-	root := op
-	ticket := root.prepareSubmission(time.Now())
-	if op.completion != nil {
-		t.Fatal("preparing the submission copy modified the caller's operation")
+	op := WriteOp(nil, []byte("root"), 0).Link(ReadOp(nil, []byte("linked"), 0))
+	a, b := prepareForTest(op), prepareForTest(op)
+	a.root.vfd = 9
+	a.linked[0].vfd = 7
+	if op.vfd != 0 || op.followers()[0].vfd != 0 || b.root.vfd != 0 || b.linked[0].vfd != 0 {
+		t.Fatal("prepared requests share mutable operands")
 	}
-
-	if string(root.buf) != "root" {
-		t.Fatal("submission did not retain its root operation copy")
+	if string(a.root.buf) != "root" || string(a.linked[0].buf) != "linked" {
+		t.Fatal("lost operands")
 	}
-	if root.linked == nil || string(root.linked.buf) != "linked" {
-		t.Fatal("submission did not retain the immutable linked chain")
-	}
-	root.finish()
-	ticket.Wait()
+	a.finish()
+	b.finish()
 }
 
-func TestDurableWriteBeforeEndOfChainRejected(t *testing.T) {
+func TestPreparationRejectsUnsupportedChainLength(t *testing.T) {
+	op := Op{}.Link(make([]Op, maxChainLength)...)
+	if _, err := copySubmission(&op, maxChainLength); err == nil {
+		t.Fatal("accepted a chain larger than internal result storage")
+	}
 	f := new(os.File)
-	op := WriteOp(f, nil, 0).Durable().Link(DrainOp(f))
-	_, err := countAndValidateOps(&op, nil)
-	if err == nil || !strings.Contains(err.Error(), "Durable write must be the final operation") {
-		t.Fatalf("validation error: got %v", err)
+	op = WriteOp(f, nil, 0).Durable().Link(make([]Op, maxChainLength-1)...)
+	if _, err := copySubmission(&op, maxChainLength); err == nil {
+		t.Fatal("a non-final Durable write's fdatasync does not count against the limit")
 	}
 }
 
-func TestDrainMustEndLinkedChain(t *testing.T) {
-	f := new(os.File)
-	op := DrainOp(f).Link(ReadOp(f, nil, 0))
-	_, err := countAndValidateOps(&op, nil)
-	if err == nil || !strings.Contains(err.Error(), "DrainOp must be the final operation") {
-		t.Fatalf("validation error: got %v", err)
-	}
-}
-
-func TestDurableWriteAccepted(t *testing.T) {
+func TestPreparationRetainsDurableTail(t *testing.T) {
 	for _, op := range []Op{
 		WriteOp(new(os.File), nil, 0).Durable(),
 		WriteOp(new(os.File), nil, 0).Link(WriteOp(new(os.File), nil, 0).Durable()),
 	} {
-		if _, err := countAndValidateOps(&op, nil); err != nil {
-			t.Fatalf("validation error: %v", err)
+		work := prepareForTest(op)
+		if work.durable() != work.op(work.opCount()-1) {
+			t.Fatal("lost durable tail")
 		}
+	}
+}
+
+func TestPreparationSyncsIntermediateDurableWrite(t *testing.T) {
+	f := new(os.File)
+	for _, link := range []func(Op, ...Op) Op{Op.Link, Op.HardLink} {
+		op := link(WriteOp(f, []byte("data"), 0).Durable(), DrainOp(f))
+		work := prepareForTest(op)
+		if work.opCount() != 3 || len(work.results) != 2 {
+			t.Fatalf("ops=%d results=%d, want 3 operations reporting 2 results", work.opCount(), len(work.results))
+		}
+		write, sync, drain := work.op(0), work.op(1), work.op(2)
+		if write.durable() || work.durable() != nil {
+			t.Fatal("an intermediate durable write still awaits the batched sync")
+		}
+		if sync.kind() != OpFdatasync || sync.f != f || sync.opFlags&opWriteSync == 0 || sync.resultIndex != 0 {
+			t.Fatal("the synthesized fdatasync does not target and report into the write")
+		}
+		if sync.sqeFlags != write.sqeFlags || write.sqeFlags != op.sqeFlags {
+			t.Fatal("the fdatasync does not keep the write's link type")
+		}
+		if drain.resultIndex != 1 {
+			t.Fatal("the follower's result moved")
+		}
+		work.recordResult(write, 4, nil)
+		work.recordResult(sync, 0, syscall.EIO)
+		work.recordResult(drain, 0, nil)
+		if work.n != 4 || work.err != syscall.EIO || work.results[0] != (Result{N: 4, Err: syscall.EIO}) {
+			t.Fatalf("n=%d err=%v results=%v; a failed sync must fail the write's result", work.n, work.err, work.results)
+		}
+		work.finish()
 	}
 }
 
@@ -147,35 +175,36 @@ func TestDurableWriteSyncOpPreservesTarget(t *testing.T) {
 func TestWriteResultError(t *testing.T) {
 	f := new(os.File)
 	write := WriteOp(f, make([]byte, 4), 0)
-	if err := writeResultError(&write, 2, nil); !errors.Is(err, io.ErrShortWrite) {
+	if err := writeResultError(&write.operation, 2, nil); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("short write error: got %v want %v", err, io.ErrShortWrite)
 	}
-	if err := writeResultError(&write, 4, nil); err != nil {
+	if err := writeResultError(&write.operation, 4, nil); err != nil {
 		t.Fatalf("complete write error: %v", err)
 	}
 	read := ReadOp(f, make([]byte, 4), 0)
-	if err := writeResultError(&read, 2, nil); err != nil {
+	if err := writeResultError(&read.operation, 2, nil); err != nil {
 		t.Fatalf("short read unexpectedly failed: %v", err)
 	}
 }
 
 func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 	root := Op{}.Link(Op{})
-	ticket := root.prepareSubmission(time.Now())
+	work := prepareForTest(root)
+	ticket := Ticket{&work.completion}
 	done := make(chan struct{})
 	go func() {
 		ticket.Wait()
 		close(done)
 	}()
 
-	recordResult(&root, &root, 1, nil)
+	work.recordResult(&work.root, 1, nil)
 	select {
 	case <-done:
 		t.Fatal("Wait returned before the submission completed")
 	default:
 	}
 
-	root.finish()
+	work.finish()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -185,35 +214,47 @@ func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
 
 func BenchmarkTicketCompletion(b *testing.B) {
 	root := Op{}
-	ticket := root.prepareSubmission(time.Now())
-	root.finish()
+	work := prepareForTest(root)
+	ticket := Ticket{&work.completion}
+	work.finish()
 	ticket.Wait()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
 		root := Op{}
-		ticket := root.prepareSubmission(time.Now())
-		root.finish()
+		work := prepareForTest(root)
+		ticket := Ticket{&work.completion}
+		work.finish()
 		ticket.Wait()
 	}
 }
 
-var benchmarkSubmission *Op
+var benchmarkSubmission *submission
 var benchmarkTicket Ticket
 
 func BenchmarkSubmissionState(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		root := Op{}
-		ticket := root.prepareSubmission(time.Now())
-		benchmarkSubmission = &root
-		root.finish()
+		work := prepareForTest(root)
+		ticket := Ticket{&work.completion}
+		benchmarkSubmission = work
+		work.finish()
 		benchmarkTicket = ticket
 	}
 }
 
 var benchmarkLinkedOp Op
+
+func TestInlineLinksDoNotAllocate(t *testing.T) {
+	allocations := testing.AllocsPerRun(100, func() {
+		benchmarkLinkedOp = Op{}.Link(Op{}, Op{}, Op{})
+	})
+	if allocations != 0 {
+		t.Fatalf("inline link construction allocated %g times", allocations)
+	}
+}
 
 func BenchmarkOpLink3(b *testing.B) {
 	b.ReportAllocs()
@@ -244,7 +285,8 @@ func BenchmarkOpLinkBatch8(b *testing.B) {
 
 func TestTicketDoneClosesOnCompletion(t *testing.T) {
 	root := Op{}
-	ticket := root.prepareSubmission(time.Now())
+	work := prepareForTest(root)
+	ticket := Ticket{&work.completion}
 	done := ticket.Done()
 	if done != ticket.Done() {
 		t.Fatal("Done returned a different channel on the second call")
@@ -254,8 +296,8 @@ func TestTicketDoneClosesOnCompletion(t *testing.T) {
 		t.Fatal("Done closed before the ticket completed")
 	default:
 	}
-	recordResult(&root, &root, 7, nil)
-	root.finish()
+	work.recordResult(&work.root, 7, nil)
+	work.finish()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -268,8 +310,9 @@ func TestTicketDoneClosesOnCompletion(t *testing.T) {
 
 func TestTicketDoneAfterCompletionIsClosed(t *testing.T) {
 	root := Op{}
-	ticket := root.prepareSubmission(time.Now())
-	root.finish()
+	work := prepareForTest(root)
+	ticket := Ticket{&work.completion}
+	work.finish()
 	select {
 	case <-ticket.Done():
 	default:
@@ -321,8 +364,9 @@ func TestWhenDoneRacesWait(t *testing.T) {
 	for range 1000 {
 		var calls atomic.Int32
 		root := Op{whenDone: func(int, error) { calls.Add(1) }}
-		ticket := root.prepareSubmission(time.Now())
-		go root.finish()
+		work := prepareForTest(root)
+		ticket := Ticket{&work.completion}
+		go work.finish()
 		ticket.Wait()
 		for deadline := time.Now().Add(time.Second); calls.Load() == 0 && time.Now().Before(deadline); {
 			time.Sleep(time.Microsecond)
@@ -338,7 +382,8 @@ func TestWhenDoneRacesWait(t *testing.T) {
 func TestTicketConcurrentDoneAndWait(t *testing.T) {
 	for range 500 {
 		root := Op{}
-		ticket := root.prepareSubmission(time.Now())
+		work := prepareForTest(root)
+		ticket := Ticket{&work.completion}
 		var workers sync.WaitGroup
 		channels := make(chan (<-chan struct{}), 8)
 		for range 8 {
@@ -352,8 +397,8 @@ func TestTicketConcurrentDoneAndWait(t *testing.T) {
 				}
 			})
 		}
-		recordResult(&root, &root, 7, nil)
-		root.finish()
+		work.recordResult(&work.root, 7, nil)
+		work.finish()
 		workers.Wait()
 		close(channels)
 		for done := range channels {

@@ -22,6 +22,3 @@ func (s *URingScheduler) Submit(_ Op) (Ticket, error) {
 }
 
 func (s *URingScheduler) Close() error { return nil }
-
-// QueueStats is empty on platforms without io_uring.
-func (s *URingScheduler) QueueStats() QueueStats { return QueueStats{} }
