@@ -317,8 +317,8 @@ its corresponding limit is enabled; disabled limits report zero.
 Accounting and release operate on prepared submissions inside the coordinator.
 `SubmitNotify` carries its callback into preparation; only the prepared submission
 owns the runtime callback. `completion` contains the ticket result and signal.
-`Op` uses a flat follower slice, with three inline operand slots for short chains,
-so building a chain of up to four operations does not allocate.
+`Op` holds its followers in one flat slice, allocated once per `Link` or
+`HardLink` call and never modified afterwards.
 
 ### Operations and ordering
 

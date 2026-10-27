@@ -56,13 +56,13 @@ const AllocateVFD uint32 = math.MaxUint32
 // retain the Op. Referenced buffers and files remain caller-owned and must stay
 // valid until the ticket completes.
 //
-// Link and HardLink return independent values; short chains use inline storage.
+// Link and HardLink return independent values. Each call with followers
+// allocates one slice for the whole chain; the slice is never modified after
+// construction, so copies of an Op may share it.
 type Op struct {
 	operation
-	linked    []operation // overflow beyond the inline slots
-	linkCount uint8       // number of inline followers
-	linkAlloc [3]operation
-	whenDone  func(n int, err error) // construction input from SubmitNotify
+	linked   []operation            // followers, in chain order
+	whenDone func(n int, err error) // construction input from SubmitNotify
 }
 
 // operation contains only the operands and flags for one I/O operation.
@@ -309,41 +309,28 @@ func (o Op) chain(next []Op, flag uint8) Op {
 	if len(next) == 0 {
 		return o
 	}
-	count := len(o.followers())
+	count := len(o.linked)
 	for i := range next {
 		count += next[i].opCount()
 	}
-	out := Op{operation: o.operation, whenDone: o.whenDone}
-	// A slice stored back into a value-type Op would point into its old copy.
-	// Keep inline links as values and form the slice only while accessing them.
-	var links []operation
-	if count <= len(out.linkAlloc) {
-		out.linkCount = uint8(count)
-		links = out.linkAlloc[:count]
-	} else {
-		out.linked = make([]operation, count)
-		links = out.linked
-	}
-	n := copy(links, o.followers())
+	// A fresh slice: o.linked may be shared with other copies of o, and the
+	// tail's link flag changes below.
+	out := Op{operation: o.operation, linked: make([]operation, count), whenDone: o.whenDone}
+	n := copy(out.linked, o.linked)
 	for i := range next {
 		tail := &out.operation
 		if n != 0 {
-			tail = &links[n-1]
+			tail = &out.linked[n-1]
 		}
 		tail.sqeFlags = flag
-		links[n] = next[i].operation
+		out.linked[n] = next[i].operation
 		n++
-		n += copy(links[n:], next[i].followers())
+		n += copy(out.linked[n:], next[i].linked)
 	}
 	return out
 }
 
-func (o *Op) followers() []operation {
-	if o.linked != nil {
-		return o.linked
-	}
-	return o.linkAlloc[:o.linkCount]
-}
+func (o *Op) followers() []operation { return o.linked }
 
 func (o *Op) opCount() int          { return 1 + len(o.followers()) }
 func (o *operation) isLinked() bool { return o.sqeFlags&(sqeLink|sqeHardLink) != 0 }

@@ -247,12 +247,12 @@ func BenchmarkSubmissionState(b *testing.B) {
 
 var benchmarkLinkedOp Op
 
-func TestInlineLinksDoNotAllocate(t *testing.T) {
+func TestLinkAllocatesOnce(t *testing.T) {
 	allocations := testing.AllocsPerRun(100, func() {
 		benchmarkLinkedOp = Op{}.Link(Op{}, Op{}, Op{})
 	})
-	if allocations != 0 {
-		t.Fatalf("inline link construction allocated %g times", allocations)
+	if allocations != 1 {
+		t.Fatalf("link construction allocated %g times, want one follower slice", allocations)
 	}
 }
 

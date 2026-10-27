@@ -9,8 +9,7 @@ const maxChainLength = 8
 
 // submission owns mutable copies of the operation records extracted from Op,
 // plus completion, admission, and scheduling state. Op itself is needed only
-// during preparation. The separate layout keeps Op's inline follower array out
-// of standalone submissions.
+// during preparation.
 type submission struct {
 	completion
 	root          operation   // copy of Op.operation
