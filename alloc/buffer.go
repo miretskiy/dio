@@ -1,111 +1,153 @@
 package alloc
 
-import (
-	"math"
-	"sync/atomic"
+import "io"
 
-	"github.com/miretskiy/dio/v2/align"
-)
-
-// Buffer owns a reference to page-aligned memory. Each successful TryInc
-// adds a reference; every reference must be released with Unpin. The last
-// reference returns the storage to its owner. A buffer must not be copied.
-type Buffer struct {
-	inline  [1][]byte
-	chunks  [][]byte
-	refs    atomic.Int32
-	release func()
-}
-
-// newBuffer wraps a nonempty, aligned allocation with one reference.
-func newBuffer(data []byte, release func()) *Buffer {
-	b := &Buffer{release: release}
-	b.inline[0] = data[:len(data):len(data)]
-	b.chunks = b.inline[:]
-	b.refs.Store(1)
-	return b
-}
-
-func newChunkBuffer(chunks [][]byte, release func()) *Buffer {
-	b := &Buffer{chunks: chunks, release: release}
-	b.refs.Store(1)
-	return b
-}
-
-func (b *Buffer) clear() {
-	for _, data := range b.chunks {
-		clear(data)
-	}
-}
-
-// NewBuffer maps at least size zeroed bytes, rounded up to a page, without warming it.
-// The returned buffer owns one reference and unmaps its storage on the last
-// Unpin. Invalid sizes and mapping failures panic.
-func NewBuffer(size int64) *Buffer {
-	data := align.AllocAligned(size)
-	return newBuffer(data, func() { align.FreeAligned(data) })
-}
-
-// TryInc acquires another reference unless the buffer has been released or
-// the reference count would overflow. Safe for concurrent use. This checks
-// memory lifetime only; a cache must synchronize lookup-and-pin with eviction.
-func (b *Buffer) TryInc() bool {
-	for {
-		n := b.refs.Load()
-		if n == 0 || n == math.MaxInt32 {
-			return false
-		}
-		if b.refs.CompareAndSwap(n, n+1) {
-			return true
-		}
-	}
-}
-
-// Chunks returns the memory covered by this buffer, which may be non-contiguous.
-// Hold a reference while using the chunks, including pending I/O. Their contents
-// may be changed; do not replace or reslice entries in the returned list.
-func (b *Buffer) Chunks() [][]byte {
-	return b.chunks
-}
-
-// Cap returns the total usable bytes across all chunks, including allocator
-// rounding. Buffer has no logical data length: all of this storage is available
-// to the caller. Cap sums the chunk lengths, taking O(number of chunks) time.
-// Hold a reference while inspecting the buffer.
-func (b *Buffer) Cap() (capacity int64) {
-	for _, chunk := range b.chunks {
-		capacity += int64(len(chunk))
-	}
-	return capacity
-}
-
-// WrapRelease replaces the final-release callback with wrap's result. wrap is
-// called immediately with the current callback; its result runs on the last
-// Unpin and must call the original callback exactly once. Wrappers compose in
-// reverse installation order.
+// Buffer is a byte stream backed by allocator memory, in the spirit of
+// bytes.Buffer. Writes acquire Memory as needed without waiting; existing bytes
+// never move. Once every byte has been read, the buffer reuses its memory from
+// the start. Buffer is not safe for concurrent use.
 //
-// Install wrappers before sharing the buffer. WrapRelease must not race other
-// buffer operations. It does not add a reference or allocate another Buffer.
-func (b *Buffer) WrapRelease(wrap func(release func()) func()) {
-	b.release = wrap(b.release)
+// Buffer owns one reference to each acquired Memory until Release. References
+// held elsewhere protect lifetime, not contents: finish reading shared bytes
+// before the buffer drains, resets, and writes over them.
+type Buffer struct {
+	allocator Allocator
+	mem       []Memory
+	unit      int // bytes per Memory; uniform for one allocator
+	r, w      int // read and write offsets across mem
 }
 
-// Unpin releases one reference and reports whether it was the last reference.
-// When true is returned, the allocation's release function has completed. Pooled
-// storage is reusable, but another acquisition may already have claimed it.
-// Calling Unpin after release is a programming error.
-func (b *Buffer) Unpin() bool {
-	for {
-		n := b.refs.Load()
-		if n == 0 {
-			panic("alloc: Unpin called on an already-released buffer")
+// NewAllocatingBuffer returns a buffer using specified allocator for its allocations.
+func NewAllocatingBuffer(a Allocator) *Buffer {
+	return &Buffer{allocator: a}
+}
+
+// Len returns the number of unread bytes.
+func (b *Buffer) Len() int { return b.w - b.r }
+
+// Cap returns the bytes held by the buffer, read or not.
+func (b *Buffer) Cap() int { return len(b.mem) * b.unit }
+
+// Reset discards all contents and retains allocations for reuse.
+func (b *Buffer) Reset() { b.r, b.w = 0, 0 }
+
+// RawAllocations returns the slice of underlying allocations in this buffer.
+// The caller assumes responsibility for managing the safety of the returned allocations.
+// The caller may grab a reference to the underlying Memory if it needs to store a copy.
+func (b *Buffer) RawAllocations() []Memory {
+	return b.mem
+}
+
+// Release discards all contents and releases the buffer's reference to each
+// allocation. The buffer remains usable and acquires memory again on write.
+func (b *Buffer) Release() {
+	for _, m := range b.mem {
+		m.Unpin()
+	}
+	clear(b.mem)
+	b.mem = b.mem[:0]
+	b.Reset()
+}
+
+// Grow ensures space for n more bytes without waiting for allocator capacity.
+// Memory acquired before an error is retained.
+func (b *Buffer) Grow(n int) error {
+	for b.Cap()-b.w < n {
+		m, err := b.allocator.TryAcquire()
+		if err != nil {
+			return err
 		}
-		if b.refs.CompareAndSwap(n, n-1) {
-			if n == 1 {
-				b.release()
-				return true
-			}
-			return false
+		b.mem = append(b.mem, m)
+		b.unit = len(m.data)
+	}
+	return nil
+}
+
+// free returns the unwritten space in the Memory at the write offset.
+// The caller ensures w < Cap().
+func (b *Buffer) free() []byte {
+	return b.mem[b.w/b.unit].data[b.w%b.unit:]
+}
+
+// unread returns the unread bytes in the Memory at the read offset.
+// The caller ensures r < w.
+func (b *Buffer) unread() []byte {
+	i := b.r / b.unit
+	return b.mem[i].data[b.r%b.unit : min(b.unit, b.w-i*b.unit)]
+}
+
+// Write appends p. An allocation error writes nothing.
+func (b *Buffer) Write(p []byte) (int, error) {
+	if err := b.Grow(len(p)); err != nil {
+		return 0, err
+	}
+	for n := 0; n < len(p); {
+		c := copy(b.free(), p[n:])
+		b.w += c
+		n += c
+	}
+	return len(p), nil
+}
+
+// Read returns io.EOF only when the buffer is empty and p is not.
+func (b *Buffer) Read(p []byte) (int, error) {
+	if b.r == b.w && len(p) > 0 {
+		return 0, io.EOF
+	}
+	n := 0
+	for n < len(p) && b.r < b.w {
+		c := copy(p[n:], b.unread())
+		b.r += c
+		n += c
+	}
+	if b.r == b.w {
+		b.Reset()
+	}
+	return n, nil
+}
+
+// ReadFrom reads from r directly into allocator memory until EOF or an error.
+// Bytes read before a source or allocation error remain in the buffer.
+func (b *Buffer) ReadFrom(r io.Reader) (int64, error) {
+	var n int64
+	for {
+		if err := b.Grow(1); err != nil {
+			return n, err
+		}
+		c, err := r.Read(b.free())
+		b.w += c
+		n += int64(c)
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
 		}
 	}
 }
+
+// WriteTo writes unread bytes to w, consuming only the bytes w accepts.
+func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
+	var n int64
+	for b.r < b.w {
+		p := b.unread()
+		c, err := w.Write(p)
+		b.r += c
+		n += int64(c)
+		if err != nil {
+			return n, err
+		}
+		if c != len(p) {
+			return n, io.ErrShortWrite
+		}
+	}
+	b.Reset()
+	return n, nil
+}
+
+var (
+	_ io.Reader     = (*Buffer)(nil)
+	_ io.Writer     = (*Buffer)(nil)
+	_ io.ReaderFrom = (*Buffer)(nil)
+	_ io.WriterTo   = (*Buffer)(nil)
+)

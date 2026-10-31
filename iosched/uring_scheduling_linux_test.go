@@ -591,7 +591,7 @@ func TestBudgetQueuesWritesAndServesReads(t *testing.T) {
 	f := testFile(t, 3<<20)
 	tickets, works := acceptOps(c, WriteOp(f, make([]byte, 1<<20), 0),
 		WriteOp(f, make([]byte, 1<<20), 1<<20), ReadOp(f, make([]byte, 4096), 0))
-	require.Zero(t, c.sched.config.disk.Stats().Writes.ServiceTime)
+	require.Zero(t, c.sched.config.disk.Stats().Writes.InFlight)
 	placed, _ := c.placeReady(false)
 	require.Equal(t, 2, placed)
 	require.Equal(t, workReady, works[1].state)
@@ -635,9 +635,9 @@ func TestBudgetChargesCoalescedRun(t *testing.T) {
 	tickets, handles := acceptOps(c, ops...)
 	placed, _ := c.placeReady(true)
 	require.Equal(t, 1, placed)
-	require.EqualValues(t, 4*handles[0].writes.serviceTime, c.sched.config.disk.Stats().Writes.ServiceTime)
+	require.EqualValues(t, 4*handles[0].writes.inFlight, c.sched.config.disk.Stats().Writes.InFlight)
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	require.Zero(t, c.sched.config.disk.Stats().Writes.ServiceTime)
+	require.Zero(t, c.sched.config.disk.Stats().Writes.InFlight)
 	for _, ticket := range tickets {
 		_, err := ticket.Wait()
 		require.NoError(t, err)
@@ -649,9 +649,9 @@ func TestBudgetChargesCoalescedRun(t *testing.T) {
 func TestBudgetReleaseOfUnplacedWork(t *testing.T) {
 	c := withDefaultBudget(newTestCoordinator(t, 4, 1))
 	_, handles := acceptOps(c, VReadOp(0, make([]byte, 4096), 0))
-	require.Zero(t, c.sched.config.disk.Stats().Reads.ServiceTime)
+	require.Zero(t, c.sched.config.disk.Stats().Reads.InFlight)
 	completeForTest(c, handles[0], 0, 4096, nil)
-	require.Zero(t, c.sched.config.disk.Stats().Reads.ServiceTime)
+	require.Zero(t, c.sched.config.disk.Stats().Reads.InFlight)
 }
 
 func TestNewURingSchedulerWithZeroBudget(t *testing.T) {
@@ -672,12 +672,12 @@ func TestBudgetChargesOpenFollowersUntilTheirCompletion(t *testing.T) {
 	_, works := acceptOps(c,
 		VOpenatOp(0, "unused", 0, 0, 0).Link(VWriteOp(0, make([]byte, 1<<20), 0)),
 	)
-	require.Positive(t, works[0].writes.serviceTime)
+	require.Positive(t, works[0].writes.inFlight)
 	issueForTest(c, works[0]) // model CQEs without accessing the fake path
 	completeForTest(c, works[0], 0, 0, nil)
-	require.Positive(t, c.sched.config.disk.Stats().Writes.ServiceTime, "open CQE released its follower's write charge")
+	require.Positive(t, c.sched.config.disk.Stats().Writes.InFlight, "open CQE released its follower's write charge")
 	completeForTest(c, works[0], 1, 1<<20, nil)
-	require.Zero(t, c.sched.config.disk.Stats().Writes.ServiceTime)
+	require.Zero(t, c.sched.config.disk.Stats().Writes.InFlight)
 }
 
 func TestVirtualOperationsHaveNoLifecycleBarriers(t *testing.T) {
@@ -719,11 +719,46 @@ func TestUnbudgetedReadsPassFullWriteAllowance(t *testing.T) {
 	for _, h := range handles {
 		require.Equal(t, workIssued, h.state)
 	}
-	require.Zero(t, c.sched.config.disk.Stats().Reads.ServiceTime)
-	require.Positive(t, c.sched.config.disk.Stats().Writes.ServiceTime)
+	require.Zero(t, c.sched.config.disk.Stats().Reads.InFlight)
+	require.Positive(t, c.sched.config.disk.Stats().Writes.InFlight)
 	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
 	for _, ticket := range tickets {
 		_, err := ticket.Wait()
 		require.NoError(t, err)
 	}
+}
+
+// Once the write allowance blocks and only writes are ready, placement stops
+// scanning; a later read is still found and dispatched.
+func TestPlaceReadyStopsWhenNothingCanDispatch(t *testing.T) {
+	c := newTestCoordinator(t, 16, 0, diskOptions(WithLatencyGoal(DefaultLatencyGoal), WithoutReadIOBudget()))
+	f := testFile(t, 4<<20)
+	mib := make([]byte, 1<<20)
+	ops := make([]Op, 4)
+	for i := range ops {
+		ops[i] = WriteOp(f, mib, int64(i)<<20)
+	}
+	tickets, _ := acceptOps(c, ops...)
+	require.Equal(t, 4, c.readyClasses[chargesWrites])
+	placed, _ := c.placeReady(false)
+	require.Equal(t, 1, placed, "a second 1 MiB write exceeds the 1.5 ms allowance")
+	require.Equal(t, 3, c.readyClasses[chargesWrites])
+	require.False(t, c.readyCanDispatch(false, true))
+
+	readTickets, _ := acceptOps(c, ReadOp(f, make([]byte, 4096), 0))
+	require.Equal(t, 1, c.readyClasses[0])
+	placed, _ = c.placeReady(false)
+	require.Equal(t, 1, placed, "the unbudgeted read behind blocked writes still dispatches")
+	require.Zero(t, c.readyClasses[0])
+
+	for c.accepted.len != 0 {
+		c.placeReady(false)
+		require.NoError(t, c.enter(1))
+		c.reap()
+	}
+	for _, ticket := range append(tickets, readTickets...) {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	require.Equal(t, [4]int{}, c.readyClasses)
 }

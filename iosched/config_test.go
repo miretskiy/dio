@@ -8,17 +8,17 @@ import (
 )
 
 func TestWithDMABuffersCopiesCallerList(t *testing.T) {
-	first, second := alloc.NewBuffer(4096), alloc.NewBuffer(8192)
+	first, second := alloc.NewMemory(4096), alloc.NewMemory(8192)
 	defer first.Unpin()
 	defer second.Unpin()
-	input := []*alloc.Buffer{first}
+	input := [][]byte{first.Bytes()}
 	option := WithDMABuffers(input...)
-	input[0] = second
+	input[0] = second.Bytes()
 	cfg := makeSchedulerConfig([]Option{option})
 	require.Len(t, cfg.dmaBuffers, 1)
-	require.Same(t, first, cfg.dmaBuffers[0])
-	cfg = makeSchedulerConfig([]Option{option, WithDMABuffers(second, first)})
-	require.Equal(t, []*alloc.Buffer{second, first}, cfg.dmaBuffers)
+	require.Same(t, &first.Bytes()[0], &cfg.dmaBuffers[0][0])
+	cfg = makeSchedulerConfig([]Option{option, WithDMABuffers(second.Bytes(), first.Bytes())})
+	require.Equal(t, [][]byte{second.Bytes(), first.Bytes()}, cfg.dmaBuffers)
 	cfg = makeSchedulerConfig([]Option{option, WithDMABuffers()})
 	require.Empty(t, cfg.dmaBuffers)
 }

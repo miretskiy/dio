@@ -34,7 +34,7 @@ Version 2 adds `/v2` to every import path. It replaces the raw `giouring`
 package with `ringo`, whose ownership-oriented API is intentionally not a
 drop-in replacement. Existing `align`, `sys`, `netbuf`, and
 `iosched` imports must also include `/v2`. The former `mempool` package is
-now `alloc`; its allocators return owned `*alloc.Buffer` values.
+now `alloc`; its allocators return `alloc.Memory` lease handles.
 
 ## Packages
 
@@ -111,22 +111,26 @@ copies the contents into a larger mapping otherwise. `AllocAligned` and
 Mapped memory is not managed by the garbage collector. Pass the original
 allocation to `FreeAligned` when finished.
 
-## Owned buffers and allocators
+## Owned memory and allocators
 
-`alloc` provides page-aligned buffers for direct I/O. Use `alloc.NewBuffer(size)`
+`alloc.Memory` owns page-aligned storage for direct I/O. Use `alloc.NewMemory(size)`
 for a standalone allocation, or choose an allocator for reusable storage:
 
 | Allocator | Purpose |
 | --- | --- |
 | `ExtentAllocator` | Borrow whole allocations from a bounded pool |
-| `SlabAllocator` | Subdivide one backing buffer into fixed-size chunks |
+| `SlabAllocator` | Subdivide one region into fixed-size chunks |
 
-Both implement `Allocator`: `Acquire(ctx, size)` waits for capacity,
-`TryAcquire(size)` returns `ErrExhausted` when space is insufficient, and `Close()`
-releases retained storage. Backing is mapped up front; pages are committed on first use unless
-`WithWarmup()` is supplied. The slab allocator defaults to 4 KiB chunks;
-`WithChunkSize` changes the size. A slab can use an existing buffer via `WithBackingBuffer`.
-Requests round up to whole chunks or extents, returned together in one Buffer.
+Both implement `Allocator`: `Acquire(ctx)` waits for capacity, `TryAcquire()`
+returns `ErrExhausted` when none is free, and `Close()` releases retained storage.
+Each acquisition returns one contiguous, zeroed `Memory` of the allocator's unit
+size: one chunk or one extent. Backing is mapped up front; pages are committed on
+first use unless `WithWarmup()` is supplied. `WithoutZeroing()` skips zeroing
+for callers that overwrite every byte, such as direct-I/O reads. The slab
+allocator defaults to 4 KiB chunks; `WithChunkSize` changes the size.
+`WithBacking(region)` subdivides an existing page-aligned region instead of
+mapping one; the caller keeps it valid until the allocator is closed and its
+memory released.
 
 ```go
 allocator, err := alloc.NewSlabAllocator(
@@ -138,37 +142,61 @@ if err != nil {
 }
 defer allocator.Close()
 
-buf, err := allocator.Acquire(ctx, 128<<10)
+mem, err := allocator.Acquire(ctx)
 if err != nil {
     return err
 }
-defer buf.Unpin()
-copy(buf.Chunks()[0], payload)
+defer mem.Unpin()
+copy(mem.Bytes(), payload)
 ```
 
-Access memory through `Buffer.Chunks()`. `Buffer.Cap()` reports the total usable
-bytes across those chunks, including allocator rounding.
-Release buffers with `Unpin()` after use, including pending I/O. It returns
+`Memory` is a small value naming one lease; copies name the same lease, and
+acquiring memory allocates nothing on the Go heap. Each lease carries a
+generation, checked by every operation, so a handle kept past its lease fails
+`TryInc` and panics on `Unpin` even after the memory is lent again.
+Access the storage through `Memory.Bytes()`, which includes allocator rounding.
+Release memory with `Unpin()` after use, including pending I/O. It returns
 `true` only when this call released the final reference and returned storage to
 its owner. Callers may ignore the result; method values used as `func()` callbacks
-need a wrapper such as `func() { buf.Unpin() }`.
-`TryInc()` retains a reference when sharing a buffer.
-`Buffer.WrapRelease` composes a callback around the existing final release.
-Install it before sharing the buffer, and call the original callback exactly
-once from the replacement. This lets allocator wrappers account for storage
-until the last borrower releases it without changing the underlying allocator.
+need a wrapper such as `func() { mem.Unpin() }`.
+`TryInc()` retains a reference when sharing memory.
+`WithReleaseHook(func(data []byte))` runs a callback on every final `Unpin`,
+before the memory returns to the allocator. This lets callers account for
+storage until the last borrower releases it.
+
+`alloc.Buffer` is a byte stream in the spirit of `bytes.Buffer`, growing by
+acquiring allocator units rather than reallocating. It supports `Read`, `Write`,
+`ReadFrom`, and `WriteTo`. Growth never moves existing bytes and returns allocation
+errors rather than waiting for capacity; a failed `Write` writes nothing.
+Once every byte has been read, the buffer reuses its memory from the start.
+`Reset()` discards contents while retaining storage; `Release()` also drops the
+buffer's references. `Len()` counts unread bytes; `Cap()` counts held bytes.
+
+```go
+buffer := alloc.NewAllocatingBuffer(allocator)
+defer buffer.Release()
+if _, err := buffer.ReadFrom(source); err != nil {
+    return err
+}
+_, err = buffer.WriteTo(destination)
+```
+
+`RawAllocations()` exposes the buffer's `Memory`; obtain an extra reference with
+`TryInc()` before retaining one independently. Reference counts protect lifetime,
+not contents: finish reading shared bytes before the buffer reuses them.
+
 Both concrete allocators expose `Capacity()` and `Available()` byte snapshots.
 Free capacity excludes memory still pinned by readers, writers, or I/O after a
 cache has dropped its reference; it becomes available on the final release. Snapshots
 do not reserve memory; acquisition remains authoritative. Slab availability scans
 its bitmaps, avoiding a shared accounting counter on each allocation/release.
-Return all acquired buffers before closing their allocator. See the
+Return all acquired memory before closing its allocator. See the
 [`alloc` API documentation](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc)
 for configuration and ownership details.
 
-For fixed-buffer I/O, pass single-chunk buffers to the scheduler with
-`iosched.WithDMABuffers(buffers...)`. The caller obtains these buffers and keeps
-them alive until the scheduler closes.
+For fixed-buffer I/O, pass regions to the scheduler with
+`iosched.WithDMABuffers(regions...)`, for example `mem.Bytes()`. The caller keeps
+them mapped until the scheduler closes.
 
 ## File operations
 
@@ -252,13 +280,18 @@ and admission options exist only on `NewDiskPolicy`; ring depth, CPU and file
 table settings are scheduler options. Without a policy, each scheduler uses its
 own `NewDiskPolicy()`.
 
-Reads and writes have independent service-time, outstanding-byte and
-operation-count allowances. The estimated service time of each data operation is
-`max(bytes / bandwidth, 1 / IOPS)`; linked chains sum every operation's service time.
-Coordinators count bytes and operations when accepting staged submissions,
-until ticket completion, including durable sync. Submit only observes a shared
-rejection flag for each class; it does no admission accounting or rollback.
-Staged requests can overshoot a threshold before a coordinator closes admission.
+Every data operation has a modeled service time, `max(bytes / bandwidth, 1 / IOPS)`;
+a linked chain sums its operations. Both admission and dispatch are expressed in
+this one unit, per class (reads, writes), so a limit covers bytes and operation
+count at once and reads directly as time.
+
+Admission: a coordinator adds a submission's modeled time to its class's
+backlog when it accepts the submission and removes it when the ticket
+completes, including any durable sync. Reaching `WithWriteBacklogLimit(d)`
+(or `WithReadBacklogLimit(d)`) closes that class's admission, so an admitted
+write queues for at most about `d`. Submit only observes a shared rejection
+flag; it does no accounting or rollback. Staged requests can overshoot the
+limit before a coordinator closes admission.
 
 Separately, the coordinator reserves modeled service time before dispatch and
 returns it as each I/O completes. Work that does not fit queues without being
@@ -279,40 +312,33 @@ non-positive limit or latency goal disables it.
 | `WithWriteBandwidth(bytesPerSecond)` | 1.22 GB/s |
 | `WithWriteIOPS(iops)` | 83k |
 | `WithLatencyGoal(d)` | 1.5 ms per class |
-| `WithRejectReadBacklog(bytes)`, `WithRejectWriteBacklog(bytes)` | unlimited |
-| `WithWriteBacklogLowWatermark(bytes)` | negative (recovery disabled) |
-| `WithRejectReadQueueDepth(n)`, `WithRejectWriteQueueDepth(n)` | unlimited |
+| `WithReadBacklogLimit(d)`, `WithWriteBacklogLimit(d)` | disabled |
+| `WithWriteBacklogRecovery(target)` | negative (timed recovery disabled) |
 
-`WithoutIOBudget()` disables both service-time limits; `WithoutReadIOBudget()`
-disables only the read time limit. Byte and operation-count thresholds close admission
-until coordinators observe counts below their limits, unless timed recovery is enabled.
+`WithoutIOBudget()` disables both dispatch caps; `WithoutReadIOBudget()`
+disables only the read cap. Without timed recovery a backlog limit closes
+admission until coordinators observe the backlog below it again.
 `MustAdmit()` exempts a submission from every throttle: it is never rejected,
 never waits for the service-time allowance, and is not charged, so it is
 excluded from `Stats()`.
 
-For backlog recovery, configure a low watermark below `WithRejectWriteBacklog`.
-At the threshold, a coordinator closes write admission until a deadline: now plus
-the estimated drain interval. Submit compares the clock with that deadline only
-while admission is closed, so the pause ends on time even when every coordinator
-is idle, with no timer.
-
-The pause estimate is `(outstanding bytes - low watermark) / configured write
-bandwidth`, or the outstanding operation count divided by IOPS if larger.
-Active pauses are not extended. For 2 GB down to 250 MB at 1.22 GB/s, the
-estimate is about 1.43 s. Reads and `MustAdmit` continue. If the coordinator
-still observes a full backlog after expiry, it can start another pause.
-A zero low watermark targets a full drain; a negative one disables timed recovery.
-The watermark is an estimation target; actual bytes at expiry depend on device progress.
-Keep the service-time allowance enabled to limit device queue pressure while
-admitted work drains.
+With `WithWriteBacklogRecovery(target)`, reaching the write limit instead
+closes write admission for `backlog - target`: the modeled time to drain to
+target. For a one-second limit and a 200 ms target the pause is 800 ms. Submit
+compares the clock with the deadline only while admission is closed, so the
+pause ends on time even when every coordinator is idle, with no timer. Active
+pauses are not extended; a backlog still at the limit after expiry starts
+another. Reads and `MustAdmit` continue. Zero targets a full drain. The model
+is an estimate: a device also serving reads drains writes more slowly than its
+write rating, so more than target typically remains at expiry. Keep the
+dispatch cap enabled to limit device queue pressure while admitted work drains.
 
 The default device rates were measured on an AWS m7gd.8xlarge instance store.
 Use `scripts/disk-model.sh DIR` to measure another device. Service time is a
 model, not measured latency or a bandwidth rate limiter. `DiskPolicy.Stats()`
-reports coordinator-accounted bytes/operations and dispatched service time across
-its rings. Staged submissions are not yet counted.
-Each field is counted only when
-its corresponding limit is enabled; disabled limits report zero.
+reports each class's backlog (counted while a backlog limit is set) and
+dispatched service time (counted while a dispatch cap is set) across its rings.
+Staged submissions are not yet counted.
 
 Accounting and release operate on prepared submissions inside the coordinator.
 `SubmitNotify` carries its callback into preparation; only the prepared submission

@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"context"
+	"errors"
 	"math/bits"
 	"math/rand/v2"
 	"sync/atomic"
@@ -10,65 +11,69 @@ import (
 	"github.com/miretskiy/dio/v2/align"
 )
 
-// SlabAllocator subdivides one backing Buffer into fixed-size
+// SlabAllocator subdivides one region into fixed-size
 // objects. Acquisition and release use atomic bitmaps. Acquire retries on a
-// timer when exhausted; returning a buffer does not notify waiting borrowers.
+// timer when exhausted; returning a chunk does not notify waiting borrowers.
 type SlabAllocator struct {
 	slab          slabState
+	mapped        []byte // the region, when the allocator mapped it
 	retryInterval time.Duration
+	noZero        bool
 }
 
 // NewSlabAllocator creates an allocator for one page-rounded slab, with 4 KiB
-// chunks unless WithChunkSize is supplied. It holds its own reference to supplied
-// backing. Otherwise backing is mapped during construction. WithWarmup commits
-// all backing pages before returning.
-// Mapping failures panic.
+// chunks unless WithChunkSize is supplied. The slab is mapped during
+// construction unless WithBacking supplies it, in which case slabSize is
+// ignored. WithWarmup commits all pages before returning. Mapping failures panic.
 func NewSlabAllocator(slabSize int64, opts ...Option) (*SlabAllocator, error) {
 	cfg := allocatorConfig{chunkSize: align.BlockSize, retryInterval: 100 * time.Millisecond}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	backing := cfg.backing
-	if backing == nil {
-		backing = NewBuffer(align.PageAlign(slabSize))
-		defer backing.Unpin() // Release the initial reference after taking the slab's.
+	chunkSize := int(align.PageAlign(cfg.chunkSize))
+	p := &SlabAllocator{retryInterval: cfg.retryInterval, noZero: cfg.noZero}
+	region := cfg.backing
+	if region == nil {
+		if align.PageAlign(slabSize) < int64(chunkSize) {
+			return nil, errors.New("alloc: slab smaller than one chunk")
+		}
+		p.mapped = align.AllocAligned(slabSize)
+		region = p.mapped
+	} else if len(region) < chunkSize || !align.IsAligned(region) {
+		return nil, errors.New("alloc: backing must be page-aligned and hold at least one chunk")
 	}
-	backing.TryInc()
 	if cfg.warmup {
-		warmup(backing.Chunks()[0], align.BlockSize)
+		warmup(region, align.BlockSize)
 	}
-	return &SlabAllocator{
-		slab:          newSlabState(backing, int(align.PageAlign(cfg.chunkSize))),
-		retryInterval: cfg.retryInterval,
-	}, nil
+	p.slab = newSlabState(region, chunkSize)
+	p.slab.leases = newLeases(len(p.slab.shards)*chunksPerShard, func(slot int, _ []byte) {
+		p.slab.release(slot)
+	}, cfg.releaseHook)
+	return p, nil
 }
 
-// TryAcquire rounds size up to whole chunks and claims them with atomic CAS.
-// Chunks need not be contiguous. Insufficient space returns ErrExhausted after
-// returning any partial claims. Size must be positive; the allocator must be open.
-func (p *SlabAllocator) TryAcquire(size int64) (*Buffer, error) {
-	n := int((size-1)/int64(p.slab.chunkSize) + 1)
-	start := rand.IntN(len(p.slab.shards))
-	var b *Buffer
-	if n == 1 {
-		b = p.slab.tryAcquire(start)
-	} else {
-		b = p.slab.tryAcquireN(start, n)
+// TryAcquire claims one chunk with atomic CAS, or returns ErrExhausted.
+// The allocator must be open.
+func (p *SlabAllocator) TryAcquire() (Memory, error) {
+	slot, ok := p.slab.tryAcquire(rand.IntN(len(p.slab.shards)))
+	if !ok {
+		return Memory{}, ErrExhausted
 	}
-	if b != nil {
-		b.clear()
-		return b, nil
+	offset := slot * p.slab.chunkSize
+	m := p.slab.leases.lease(slot, p.slab.region[offset:offset+p.slab.chunkSize])
+	if !p.noZero {
+		clear(m.data)
 	}
-	return nil, ErrExhausted
+	return m, nil
 }
 
 // Acquire tries immediately, then retries every 100 ms (or WithRetryInterval)
 // when exhausted. Context cancellation interrupts the wait. A returned chunk
 // becomes visible to waiting callers on their next retry. Available capacity
 // may be acquired even if ctx is already cancelled.
-func (p *SlabAllocator) Acquire(ctx context.Context, size int64) (*Buffer, error) {
-	if b, err := p.TryAcquire(size); err != ErrExhausted {
-		return b, err
+func (p *SlabAllocator) Acquire(ctx context.Context) (Memory, error) {
+	if m, err := p.TryAcquire(); err != ErrExhausted {
+		return m, err
 	}
 
 	timer := time.NewTimer(p.retryInterval)
@@ -76,10 +81,10 @@ func (p *SlabAllocator) Acquire(ctx context.Context, size int64) (*Buffer, error
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return Memory{}, ctx.Err()
 		case <-timer.C:
-			if b, err := p.TryAcquire(size); err != ErrExhausted {
-				return b, err
+			if m, err := p.TryAcquire(); err != ErrExhausted {
+				return m, err
 			}
 			timer.Reset(p.retryInterval)
 		}
@@ -88,19 +93,13 @@ func (p *SlabAllocator) Acquire(ctx context.Context, size int64) (*Buffer, error
 
 // Capacity reports the usable bytes in whole chunks, excluding a partial tail.
 // It must not race Close.
-func (p *SlabAllocator) Capacity() int64 {
-	if p.slab.backing == nil {
-		return 0
-	}
-	chunk := int64(p.slab.chunkSize)
-	return int64(len(p.slab.backing.Chunks()[0])) / chunk * chunk
-}
+func (p *SlabAllocator) Capacity() int64 { return int64(len(p.slab.region)) }
 
-// Available reports a snapshot of unclaimed bytes in whole chunks. Buffers stay
+// Available reports a snapshot of unclaimed bytes in whole chunks. Chunks stay
 // claimed until their last Unpin, even after a cache drops its own reference.
 // It scans the allocation bitmaps without adding a shared counter to the hot
-// path. Concurrent acquisitions and releases can change the result immediately;
-// partial acquisitions may also temporarily claim chunks. This is not a reservation.
+// path. Concurrent acquisitions and releases can change the result immediately.
+// This is not a reservation.
 // It must not race Close.
 func (p *SlabAllocator) Available() int64 {
 	var chunks int64
@@ -110,15 +109,14 @@ func (p *SlabAllocator) Available() int64 {
 	return chunks * int64(p.slab.chunkSize)
 }
 
-// Close releases the allocator's backing reference.
-// It must not race allocator use. Do not acquire buffers after Close.
-// The caller must finish using and releasing borrowed buffers first.
-// Repeated closes are harmless.
+// Close unmaps the slab if the allocator mapped it. It must not race allocator
+// use. Do not acquire after Close. The caller must finish using and releasing
+// borrowed memory first. Repeated closes are harmless.
 func (p *SlabAllocator) Close() {
-	if p.slab.backing != nil {
-		p.slab.backing.Unpin()
-		p.slab = slabState{}
+	if p.mapped != nil {
+		align.FreeAligned(p.mapped)
 	}
+	p.slab, p.mapped = slabState{}, nil
 }
 
 const chunksPerShard = 64
@@ -129,24 +127,20 @@ type slabShard struct {
 	_    [56]byte
 }
 
-// slabState subdivides backing into fixed-size chunks. Geometry is immutable;
+// slabState subdivides a region into fixed-size chunks. Geometry is immutable;
 // occupancy is atomic.
 // A set bit means occupied; padding in the last shard is permanently occupied.
 type slabState struct {
-	backing   *Buffer
+	region    []byte  // whole chunks
+	leases    *leases // one unit per chunk
 	shards    []slabShard
 	chunkSize int
 }
 
-type slabClaim struct {
-	shardIdx int
-	mask     uint64
-}
-
-func newSlabState(backing *Buffer, chunkSize int) slabState {
-	chunks := len(backing.Chunks()[0]) / chunkSize
+func newSlabState(region []byte, chunkSize int) slabState {
+	chunks := len(region) / chunkSize
 	s := slabState{
-		backing: backing, chunkSize: chunkSize,
+		region: region[: chunks*chunkSize : chunks*chunkSize], chunkSize: chunkSize,
 		shards: make([]slabShard, (chunks-1)/chunksPerShard+1),
 	}
 	if tail := chunks % chunksPerShard; tail != 0 {
@@ -155,7 +149,8 @@ func newSlabState(backing *Buffer, chunkSize int) slabState {
 	return s
 }
 
-func (s *slabState) tryAcquire(start int) *Buffer {
+// tryAcquire claims a free chunk, scanning shards from start.
+func (s *slabState) tryAcquire(start int) (slot int, ok bool) {
 	for j := range s.shards {
 		i := (start + j) % len(s.shards)
 		for {
@@ -165,71 +160,15 @@ func (s *slabState) tryAcquire(start int) *Buffer {
 			}
 			bit := bits.TrailingZeros64(^mask)
 			if s.shards[i].mask.CompareAndSwap(mask, mask|uint64(1)<<bit) {
-				slot := i*chunksPerShard + bit
-				offset := slot * s.chunkSize
-				data := s.backing.Chunks()[0][offset : offset+s.chunkSize : offset+s.chunkSize]
-				return newBuffer(data, func() { s.release(slot) })
+				return i*chunksPerShard + bit, true
 			}
 		}
 	}
-	return nil
+	return 0, false
 }
 
 func (s *slabState) release(slot int) {
 	shard := &s.shards[slot/chunksPerShard]
 	bit := uint64(1) << (slot % chunksPerShard)
 	shard.mask.And(^bit)
-}
-
-func (s *slabState) tryAcquireN(start, n int) *Buffer {
-	if n <= 0 {
-		return nil
-	}
-	var claims []slabClaim
-	remaining := n
-	for j := 0; j < len(s.shards) && remaining > 0; j++ {
-		i := (start + j) % len(s.shards)
-		for {
-			mask := s.shards[i].mask.Load()
-			free := ^mask
-			if free == 0 {
-				break
-			}
-			var claimMask uint64
-			claimed := 0
-			for claimed < remaining && free != 0 {
-				claimMask |= uint64(1) << bits.TrailingZeros64(free)
-				free &= free - 1
-				claimed++
-			}
-			if s.shards[i].mask.CompareAndSwap(mask, mask|claimMask) {
-				claims = append(claims, slabClaim{i, claimMask})
-				remaining -= claimed
-				break
-			}
-		}
-	}
-	if remaining > 0 {
-		s.releaseClaims(claims)
-		return nil
-	}
-
-	// Assemble views only after the entire allocation succeeds.
-	data := make([][]byte, n)
-	next := 0
-	for _, c := range claims {
-		for mask := c.mask; mask != 0; mask &= mask - 1 {
-			slot := c.shardIdx*chunksPerShard + bits.TrailingZeros64(mask)
-			offset := slot * s.chunkSize
-			data[next] = s.backing.Chunks()[0][offset : offset+s.chunkSize : offset+s.chunkSize]
-			next++
-		}
-	}
-	return newChunkBuffer(data, func() { s.releaseClaims(claims) })
-}
-
-func (s *slabState) releaseClaims(claims []slabClaim) {
-	for _, c := range claims {
-		s.shards[c.shardIdx].mask.And(^c.mask)
-	}
 }

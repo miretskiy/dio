@@ -31,21 +31,25 @@ func TestAllocatorAvailability(t *testing.T) {
 				capacity := int64(chunks * chunk)
 				require.Equal(t, capacity, a.Capacity())
 				require.Equal(t, capacity, a.Available())
-				b, err := a.TryAcquire(chunk + 1)
+				b, err := a.TryAcquire()
 				require.NoError(t, err)
-				require.Equal(t, capacity-2*chunk, a.Available())
+				require.Equal(t, capacity-chunk, a.Available())
 				require.True(t, b.TryInc())
 				require.False(t, b.Unpin())
-				require.Equal(t, capacity-2*chunk, a.Available())
-				_, err = a.TryAcquire(capacity)
-				require.ErrorIs(t, err, ErrExhausted)
-				require.Equal(t, capacity-2*chunk, a.Available(), "failed partial claims are rolled back")
+				require.Equal(t, capacity-chunk, a.Available())
 				require.True(t, b.Unpin())
 				require.Equal(t, capacity, a.Available())
-				b, err = a.TryAcquire(capacity)
-				require.NoError(t, err)
+				held := make([]Memory, chunks)
+				for i := range held {
+					held[i], err = a.TryAcquire()
+					require.NoError(t, err)
+				}
 				require.Zero(t, a.Available())
-				require.True(t, b.Unpin())
+				_, err = a.TryAcquire()
+				require.ErrorIs(t, err, ErrExhausted)
+				for _, m := range held {
+					m.Unpin()
+				}
 				require.Equal(t, capacity, a.Available())
 				a.Close()
 				require.Zero(t, a.Capacity())
@@ -63,7 +67,7 @@ func TestSlabAvailabilityDuringConcurrentUse(t *testing.T) {
 	for range 8 {
 		wg.Go(func() {
 			for range 100 {
-				b, err := a.TryAcquire(3 * 4096)
+				b, err := a.TryAcquire()
 				if err != nil {
 					t.Error(err)
 					return

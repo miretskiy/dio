@@ -12,3 +12,8 @@ const HugepageSupported = false
 
 // hugePageMmapExtraFlags is 0 on non-Linux; no MAP_HUGETLB available.
 const hugePageMmapExtraFlags = 0
+
+func adviseHugepages([]byte) {}
+
+// populate is unavailable; Warmup touches each page instead.
+func populate([]byte) bool { return false }

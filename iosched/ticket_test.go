@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -359,20 +358,17 @@ func TestSubmitNotify(t *testing.T) {
 }
 
 // TestWhenDoneRacesWait completes tickets concurrently with Wait; whenDone
-// must run exactly once, after Done is closed (run with -race).
+// must run exactly once, before Wait returns (run with -race).
 func TestWhenDoneRacesWait(t *testing.T) {
 	for range 1000 {
-		var calls atomic.Int32
-		root := Op{whenDone: func(int, error) { calls.Add(1) }}
+		calls := 0 // Plain: Wait must order the callback's write before the read.
+		root := Op{whenDone: func(int, error) { calls++ }}
 		work := prepareForTest(root)
 		ticket := Ticket{&work.completion}
 		go work.finish()
 		ticket.Wait()
-		for deadline := time.Now().Add(time.Second); calls.Load() == 0 && time.Now().Before(deadline); {
-			time.Sleep(time.Microsecond)
-		}
-		if got := calls.Load(); got != 1 {
-			t.Fatalf("whenDone ran %d times", got)
+		if calls != 1 {
+			t.Fatalf("whenDone ran %d times before Wait returned", calls)
 		}
 	}
 }

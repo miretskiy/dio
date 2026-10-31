@@ -387,7 +387,7 @@ func TestURing_VOpenUnlinkedWriteReadClose(t *testing.T) {
 	require.Error(t, err)
 }
 
-func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, []*alloc.Buffer) {
+func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, []alloc.Memory) {
 	t.Helper()
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
@@ -395,15 +395,17 @@ func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, []*alloc.Bu
 	allocator, err := alloc.NewSlabAllocator(align.HugepageSize)
 	require.NoError(t, err)
 	t.Cleanup(allocator.Close)
-	buffers := make([]*alloc.Buffer, 8)
+	buffers := make([]alloc.Memory, 8)
+	regions := make([][]byte, len(buffers))
 	for i := range buffers {
-		buffers[i], err = allocator.TryAcquire(4096)
+		buffers[i], err = allocator.TryAcquire()
 		require.NoError(t, err)
+		regions[i] = buffers[i].Bytes()
 		t.Cleanup(func() { buffers[i].Unpin() })
 	}
 	s, err := iosched.NewURingScheduler(
 		iosched.WithRingDepth(64),
-		iosched.WithDMABuffers(buffers...),
+		iosched.WithDMABuffers(regions...),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, s.Close()) })
@@ -422,18 +424,18 @@ func TestURing_FixedOp_WriteRead(t *testing.T) {
 	_, _ = rand.Read(payload)
 
 	wslot := buffers[0]
-	copy(wslot.Chunks()[0], payload)
+	copy(wslot.Bytes(), payload)
 
-	n, err := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Chunks()[0], 0))
+	n, err := submitOne(t, s, iosched.WriteFixedOp(f, wslot.Bytes(), 0))
 	require.NoError(t, err)
 	require.Equal(t, align.BlockSize, n)
 
 	rslot := buffers[1]
 
-	n, err = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Chunks()[0], 0))
+	n, err = submitOne(t, s, iosched.ReadFixedOp(f, rslot.Bytes(), 0))
 	require.NoError(t, err)
 	require.Equal(t, align.BlockSize, n)
-	require.Equal(t, payload, rslot.Chunks()[0])
+	require.Equal(t, payload, rslot.Bytes())
 }
 
 func TestURing_FixedOp_MultipleSlots(t *testing.T) {
@@ -453,9 +455,9 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 		payloads[i] = make([]byte, align.BlockSize)
 		_, _ = rand.Read(payloads[i])
 
-		copy(slots[i].Chunks()[0], payloads[i])
+		copy(slots[i].Bytes(), payloads[i])
 
-		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Chunks()[0], int64(i*align.BlockSize)))
+		ticket, err := s.Submit(iosched.WriteFixedOp(f, slots[i].Bytes(), int64(i*align.BlockSize)))
 		require.NoError(t, err)
 		tickets[i] = ticket
 	}
@@ -484,11 +486,11 @@ func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
 	f := openRW(t, path)
 
-	slot, err := allocator.TryAcquire(4096)
+	slot, err := allocator.TryAcquire()
 	require.NoError(t, err)
 	defer slot.Unpin()
 
-	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Chunks()[0], 0))
+	_, err = s.Submit(iosched.WriteFixedOp(f, slot.Bytes(), 0))
 	require.Error(t, err)
 	t.Logf("validation error for unregistered fixed op: %v", err)
 }

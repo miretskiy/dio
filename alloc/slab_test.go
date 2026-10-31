@@ -17,29 +17,29 @@ func TestSlabAllocatorLayoutAndReuse(t *testing.T) {
 			p, err := NewSlabAllocator(int64(chunks*8192+4096), WithChunkSize(4097))
 			require.NoError(t, err)
 			defer p.Close()
-			held := make([]*Buffer, chunks)
+			held := make([]Memory, chunks)
 			addresses := make(map[*byte]bool)
 			for i := range held {
-				held[i], err = p.TryAcquire(4096)
+				held[i], err = p.TryAcquire()
 				require.NoError(t, err)
 				b := held[i]
-				require.Equal(t, 8192, len(b.Chunks()[0]))
-				require.Equal(t, 8192, cap(b.Chunks()[0]))
-				require.True(t, align.IsAligned(b.Chunks()[0]))
-				require.False(t, addresses[&b.Chunks()[0][0]])
-				addresses[&b.Chunks()[0][0]] = true
-				b.Chunks()[0][0] = byte(i)
+				require.Equal(t, 8192, len(b.Bytes()))
+				require.Equal(t, 8192, cap(b.Bytes()))
+				require.True(t, align.IsAligned(b.Bytes()))
+				require.False(t, addresses[&b.Bytes()[0]])
+				addresses[&b.Bytes()[0]] = true
+				b.Bytes()[0] = byte(i)
 			}
-			_, err = p.TryAcquire(4096)
+			_, err = p.TryAcquire()
 			require.ErrorIs(t, err, ErrExhausted)
 			for i := len(held) - 1; i >= 0; i-- {
 				b := held[i]
-				require.Equal(t, byte(i), b.Chunks()[0][0])
-				address := &b.Chunks()[0][0]
+				require.Equal(t, byte(i), b.Bytes()[0])
+				address := &b.Bytes()[0]
 				b.Unpin()
-				held[i], err = p.TryAcquire(4096)
+				held[i], err = p.TryAcquire()
 				require.NoError(t, err)
-				require.Same(t, address, &held[i].Chunks()[0][0])
+				require.Same(t, address, &held[i].Bytes()[0])
 			}
 			for _, b := range held {
 				b.Unpin()
@@ -48,38 +48,36 @@ func TestSlabAllocatorLayoutAndReuse(t *testing.T) {
 	}
 }
 
+// The slab borrows the caller's region without owning it: closing the slab
+// leaves the region with the caller.
 func TestSlabAllocatorBacking(t *testing.T) {
-	for _, first := range []string{"caller", "slab"} {
-		t.Run(first+"_releases_first", func(t *testing.T) {
-			extents, err := NewExtentAllocator(8192, 1)
-			require.NoError(t, err)
-			defer extents.Close()
-			backing, err := extents.TryAcquire(4096)
-			require.NoError(t, err)
-			p, err := NewSlabAllocator(8192, WithBackingBuffer(backing), WithWarmup())
-			require.NoError(t, err)
-			defer p.Close()
-			if first == "caller" {
-				backing.Unpin()
-			}
-			b, err := p.TryAcquire(4096)
-			require.NoError(t, err)
-			b.Chunks()[0][0] = 42
-			_, err = extents.TryAcquire(4096)
-			require.ErrorIs(t, err, ErrExhausted)
-			b.Unpin()
-			p.Close()
-			if first == "slab" {
-				backing.Chunks()[0][0] = 43
-				_, err = extents.TryAcquire(4096)
-				require.ErrorIs(t, err, ErrExhausted)
-				backing.Unpin()
-			}
-			reused, err := extents.TryAcquire(4096)
-			require.NoError(t, err)
-			reused.Unpin()
-		})
-	}
+	extents, err := NewExtentAllocator(8192, 1)
+	require.NoError(t, err)
+	defer extents.Close()
+	backing, err := extents.TryAcquire()
+	require.NoError(t, err)
+	p, err := NewSlabAllocator(0, WithBacking(backing.Bytes()), WithWarmup())
+	require.NoError(t, err)
+	require.EqualValues(t, 8192, p.Capacity())
+	b, err := p.TryAcquire()
+	require.NoError(t, err)
+	b.Bytes()[0] = 42
+	require.Equal(t, byte(42), backing.Bytes()[0], "chunks come from the supplied region")
+	b.Unpin()
+	p.Close()
+	_, err = extents.TryAcquire()
+	require.ErrorIs(t, err, ErrExhausted, "the caller still owns the region")
+	backing.Unpin()
+	reused, err := extents.TryAcquire()
+	require.NoError(t, err)
+	reused.Unpin()
+
+	region := NewMemory(8192)
+	defer region.Unpin()
+	_, err = NewSlabAllocator(0, WithBacking(region.Bytes()[1:]))
+	require.ErrorContains(t, err, "page-aligned")
+	_, err = NewSlabAllocator(0, WithBacking(region.Bytes()), WithChunkSize(3*4096))
+	require.ErrorContains(t, err, "at least one chunk")
 }
 
 func TestSlabAllocatorAcquireRetry(t *testing.T) {
@@ -95,24 +93,28 @@ func TestSlabAllocatorAcquireRetry(t *testing.T) {
 					require.NoError(t, err)
 					defer p.Close()
 					start := time.Now()
-					held, err := p.Acquire(context.Background(), 4096)
-					require.NoError(t, err)
+					held := make([]Memory, n)
+					for i := range held {
+						held[i], err = p.Acquire(context.Background())
+						require.NoError(t, err)
+					}
 					require.Equal(t, start, time.Now(), "first attempt must be immediate")
 					type result struct {
-						buffer *Buffer
+						memory Memory
 						err    error
 					}
 					results := make(chan result, 1)
 					go func() {
-						b, err := p.Acquire(context.Background(), int64(n*4096))
-						results <- result{b, err}
+						m, err := p.Acquire(context.Background())
+						results <- result{m, err}
 					}()
 					synctest.Wait()
-					time.Sleep(interval) // First retry still finds an occupied chunk.
+					time.Sleep(interval) // First retry still finds every chunk occupied.
 					synctest.Wait()
 					require.Empty(t, results)
 					time.Sleep(interval / 2)
-					held.Unpin()
+					released := &held[n-1].Bytes()[0]
+					held[n-1].Unpin()
 					synctest.Wait()
 					require.Empty(t, results, "release does not wake the retry timer")
 					time.Sleep(interval / 2)
@@ -120,8 +122,11 @@ func TestSlabAllocatorAcquireRetry(t *testing.T) {
 					require.Len(t, results, 1, "second retry must acquire the released chunk")
 					acquired := <-results
 					require.NoError(t, acquired.err)
-					require.Len(t, acquired.buffer.Chunks(), n)
-					acquired.buffer.Unpin()
+					require.Same(t, released, &acquired.memory.Bytes()[0])
+					acquired.memory.Unpin()
+					for _, m := range held[:n-1] {
+						m.Unpin()
+					}
 				})
 			})
 		}
@@ -135,16 +140,18 @@ func TestSlabAllocatorAcquireCancellation(t *testing.T) {
 		defer p.Close()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		held, err := p.Acquire(ctx, 4096) // Available capacity wins without checking ctx.
-		require.NoError(t, err)
-		defer held.Unpin()
-		_, err = p.Acquire(ctx, 8192)
+		for range 2 {
+			held, err := p.Acquire(ctx) // Available capacity wins without checking ctx.
+			require.NoError(t, err)
+			defer held.Unpin()
+		}
+		_, err = p.Acquire(ctx)
 		require.ErrorIs(t, err, context.Canceled)
 
 		start := time.Now()
 		ctx, cancel = context.WithCancel(context.Background())
 		var waitErr error
-		go func() { _, waitErr = p.Acquire(ctx, 8192) }()
+		go func() { _, waitErr = p.Acquire(ctx) }()
 		synctest.Wait()
 		cancel()
 		synctest.Wait()
@@ -153,70 +160,10 @@ func TestSlabAllocatorAcquireCancellation(t *testing.T) {
 
 		ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		_, err = p.Acquire(ctx, 8192)
+		_, err = p.Acquire(ctx)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		require.Equal(t, 100*time.Millisecond, time.Since(start))
-		remaining, err := p.TryAcquire(4096)
-		require.NoError(t, err)
-		remaining.Unpin()
 	})
-}
-
-func TestSlabAllocatorFragmentedChunks(t *testing.T) {
-	for _, layout := range []struct{ n, chunk int }{{3, 4096}, {64, 4096}, {65, 4096}, {65, 3 * 4096}} {
-		n, chunk := layout.n, layout.chunk
-		t.Run(fmt.Sprintf("n%d/chunk%d", n, chunk), func(t *testing.T) {
-			capacity := 2*n + 1
-			p, err := NewSlabAllocator(int64(capacity*chunk), WithChunkSize(int64(chunk)))
-			require.NoError(t, err)
-			defer p.Close()
-			held := make([]*Buffer, capacity)
-			for i := range held {
-				held[i], err = p.TryAcquire(int64(chunk))
-				require.NoError(t, err)
-				held[i].Chunks()[0][0] = byte(i)
-			}
-			free := make(map[*byte]bool)
-			for i := 1; i < capacity; i += 2 {
-				free[&held[i].Chunks()[0][0]] = true
-				held[i].Unpin()
-				held[i] = nil
-			}
-			b, err := p.TryAcquire(int64((n + 1) * chunk))
-			require.ErrorIs(t, err, ErrExhausted)
-			require.Nil(t, b)
-			// Start at the last shard to exercise release across a wrapped scan.
-			b = p.slab.tryAcquireN(len(p.slab.shards)-1, n)
-			require.NotNil(t, b, "failed acquisition must return all partial claims")
-			require.Len(t, b.Chunks(), n)
-			for _, data := range b.Chunks() {
-				require.True(t, free[&data[0]], "must use only released chunks")
-				delete(free, &data[0])
-				require.Len(t, data, chunk)
-				require.Equal(t, chunk, cap(data))
-				require.True(t, align.IsAligned(data))
-				data[0] = 255
-			}
-			require.Empty(t, free)
-			require.True(t, b.TryInc())
-			b.Unpin()
-			_, err = p.TryAcquire(4096)
-			require.ErrorIs(t, err, ErrExhausted, "one reference still owns every claim")
-			b.Unpin()
-			for i, other := range held {
-				if other != nil {
-					require.Equal(t, byte(i), other.Chunks()[0][0])
-					other.Unpin()
-				}
-			}
-			b, err = p.TryAcquire(int64(capacity * chunk))
-			require.NoError(t, err)
-			require.Len(t, b.Chunks(), capacity)
-			_, err = p.TryAcquire(4096)
-			require.ErrorIs(t, err, ErrExhausted, "padding bits must stay occupied")
-			b.Unpin()
-		})
-	}
 }
 
 func TestSlabAllocatorChunkSize(t *testing.T) {
@@ -232,12 +179,12 @@ func TestSlabAllocatorChunkSize(t *testing.T) {
 			require.NoError(t, err)
 			defer p.Close()
 			for range count {
-				b, err := p.TryAcquire(4096)
+				b, err := p.TryAcquire()
 				require.NoError(t, err)
 				defer b.Unpin()
-				require.Equal(t, size, len(b.Chunks()[0]))
+				require.Equal(t, size, len(b.Bytes()))
 			}
-			_, err = p.TryAcquire(4096)
+			_, err = p.TryAcquire()
 			require.ErrorIs(t, err, ErrExhausted)
 		})
 	}

@@ -128,14 +128,7 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	}
 
 	cfg := makeSchedulerConfig(opts)
-	data := make([][]byte, len(cfg.dmaBuffers))
-	for i, buffer := range cfg.dmaBuffers {
-		chunks := buffer.Chunks()
-		if len(chunks) > 1 {
-			return nil, fmt.Errorf("iosched: DMA buffer %d has %d chunks; expected one", i, len(chunks))
-		}
-		data[i] = chunks[0]
-	}
+	data := cfg.dmaBuffers
 	cfg.dmaBuffers = nil
 
 	ringOptions := []ringo.Option{ringo.WithDepth(cfg.ringDepth)}
@@ -231,15 +224,13 @@ func (s *URingScheduler) prepareSubmission(op *Op) (*submission, error) {
 		}
 		switch current.kind() {
 		case OpRead, OpReadv:
-			bytes := int64(opBytes(current))
-			work.reads.ops++
-			work.reads.bytes += bytes
-			work.reads.serviceTime += s.config.disk.device.reads.serviceTime(bytes)
+			t := s.config.disk.device.reads.serviceTime(int64(opBytes(current)))
+			work.reads.backlog += t
+			work.reads.inFlight += t
 		case OpWrite, OpWritev:
-			bytes := int64(opBytes(current))
-			work.writes.ops++
-			work.writes.bytes += bytes
-			work.writes.serviceTime += s.config.disk.device.writes.serviceTime(bytes)
+			t := s.config.disk.device.writes.serviceTime(int64(opBytes(current)))
+			work.writes.backlog += t
+			work.writes.inFlight += t
 		}
 	}
 	return work, nil
@@ -383,6 +374,10 @@ type coordinator struct {
 	// none in flight always dispatches, so blocked work always has an own
 	// completion coming that ends the coordinator's wait.
 	inFlight ringInFlight
+	// readyClasses counts ready work by the classes it charges at dispatch,
+	// indexed by dispatchClass, so placement stops scanning once nothing left
+	// in the ready queue can dispatch.
+	readyClasses [4]int
 
 	vfiles       []uint64 // bitmap of slots reserved through AllocateVFD
 	nextVFile    int      // first bitmap word to search
@@ -647,11 +642,14 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 		if need > free() {
 			return c.occupied - start, false
 		}
-		blocked := (readsBlocked && work.reads.serviceTime > 0) ||
-			(writesBlocked && work.writes.serviceTime > 0)
+		class := work.dispatchClass()
+		blocked := (readsBlocked && class&chargesReads != 0) || (writesBlocked && class&chargesWrites != 0)
 		if blocked || !c.sched.config.disk.dispatch(work, &c.inFlight) {
-			readsBlocked = readsBlocked || work.reads.serviceTime > 0
-			writesBlocked = writesBlocked || work.writes.serviceTime > 0
+			readsBlocked = readsBlocked || class&chargesReads != 0
+			writesBlocked = writesBlocked || class&chargesWrites != 0
+			if !c.readyCanDispatch(readsBlocked, writesBlocked) {
+				break
+			}
 			work = c.ready.next(work)
 			continue
 		}
@@ -668,8 +666,37 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 	return c.occupied - start, free() > 0
 }
 
+// dispatchClass bits say which classes a submission charges at dispatch.
+const (
+	chargesReads  = 1 << 0
+	chargesWrites = 1 << 1
+)
+
+func (work *submission) dispatchClass() int {
+	class := 0
+	if work.reads.inFlight > 0 {
+		class |= chargesReads
+	}
+	if work.writes.inFlight > 0 {
+		class |= chargesWrites
+	}
+	return class
+}
+
+// readyCanDispatch reports whether any ready work charges only unblocked
+// classes. Blocked classes stay blocked for the rest of a pass, so once this
+// is false no later ready work can dispatch in it either.
+func (c *coordinator) readyCanDispatch(readsBlocked, writesBlocked bool) bool {
+	n := &c.readyClasses
+	return n[0] > 0 ||
+		(n[chargesReads] > 0 && !readsBlocked) ||
+		(n[chargesWrites] > 0 && !writesBlocked) ||
+		(n[chargesReads|chargesWrites] > 0 && !readsBlocked && !writesBlocked)
+}
+
 // take removes work from the ready queue and marks it issued.
 func (c *coordinator) take(work *submission) {
+	c.readyClasses[work.dispatchClass()]--
 	c.ready.remove(work)
 	work.state = workIssued
 }
@@ -1117,6 +1144,7 @@ func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) 
 	for c.ready.len != 0 {
 		c.ready.pop()
 	}
+	c.readyClasses = [4]int{}
 	for c.accepted.len != 0 {
 		work := c.accepted.pop()
 		// Work in a file's sync batch is still linked there; the table goes
@@ -1145,5 +1173,6 @@ func (c *coordinator) makeReady(work *submission) {
 		panic(err)
 	}
 	work.state = workReady
+	c.readyClasses[work.dispatchClass()]++
 	c.ready.push(work)
 }

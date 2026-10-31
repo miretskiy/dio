@@ -379,10 +379,14 @@ var closedChan = func() chan struct{} {
 }()
 
 // finish publishes the result and releases ticket waiters.
-func (c *completion) finish() {
+// stopClock records Clat when the operations complete.
+func (c *completion) stopClock() {
 	if c.Slat > 0 {
 		c.Clat = time.Since(c.started) - c.Slat
 	}
+}
+
+func (c *completion) finish() {
 	// Exactly one finish races with any number of Done calls. Either finish
 	// publishes the shared closed channel, or a Done caller wins publication
 	// and finish closes that channel. No mutex or channel allocation on Wait.
@@ -413,8 +417,8 @@ func (c *completion) markIssued() {
 // error. Because whenDone travels with op, it survives any wrapper that forwards
 // op to the scheduler it wraps.
 //
-// whenDone runs on the goroutine that completes the Ticket, after Done is
-// closed. For URingScheduler that is the coordinator, which issues and reaps
+// whenDone runs on the goroutine that completes the Ticket, before Done is
+// closed and Wait returns, so a waiter observes its effects. For URingScheduler that is the coordinator, which issues and reaps
 // all of the scheduler's I/O, so whenDone must be brief and must not block: no
 // Wait, no blocking channel operation, no lock held across blocking work.
 // Nothing enforces this. It may call Submit or SubmitNotify, which only stage

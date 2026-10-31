@@ -1,6 +1,7 @@
 package align
 
 import (
+	"bytes"
 	"math"
 	"testing"
 
@@ -216,4 +217,18 @@ func TestGrowAligned_ExactPageMultiple(t *testing.T) {
 		require.True(t, IsAligned(result))
 		FreeAligned(result)
 	}
+}
+
+func TestWriteBuffers(t *testing.T) {
+	first, second := bytes.Repeat([]byte{1}, BlockSize), bytes.Repeat([]byte{2}, 2*BlockSize)
+	chunks := [][]byte{first, second}
+	out := WriteBuffers(chunks, BlockSize+10)
+	require.Len(t, out, 2)
+	require.Len(t, out[0], BlockSize)
+	require.Len(t, out[1], BlockSize, "rounded up to one page into the second chunk")
+	require.Equal(t, bytes.Repeat([]byte{2}, 10), out[1][:10])
+	require.Equal(t, make([]byte, BlockSize-10), out[1][10:], "padding is zeroed")
+	require.Equal(t, byte(2), second[BlockSize], "bytes past the page are untouched")
+	require.Len(t, WriteBuffers(chunks, BlockSize), 1)
+	require.Empty(t, WriteBuffers(chunks, 0))
 }

@@ -29,6 +29,24 @@ func PageAlign(size int64) int64 {
 	return (size + BlockMask) &^ BlockMask
 }
 
+// WriteBuffers returns the leading chunks covering n bytes rounded up to a
+// whole page, for one direct-I/O write. Bytes from n to the page boundary are
+// zeroed. The chunks must hold at least PageAlign(n) bytes.
+func WriteBuffers(chunks [][]byte, n int64) [][]byte {
+	end := PageAlign(n)
+	out := make([][]byte, 0, len(chunks))
+	for start := int64(0); start < end; {
+		chunk := chunks[len(out)]
+		chunk = chunk[:min(int64(len(chunk)), end-start)]
+		if start+int64(len(chunk)) > n {
+			clear(chunk[max(0, n-start):])
+		}
+		out = append(out, chunk)
+		start += int64(len(chunk))
+	}
+	return out
+}
+
 // IsAligned reports whether the first byte of block is aligned to [BlockSize].
 // An empty or nil slice is considered aligned.
 func IsAligned(block []byte) bool {
@@ -56,8 +74,9 @@ func AlignRange(offset int64, length int) (alignedOffset, alignedLength int64) {
 // The returned slice length is rounded up to the nearest [BlockSize] page.
 //
 // On Linux, if the aligned size is an exact multiple of [HugepageSize] (2 MiB),
-// AllocAligned first attempts MAP_HUGETLB. If huge pages are unavailable,
-// it falls back to standard pages.
+// AllocAligned first attempts MAP_HUGETLB, which draws on the hugetlb pool an
+// administrator reserves (vm.nr_hugepages). Without free pool pages, it maps
+// standard pages and advises transparent huge pages (MADV_HUGEPAGE) instead.
 //
 // WARNING: The buffer is NOT managed by the Go GC. The caller MUST call
 // [FreeAligned] when done to avoid a memory leak. Invalid sizes and mmap
@@ -71,6 +90,9 @@ func AllocAligned(size int64) []byte {
 	data, err := unix.Mmap(-1, 0, alignedSize, unix.PROT_READ|unix.PROT_WRITE, flags)
 	if err != nil && flags&hugePageMmapExtraFlags != 0 {
 		data, err = unix.Mmap(-1, 0, alignedSize, unix.PROT_READ|unix.PROT_WRITE, flags&^hugePageMmapExtraFlags)
+		if err == nil {
+			adviseHugepages(data)
+		}
 	}
 	if err != nil {
 		panic(fmt.Errorf("align: mmap(%d bytes): %w", size, err))
@@ -78,9 +100,13 @@ func AllocAligned(size int64) []byte {
 	return data
 }
 
-// Warmup zeroes one byte every stride bytes. Use the mapping's page size as
-// stride to fault in every page. Call before using the memory.
+// Warmup commits every page of page-aligned data before use: one
+// madvise(MADV_POPULATE_WRITE) on Linux 5.14 and later, otherwise a write
+// every stride bytes, which should be the mapping's page size.
 func Warmup(data []byte, stride int) {
+	if populate(data) {
+		return
+	}
 	for i := 0; i < len(data); i += stride {
 		data[i] = 0
 	}

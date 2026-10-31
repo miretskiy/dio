@@ -127,13 +127,16 @@ func (work *submission) durable() *operation {
 	return nil
 }
 
+// finish runs the completion function, if any, then completes the Ticket, so
+// a waiter observes the function's effects. Clat excludes the function.
 func (work *submission) finish() {
-	work.completion.finish()
+	work.completion.stopClock()
 	if work.whenDone != nil {
 		callback := work.whenDone
 		work.whenDone = nil
 		callback(work.n, work.err)
 	}
+	work.completion.finish()
 }
 
 func (work *submission) recordResult(op *operation, n int, err error) {

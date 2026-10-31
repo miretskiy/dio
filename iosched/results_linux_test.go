@@ -147,8 +147,8 @@ func TestPlacementFailureReleasesChain(t *testing.T) {
 	}
 	require.Zero(t, c.accepted.len)
 	require.Zero(t, c.occupied)
-	require.Zero(t, c.sched.config.disk.Stats().Writes.Depth)
-	require.Zero(t, c.sched.config.disk.Stats().Writes.Bytes)
+	require.Zero(t, c.sched.config.disk.Stats().Writes.Backlog)
+	require.Zero(t, c.sched.config.disk.Stats().Writes.Backlog)
 	require.EqualValues(t, 0, c.allocVFD(), "failed placement returns the reserved slot")
 	c.freeVFD(0)
 }

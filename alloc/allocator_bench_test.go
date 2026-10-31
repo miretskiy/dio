@@ -49,7 +49,7 @@ func benchmarkWorkers(b *testing.B, workers int, work func(worker, n int)) {
 // The atomic reference supports TryAcquire only; production implementations
 // also satisfy Allocator and participate in the blocking and latency cases.
 type benchmarkAllocator interface {
-	TryAcquire(size int64) (*Buffer, error)
+	TryAcquire() (Memory, error)
 	Close()
 }
 
@@ -105,40 +105,6 @@ func BenchmarkAllocator(b *testing.B) {
 			})
 		}
 	}
-	for _, n := range []int{1, 4, 64, 65, 128} {
-		for _, workers := range []int{1, 64} {
-			b.Run(fmt.Sprintf("Chunks/n%d/workers%d", n, workers), func(b *testing.B) {
-				p, err := NewSlabAllocator(2<<20, WithWarmup())
-				if err != nil {
-					b.Fatal(err)
-				}
-				benchmarkAllocatorOperations(b, p, int64(n*4096), 0, workers, "TryAcquire")
-			})
-			b.Run(fmt.Sprintf("ExtentChunks/n%d/workers%d", n, workers), func(b *testing.B) {
-				p, err := NewExtentAllocator(4096, max(512, 2*n*workers), WithWarmup())
-				if err != nil {
-					b.Fatal(err)
-				}
-				benchmarkAllocatorOperations(b, p, int64(n*4096), 0, workers, "TryAcquire")
-			})
-		}
-	}
-	for _, n := range []int{1, 4, 16, 64, 65, 128} {
-		for _, workers := range []int{1, 64} {
-			for _, mode := range []string{"batch", "singles"} {
-				b.Run(fmt.Sprintf("Batch/n%d/workers%d/%s", n, workers, mode), func(b *testing.B) {
-					benchmarkAllocatorBatch(b, n, workers, mode)
-				})
-			}
-		}
-	}
-	for _, workers := range []int{1, 64} {
-		for _, path := range []string{"single", "general"} {
-			b.Run(fmt.Sprintf("SinglePath/workers%d/%s", workers, path), func(b *testing.B) {
-				benchmarkSlabSinglePath(b, workers, path)
-			})
-		}
-	}
 	variants := allocatorVariants()
 	for _, mode := range []struct {
 		name      string
@@ -173,7 +139,7 @@ func BenchmarkAllocator(b *testing.B) {
 						if err != nil {
 							b.Fatal(err)
 						}
-						benchmarkAllocatorOperations(b, p, int64(workload.chunk), workload.capacity()-workload.free, workers, mode.name)
+						benchmarkAllocatorOperations(b, p, workload.capacity()-workload.free, workers, mode.name)
 					})
 				}
 			}
@@ -196,83 +162,12 @@ func BenchmarkAllocator(b *testing.B) {
 	}
 }
 
-// One operation acquires N chunks, touches each, then releases all of them.
-// Keep capacity above the largest combined working set (64 workers * 128
-// chunks) so both modes measure successful allocations without exhaustion.
-func benchmarkAllocatorBatch(b *testing.B, n, workers int, mode string) {
-	p, err := NewSlabAllocator(64<<20, WithWarmup())
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer p.Close()
-	requests, size := n, int64(4096)
-	if mode == "batch" {
-		requests, size = 1, int64(n*4096)
-	}
-	held := make([][]*Buffer, workers)
-	for i := range held {
-		held[i] = make([]*Buffer, requests)
-	}
-	b.ReportAllocs()
-	benchmarkWorkers(b, workers, func(worker, iterations int) {
-		buffers := held[worker]
-		for range iterations {
-			for i := range buffers {
-				buffer, err := p.TryAcquire(size)
-				if err != nil {
-					b.Error(err)
-					for _, held := range buffers[:i] {
-						held.Unpin()
-					}
-					return
-				}
-				buffers[i] = buffer
-			}
-			for _, buffer := range buffers {
-				for _, chunk := range buffer.Chunks() {
-					chunk[0] = byte(worker)
-				}
-			}
-			for _, buffer := range buffers {
-				buffer.Unpin()
-			}
-		}
-	})
-	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n), "ns/chunk")
-}
-
-// Compare the two bitmap paths directly, with the same random starting shard
-// and Buffer lifecycle. This bypasses the public API's n == 1 selection.
-func benchmarkSlabSinglePath(b *testing.B, workers int, path string) {
-	p, err := NewSlabAllocator(64<<20, WithWarmup())
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer p.Close()
-	acquire := p.slab.tryAcquire
-	if path == "general" {
-		acquire = func(start int) *Buffer { return p.slab.tryAcquireN(start, 1) }
-	}
-	b.ReportAllocs()
-	benchmarkWorkers(b, workers, func(worker, iterations int) {
-		for range iterations {
-			buffer := acquire(rand.IntN(len(p.slab.shards)))
-			if buffer == nil {
-				b.Error("unexpected exhaustion")
-				return
-			}
-			buffer.Chunks()[0][0] = byte(worker)
-			buffer.Unpin()
-		}
-	})
-}
-
-func benchmarkAllocatorOperations(b *testing.B, p benchmarkAllocator, size int64, reserve, workers int, mode string) {
+func benchmarkAllocatorOperations(b *testing.B, p benchmarkAllocator, reserve, workers int, mode string) {
 	b.Helper()
 	defer p.Close()
-	held := make([]*Buffer, reserve)
+	held := make([]Memory, reserve)
 	for i := range held {
-		buf, err := p.TryAcquire(size)
+		buf, err := p.TryAcquire()
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -283,7 +178,7 @@ func benchmarkAllocatorOperations(b *testing.B, p benchmarkAllocator, size int64
 			buf.Unpin()
 		}
 	}()
-	benchmarkAllocatorCycles(b, p, size, workers, mode)
+	benchmarkAllocatorCycles(b, p, workers, mode)
 }
 
 // Share one mapping and occupancy setup across calibrated benchmark runs.
@@ -304,9 +199,9 @@ func benchmarkAllocatorScale(b *testing.B, newAllocator func() (benchmarkAllocat
 		{"full", capacity},
 	} {
 		b.Run(occupancy.name, func(b *testing.B) {
-			held := make([]*Buffer, occupancy.held)
+			held := make([]Memory, occupancy.held)
 			for i := range held {
-				held[i], err = p.TryAcquire(4096)
+				held[i], err = p.TryAcquire()
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -318,7 +213,7 @@ func benchmarkAllocatorScale(b *testing.B, newAllocator func() (benchmarkAllocat
 			}()
 			for _, workers := range []int{1, 64} {
 				b.Run(fmt.Sprintf("workers%d", workers), func(b *testing.B) {
-					benchmarkAllocatorCycles(b, p, 4096, workers, "TryAcquire")
+					benchmarkAllocatorCycles(b, p, workers, "TryAcquire")
 				})
 			}
 		})
@@ -338,16 +233,16 @@ func benchmarkAllocatorInit(b *testing.B, newAllocator func() (benchmarkAllocato
 		}
 		initTime += time.Since(start)
 		start = time.Now()
-		first, err := p.TryAcquire(4096)
+		first, err := p.TryAcquire()
 		if err != nil {
 			b.Fatal(err)
 		}
 		firstTime += time.Since(start)
 		start = time.Now()
-		held := make([]*Buffer, max(1, fill))
+		held := make([]Memory, max(1, fill))
 		held[0] = first
 		for i := 1; i < len(held); i++ {
-			held[i], err = p.TryAcquire(4096)
+			held[i], err = p.TryAcquire()
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -375,12 +270,12 @@ func benchmarkAllocatorInit(b *testing.B, newAllocator func() (benchmarkAllocato
 	}
 }
 
-func benchmarkAllocatorCycles(b *testing.B, p benchmarkAllocator, size int64, workers int, mode string) {
+func benchmarkAllocatorCycles(b *testing.B, p benchmarkAllocator, workers int, mode string) {
 	b.Helper()
 	acquire := p.TryAcquire
 	if mode != "TryAcquire" {
 		a := p.(Allocator)
-		acquire = func(size int64) (*Buffer, error) { return a.Acquire(context.Background(), size) }
+		acquire = func() (Memory, error) { return a.Acquire(context.Background()) }
 	}
 	exhausted := make([]int, workers)
 	var samples [][]int64
@@ -399,7 +294,7 @@ func benchmarkAllocatorCycles(b *testing.B, p benchmarkAllocator, size int64, wo
 			if samples != nil && i%stride == 0 {
 				start = time.Now()
 			}
-			buf, err := acquire(size)
+			buf, err := acquire()
 			if !start.IsZero() {
 				samples[worker] = append(samples[worker], time.Since(start).Nanoseconds())
 			}
@@ -411,9 +306,7 @@ func benchmarkAllocatorCycles(b *testing.B, p benchmarkAllocator, size int64, wo
 				b.Error(err)
 				return
 			}
-			for _, data := range buf.Chunks() {
-				data[0] = byte(worker)
-			}
+			buf.Bytes()[0] = byte(worker)
 			buf.Unpin()
 		}
 		exhausted[worker] = failures
@@ -447,9 +340,9 @@ func benchmarkAllocatorCold(b *testing.B, variant allocatorVariant, w allocatorW
 		if err != nil {
 			b.Fatal(err)
 		}
-		var held [4]*Buffer
+		var held [4]Memory
 		for i := range w.slabs {
-			held[i], err = p.TryAcquire(int64(w.chunk))
+			held[i], err = p.TryAcquire()
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -464,29 +357,31 @@ func benchmarkAllocatorCold(b *testing.B, variant allocatorVariant, w allocatorW
 // Benchmark reference: the pre-unification SlabPool's padded, atomic bitmap
 // algorithm. It only supports one eagerly mapped slab and TryAcquire. Keep it
 // in tests as a comparison for the mutex-based implementations.
-// Buffer ownership uses the same release closures as the current allocators.
+// Memory ownership uses the same release closures as the current allocators.
 type atomicReferenceShard struct {
 	mask atomic.Uint64
 	_    [56]byte
 }
 
 type atomicBitmapReference struct {
-	backing   *Buffer
+	backing   Memory
+	leases    *leases
 	chunkSize int
 	shards    []atomicReferenceShard
 }
 
 func newAtomicBitmapReference(size, chunkSize int) *atomicBitmapReference {
 	chunks := size / chunkSize
-	p := &atomicBitmapReference{backing: NewBuffer(int64(size)), chunkSize: chunkSize,
+	p := &atomicBitmapReference{backing: NewMemory(int64(size)), chunkSize: chunkSize,
 		shards: make([]atomicReferenceShard, (chunks+63)/64)}
 	if tail := chunks % 64; tail != 0 {
 		p.shards[len(p.shards)-1].mask.Store(^uint64(0) << tail)
 	}
+	p.leases = newLeases(chunks, func(slot int, _ []byte) { p.release(slot) }, nil)
 	return p
 }
 
-func (p *atomicBitmapReference) TryAcquire(int64) (*Buffer, error) {
+func (p *atomicBitmapReference) TryAcquire() (Memory, error) {
 	n := len(p.shards)
 	start := rand.IntN(n)
 	for j := range n {
@@ -501,12 +396,12 @@ func (p *atomicBitmapReference) TryAcquire(int64) (*Buffer, error) {
 			if p.shards[i].mask.CompareAndSwap(mask, mask|claimMask) {
 				slot := i*64 + bit
 				offset := slot * p.chunkSize
-				data := p.backing.Chunks()[0][offset : offset+p.chunkSize : offset+p.chunkSize]
-				return newBuffer(data, func() { p.release(slot) }), nil
+				data := p.backing.data[offset : offset+p.chunkSize : offset+p.chunkSize]
+				return p.leases.lease(slot, data), nil
 			}
 		}
 	}
-	return nil, ErrExhausted
+	return Memory{}, ErrExhausted
 }
 
 func (p *atomicBitmapReference) release(slot int) {

@@ -26,10 +26,8 @@ type ShardedMap[K comparable, V, E any] struct {
 // Access Items and Extra while holding the appropriate read or write lock.
 // A MapShard must not be copied after first use.
 //
-// E owns the shard layout, including any padding. The VerifyAlignment helper
-// in alignment_test.go can be copied into caller tests to check the shard size
-// and compiler-inserted trailing padding in E. Constructors accept any layout;
-// insufficient padding may cause false sharing between shards.
+// E owns the shard layout, including any padding; VerifyAlignment checks it.
+// Insufficient padding may cause false sharing between shards.
 type MapShard[K comparable, V, E any] struct {
 	sync.RWMutex
 	Items map[K]V

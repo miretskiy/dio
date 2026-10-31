@@ -3,8 +3,6 @@ package iosched
 import (
 	"slices"
 	"time"
-
-	"github.com/miretskiy/dio/v2/alloc"
 )
 
 const defaultRingDepth uint32 = 256
@@ -21,7 +19,7 @@ type schedulerConfig struct {
 	sqPoll         bool
 	vfiles         uint32
 	coalescing     bool
-	dmaBuffers     []*alloc.Buffer
+	dmaBuffers     [][]byte
 	disk           *DiskPolicy
 }
 
@@ -99,15 +97,15 @@ func WithCoalescing(enabled bool) Option {
 	return optionFunc(func(c *schedulerConfig) { c.coalescing = enabled })
 }
 
-// WithDMABuffers registers each supplied single-chunk Buffer as one fixed buffer
-// before the io_uring coordinator starts. The caller obtains the buffers and
-// must keep a reference to each until the scheduler has closed successfully,
-// including between I/O operations. The scheduler does not pin, unpin, or acquire buffers.
+// WithDMABuffers registers each supplied region as one fixed buffer before the
+// io_uring coordinator starts, such as the Bytes of an alloc.Memory. The caller
+// keeps every region mapped and unchanged in place until the scheduler has
+// closed successfully, including between I/O operations.
 //
-// The buffer list is copied. Repeated options replace the list; an empty list
-// disables registration. NewURingScheduler returns an error for multi-chunk buffers.
+// The region list is copied. Repeated options replace the list; an empty list
+// disables registration.
 // The POSIX fallback ignores this option.
-func WithDMABuffers(buffers ...*alloc.Buffer) Option {
+func WithDMABuffers(buffers ...[]byte) Option {
 	buffers = slices.Clone(buffers)
 	return optionFunc(func(c *schedulerConfig) {
 		c.dmaBuffers = buffers
@@ -121,8 +119,8 @@ type DiskPolicyOption func(*DiskPolicy)
 // the schedulers it is passed to.
 func NewDiskPolicy(opts ...DiskPolicyOption) *DiskPolicy {
 	p := &DiskPolicy{
-		readBudget:  ioBudget{lowWatermark: -1},
-		writeBudget: ioBudget{lowWatermark: -1},
+		readBudget:  ioBudget{recovery: -1},
+		writeBudget: ioBudget{recovery: -1},
 		device: deviceConfig{
 			reads:  deviceIO{bytesPerSecond: DefaultReadBandwidth, iops: DefaultReadIOPS, latency: DefaultLatencyGoal},
 			writes: deviceIO{bytesPerSecond: DefaultWriteBandwidth, iops: DefaultWriteIOPS, latency: DefaultLatencyGoal},
@@ -192,36 +190,25 @@ func WithoutIOBudget() DiskPolicyOption {
 	return WithLatencyGoal(0)
 }
 
-// WithRejectWriteQueueDepth closes write admission when coordinators observe n
-// outstanding writes. Each write in a chain counts through ticket completion,
-// including Durable sync. Some staged work can overshoot. Zero disables it.
-func WithRejectWriteQueueDepth(n int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.writeBudget.maxOutstandingOps = max(0, n) }
+// WithWriteBacklogLimit closes write admission while the modeled service
+// time of accepted, unfinished writes is at least limit. It bounds how long an
+// admitted write can queue: about limit at the modeled bandwidth. Each write in
+// a chain counts through ticket completion, including Durable sync. Staged work
+// can overshoot before a coordinator observes it. Default: disabled.
+func WithWriteBacklogLimit(limit time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) { p.writeBudget.limit = int64(max(0, limit)) }
 }
 
-// WithRejectWriteBacklog closes write admission when coordinators observe this
-// many outstanding buffer bytes. Staged work may overshoot before the circuit
-// closes. Zero disables this threshold. POSIX ignores it.
-func WithRejectWriteBacklog(bytes int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.writeBudget.maxOutstandingBytes = max(0, bytes) }
+// WithWriteBacklogRecovery makes reaching the write backlog limit close write
+// admission for a timed pause, backlog minus target: the modeled time to drain
+// to target. Zero targets a full drain; a negative target (the default)
+// disables timed recovery, and the circuit reopens as soon as the backlog falls
+// below the limit. It requires a write backlog limit.
+func WithWriteBacklogRecovery(target time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) { p.writeBudget.recovery = int64(max(-1, target)) }
 }
 
-// WithWriteBacklogLowWatermark enables a timed pause at the write backlog
-// threshold. The coordinator estimates how long draining to this watermark takes
-// and closes write admission for that duration. Zero targets a full drain; a
-// negative value (the default) disables timed recovery. It requires a positive
-// write backlog threshold. Without timed recovery the circuit reopens when
-// counts fall below their limits. POSIX ignores this option.
-func WithWriteBacklogLowWatermark(bytes int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.writeBudget.lowWatermark = max(-1, bytes) }
-}
-
-// WithRejectReadQueueDepth is the read counterpart of WithRejectWriteQueueDepth.
-func WithRejectReadQueueDepth(n int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.readBudget.maxOutstandingOps = max(0, n) }
-}
-
-// WithRejectReadBacklog is the read counterpart of WithRejectWriteBacklog.
-func WithRejectReadBacklog(bytes int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.readBudget.maxOutstandingBytes = max(0, bytes) }
+// WithReadBacklogLimit is the read counterpart of WithWriteBacklogLimit.
+func WithReadBacklogLimit(limit time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) { p.readBudget.limit = int64(max(0, limit)) }
 }

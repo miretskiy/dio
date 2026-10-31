@@ -15,14 +15,14 @@ func TestURingDMABuffersCallerOwnership(t *testing.T) {
 	if !IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	buffer := alloc.NewBuffer(4096)
+	buffer := alloc.NewMemory(4096)
 	released := false
 	defer func() {
 		if !released {
 			buffer.Unpin()
 		}
 	}()
-	s, err := NewURingScheduler(WithRingDepth(8), WithDMABuffers(buffer))
+	s, err := NewURingScheduler(WithRingDepth(8), WithDMABuffers(buffer.Bytes()))
 	require.NoError(t, err)
 	closed := false
 	defer func() {
@@ -40,7 +40,7 @@ func TestURingDMABuffersCallerOwnership(t *testing.T) {
 	// behind an extra reference. The caller's one Unpin releases the buffer.
 	require.True(t, buffer.TryInc())
 	buffer.Unpin()
-	buffer.Chunks()[0][0] = 42
+	buffer.Bytes()[0] = 42
 	buffer.Unpin()
 	released = true
 	require.False(t, buffer.TryInc())
@@ -62,53 +62,53 @@ func TestURingFixedIOWithExplicitBuffers(t *testing.T) {
 			}
 			require.NoError(t, err)
 			defer allocator.Close()
-			var buffers []*alloc.Buffer
+			var buffers []alloc.Memory
 			defer func() {
 				for _, b := range buffers {
 					b.Unpin()
 				}
 			}()
-			held := make([]*alloc.Buffer, 7)
+			held := make([]alloc.Memory, 7)
+			released := make([]bool, len(held))
 			defer func() {
-				for _, b := range held {
-					if b != nil {
+				for i, b := range held {
+					if !released[i] {
 						b.Unpin()
 					}
 				}
 			}()
 			for i := range held {
-				held[i], err = allocator.TryAcquire(4096)
+				held[i], err = allocator.TryAcquire()
 				require.NoError(t, err)
 			}
 			// Register individual allocations without including their neighbors.
 			for _, i := range []int{0, 2, 4} {
 				held[i].Unpin()
-				held[i] = nil
+				released[i] = true
 			}
-			multi, err := allocator.TryAcquire(3 * chunk)
-			require.NoError(t, err)
-			_, err = NewURingScheduler(WithRingDepth(8), WithDMABuffers(multi))
-			multi.Unpin()
-			require.ErrorContains(t, err, "DMA buffer 0 has 3 chunks; expected one")
 			for range 3 {
-				buffer, err := allocator.TryAcquire(chunk)
+				buffer, err := allocator.TryAcquire()
 				require.NoError(t, err)
 				buffers = append(buffers, buffer)
 			}
 			for range 3 {
-				buffers = append(buffers, alloc.NewBuffer(chunk))
+				buffers = append(buffers, alloc.NewMemory(chunk))
 			}
-			s, err := NewURingScheduler(WithRingDepth(8), WithDMABuffers(buffers...))
+			regions := make([][]byte, len(buffers))
+			for i, b := range buffers {
+				regions[i] = b.Bytes()
+			}
+			s, err := NewURingScheduler(WithRingDepth(8), WithDMABuffers(regions...))
 			require.NoError(t, err)
 			defer func() { require.NoError(t, s.Close()) }()
 			require.Equal(t, len(buffers), s.registeredBuffers.Len())
 			f, err := os.CreateTemp(t.TempDir(), "explicit-buffers")
 			require.NoError(t, err)
 			defer f.Close()
-			_, err = s.Submit(WriteFixedOp(f, held[1].Chunks()[0], 0))
+			_, err = s.Submit(WriteFixedOp(f, held[1].Bytes(), 0))
 			require.ErrorContains(t, err, "outside the registered DMA buffers")
 			for i, buffer := range buffers {
-				data := buffer.Chunks()[0]
+				data := buffer.Bytes()
 				for j := range data {
 					data[j] = byte(i + 1)
 				}
@@ -119,7 +119,7 @@ func TestURingFixedIOWithExplicitBuffers(t *testing.T) {
 				require.Equal(t, chunk, n)
 			}
 			for i, buffer := range buffers {
-				data := buffer.Chunks()[0]
+				data := buffer.Bytes()
 				clear(data)
 				ticket, err := s.Submit(ReadFixedOp(f, data, int64(i*chunk)))
 				require.NoError(t, err)
@@ -143,16 +143,16 @@ func TestURingAllocatorBufferFixedIO(t *testing.T) {
 	allocator, err := alloc.NewExtentAllocator(chunkSize, 1)
 	require.NoError(t, err)
 	defer allocator.Close()
-	buf, err := allocator.TryAcquire(chunkSize)
+	buf, err := allocator.TryAcquire()
 	require.NoError(t, err)
 	defer buf.Unpin()
-	s, err := NewURingScheduler(WithRingDepth(8), WithDMABuffers(buf))
+	s, err := NewURingScheduler(WithRingDepth(8), WithDMABuffers(buf.Bytes()))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, s.Close()) }()
 	f, err := os.CreateTemp(t.TempDir(), "fixed")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, f.Close()) }()
-	_, err = allocator.TryAcquire(chunkSize)
+	_, err = allocator.TryAcquire()
 	require.ErrorIs(t, err, alloc.ErrExhausted)
 	payload := make([]byte, 3*chunkSize+100)
 	for i := range payload {
@@ -160,7 +160,7 @@ func TestURingAllocatorBufferFixedIO(t *testing.T) {
 	}
 	for off := 0; off < len(payload); off += chunkSize {
 		n := min(chunkSize, len(payload)-off)
-		piece := buf.Chunks()[0][:int(align.PageAlign(int64(n)))]
+		piece := buf.Bytes()[:int(align.PageAlign(int64(n)))]
 		clear(piece)
 		copy(piece, payload[off:off+n])
 		ticket, err := s.Submit(WriteFixedOp(f, piece, int64(off)))
@@ -171,7 +171,7 @@ func TestURingAllocatorBufferFixedIO(t *testing.T) {
 	}
 	for off := 0; off < len(payload); off += chunkSize {
 		n := min(chunkSize, len(payload)-off)
-		piece := buf.Chunks()[0][:int(align.PageAlign(int64(n)))]
+		piece := buf.Bytes()[:int(align.PageAlign(int64(n)))]
 		clear(piece)
 		ticket, err := s.Submit(ReadFixedOp(f, piece, int64(off)))
 		require.NoError(t, err)

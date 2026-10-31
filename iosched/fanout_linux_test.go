@@ -173,11 +173,11 @@ func BenchmarkFanout_URing(b *testing.B) {
 	ff := setupFanout(b)
 
 	// The caller keeps one staging buffer registered through scheduler shutdown.
-	slot := alloc.NewBuffer(fanoutChunk)
+	slot := alloc.NewMemory(fanoutChunk)
 	defer slot.Unpin()
 	sched, err := iosched.NewURingScheduler(
 		iosched.WithRingDepth(256),
-		iosched.WithDMABuffers(slot),
+		iosched.WithDMABuffers(slot.Bytes()),
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -197,7 +197,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 		offset := int64(i%fanoutNumChunks) * fanoutChunk
 
 		// Fixed read.
-		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Chunks()[0], offset))
+		readTicket, err := sched.Submit(iosched.ReadFixedOp(ff.src, slot.Bytes(), offset))
 		if err != nil {
 			b.Fatalf("submit read: %v", err)
 		}
@@ -208,7 +208,7 @@ func BenchmarkFanout_URing(b *testing.B) {
 		// Fan-out: submit all sinks before waiting, allowing the coordinator
 		// to place them in the same ring wave.
 		for si := range fanoutNumSinks {
-			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Chunks()[0], offset))
+			writeTicket, err := sched.Submit(iosched.WriteFixedOp(ff.sinks[si], slot.Bytes(), offset))
 			if err != nil {
 				b.Fatalf("submit write sink%d: %v", si+1, err)
 			}

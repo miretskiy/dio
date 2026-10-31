@@ -17,9 +17,9 @@ var errSchedulerClosed = errors.New("iosched: scheduler closed")
 type Scheduler interface {
 	// Submit schedules op and returns its completion Ticket. URingScheduler is a
 	// non-blocking handoff; POSIXScheduler executes the operation before returning.
-	// URingScheduler can reject excess outstanding I/O with ErrRejected when
-	// its shared DiskPolicy is full. Byte/count limits are disabled by default;
-	// the default service-time allowance is 1.5 ms per class.
+	// URingScheduler rejects I/O with ErrRejected while its DiskPolicy's
+	// backlog limit for that class is reached. Backlog limits are disabled by
+	// default; the default dispatch cap is 1.5 ms of service time per class.
 	//
 	// After an accepted submission, Ticket.Wait returns its result and
 	// Ticket.Done offers completion to a select; SubmitNotify also runs a brief

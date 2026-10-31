@@ -42,23 +42,36 @@ func TestBudgetServiceTime(t *testing.T) {
 			require.Equal(t, tc.writeTime, writeTime)
 		})
 	}
-	off := NewDiskPolicy(WithoutIOBudget())
-	require.Zero(t, off.device.reads.serviceTime(1<<20))
-	require.Zero(t, off.device.writes.serviceTime(1<<20))
+}
+
+func TestDisabledGoalChargesNoInFlight(t *testing.T) {
+	p := NewDiskPolicy(WithoutIOBudget(), WithWriteBacklogLimit(time.Second))
+	work := policyWrite(p, 1<<20)
+	p.account(work)
+	require.Zero(t, work.writes.inFlight, "no latency goal: nothing to reserve at dispatch")
+	require.Positive(t, work.writes.backlog, "the backlog is modeled from the rates either way")
+	p.release(work, &testRing)
+	require.Equal(t, DiskStats{}, p.Stats())
 }
 
 func TestBudgetOptions(t *testing.T) {
 	cfg := NewDiskPolicy(WithReadBandwidth(1), WithReadIOPS(2), WithWriteBandwidth(3), WithWriteIOPS(4), WithLatencyGoal(5*time.Millisecond))
 	require.Equal(t, deviceIO{latency: 5 * time.Millisecond, bytesPerSecond: 1, iops: 2}, cfg.device.reads)
 	require.Equal(t, deviceIO{latency: 5 * time.Millisecond, bytesPerSecond: 3, iops: 4}, cfg.device.writes)
-	cfg = NewDiskPolicy(WithLatencyGoal(-1), WithReadIOPS(0), WithWriteBandwidth(-1), WithRejectWriteBacklog(-1),
-		WithWriteBacklogLowWatermark(-7))
+	cfg = NewDiskPolicy(WithLatencyGoal(-1), WithReadIOPS(0), WithWriteBandwidth(-1), WithWriteBacklogLimit(-1),
+		WithWriteBacklogRecovery(-7), WithReadBacklogLimit(-1))
 	require.Zero(t, cfg.device.reads.latency, "a non-positive goal disables pacing")
 	require.Zero(t, cfg.device.writes.latency)
 	require.Equal(t, DefaultReadIOPS, cfg.device.reads.iops, "a non-positive rate keeps the default")
 	require.Equal(t, DefaultWriteBandwidth, cfg.device.writes.bytesPerSecond)
-	require.Zero(t, cfg.writeBudget.maxOutstandingBytes, "a non-positive limit disables it")
-	require.EqualValues(t, -1, cfg.writeBudget.lowWatermark)
+	require.Zero(t, cfg.writeBudget.limit, "a non-positive limit disables it")
+	require.Zero(t, cfg.readBudget.limit)
+	require.EqualValues(t, -1, cfg.writeBudget.recovery)
+	cfg = NewDiskPolicy(WithWriteBacklogLimit(time.Second), WithWriteBacklogRecovery(200*time.Millisecond),
+		WithReadBacklogLimit(time.Millisecond))
+	require.EqualValues(t, time.Second, cfg.writeBudget.limit)
+	require.EqualValues(t, 200*time.Millisecond, cfg.writeBudget.recovery)
+	require.EqualValues(t, time.Millisecond, cfg.readBudget.limit)
 	cfg = NewDiskPolicy(WithLatencyGoal(time.Millisecond), WithoutReadIOBudget())
 	require.Zero(t, cfg.device.reads.latency)
 	require.Equal(t, time.Millisecond, cfg.device.writes.latency)
@@ -78,45 +91,42 @@ func TestSchedulerOptionDefaults(t *testing.T) {
 // testRing is the ring counter for policy tests that never dispatch.
 var testRing ringInFlight
 
+// nanosPerByte models one byte as one nanosecond with no IOPS floor.
+var nanosPerByte = []DiskPolicyOption{WithReadBandwidth(1e9), WithReadIOPS(1e9), WithWriteBandwidth(1e9), WithWriteIOPS(1e9)}
+
+func policy(opts ...DiskPolicyOption) *DiskPolicy {
+	return NewDiskPolicy(append(nanosPerByte, opts...)...)
+}
+
 func policyWrite(p *DiskPolicy, bytes int) *submission {
 	work := prepareForTest(WriteOp(nil, make([]byte, bytes), 0))
-	work.writes = ioCharge{ops: 1, bytes: int64(bytes), serviceTime: p.device.writes.serviceTime(int64(bytes))}
+	t := p.device.writes.serviceTime(int64(bytes))
+	work.writes = ioCharge{backlog: t, inFlight: t}
 	return work
 }
 
-func TestDiskAdmissionLimits(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		option DiskPolicyOption
-		want   DiskUsage
-	}{
-		{"bytes", WithRejectWriteBacklog(12), DiskUsage{Bytes: 12}},
-		{"ops", WithRejectWriteQueueDepth(2), DiskUsage{Depth: 2}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			p := NewDiskPolicy(WithoutIOBudget(), tc.option)
-			a, b, next := policyWrite(p, 7), policyWrite(p, 5), policyWrite(p, 1)
-			require.True(t, p.admit(a))
-			require.True(t, p.admit(b))
-			require.Equal(t, DiskStats{}, p.Stats(), "Submit acquires nothing")
-			p.account(a)
-			p.account(b)
-			p.updateAdmission()
-			require.False(t, p.admit(next))
-			require.Equal(t, tc.want, p.Stats().Writes)
-			require.EqualValues(t, 1, next.writes.bytes, "rejection does not mutate request totals")
-			p.release(a, &testRing)
-			require.True(t, p.admit(next))
-			p.account(next)
-			p.release(b, &testRing)
-			p.release(next, &testRing)
-			require.Equal(t, DiskStats{}, p.Stats())
-		})
-	}
+func TestDiskAdmissionLimit(t *testing.T) {
+	p := policy(WithoutIOBudget(), WithWriteBacklogLimit(12))
+	a, b, next := policyWrite(p, 7), policyWrite(p, 5), policyWrite(p, 1)
+	require.True(t, p.admit(a))
+	require.True(t, p.admit(b))
+	require.Equal(t, DiskStats{}, p.Stats(), "Submit acquires nothing")
+	p.account(a)
+	p.account(b)
+	p.updateAdmission()
+	require.False(t, p.admit(next))
+	require.Equal(t, DiskUsage{Backlog: 12}, p.Stats().Writes)
+	require.EqualValues(t, 1, next.writes.backlog, "rejection does not mutate request totals")
+	p.release(a, &testRing)
+	require.True(t, p.admit(next))
+	p.account(next)
+	p.release(b, &testRing)
+	p.release(next, &testRing)
+	require.Equal(t, DiskStats{}, p.Stats())
 }
 
 func TestDiskAdmissionConcurrent(t *testing.T) {
-	p := NewDiskPolicy(WithoutIOBudget(), WithRejectWriteBacklog(8192), WithRejectWriteQueueDepth(64))
+	p := policy(WithoutIOBudget(), WithWriteBacklogLimit(64*1024))
 	var wg sync.WaitGroup
 	works := make([]*submission, 64)
 	for i := range works {
@@ -128,8 +138,7 @@ func TestDiskAdmissionConcurrent(t *testing.T) {
 		wg.Go(func() { p.account(work); p.updateAdmission() })
 	}
 	wg.Wait()
-	require.EqualValues(t, 64, p.Stats().Writes.Depth)
-	require.EqualValues(t, 64*1024, p.Stats().Writes.Bytes)
+	require.Equal(t, time.Duration(64*1024), p.Stats().Writes.Backlog)
 	require.False(t, p.admit(policyWrite(p, 1)))
 	for _, work := range works {
 		wg.Go(func() { p.release(work, &testRing) })
@@ -139,20 +148,23 @@ func TestDiskAdmissionConcurrent(t *testing.T) {
 	require.True(t, p.admit(policyWrite(p, 1)), "completion reopens the circuit")
 }
 
+// eighthSecondPerByte models one write byte as 125 ms.
+var eighthSecondPerByte = []DiskPolicyOption{WithWriteBandwidth(8)}
+
 func TestWriteBacklogRecovery(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		p := NewDiskPolicy(WithoutIOBudget(), WithRejectWriteBacklog(16),
-			WithWriteBacklogLowWatermark(2), WithWriteBandwidth(8), WithRejectReadBacklog(16))
+		p := NewDiskPolicy(append(eighthSecondPerByte, WithoutIOBudget(), WithWriteBacklogLimit(2*time.Second),
+			WithWriteBacklogRecovery(250*time.Millisecond), WithReadBacklogLimit(time.Hour))...)
 		a, b := policyWrite(p, 12), policyWrite(p, 4)
 		p.account(a)
 		p.account(b)
-		p.updateAdmission() // (16 - 2) / 8 = 1.75 seconds.
+		p.updateAdmission() // 2 s - 250 ms = 1.75 s.
 		require.False(t, p.admit(policyWrite(p, 1)))
 		p.release(a, &testRing)
 		p.release(b, &testRing)
 		require.Equal(t, DiskStats{}, p.Stats())
 		require.False(t, p.admit(policyWrite(p, 1)), "early completion does not cancel the recovery interval")
-		read := &submission{reads: ioCharge{ops: 1, bytes: 4}}
+		read := &submission{reads: ioCharge{backlog: 4}}
 		require.True(t, p.admit(read), "reads continue during write recovery")
 		p.account(read)
 		p.release(read, &testRing)
@@ -175,8 +187,8 @@ func TestCoordinatorRecoveryEstimate(t *testing.T) {
 	for _, bytes := range []int{16, 20} {
 		t.Run(strconv.Itoa(bytes), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				p := NewDiskPolicy(WithoutIOBudget(), WithRejectWriteBacklog(16),
-					WithWriteBacklogLowWatermark(4), WithWriteBandwidth(8))
+				p := NewDiskPolicy(append(eighthSecondPerByte, WithoutIOBudget(), WithWriteBacklogLimit(2*time.Second),
+					WithWriteBacklogRecovery(500*time.Millisecond))...)
 				work := policyWrite(p, bytes)
 				p.account(work)
 				var wg sync.WaitGroup
@@ -203,7 +215,7 @@ func TestCoordinatorRecoveryEstimate(t *testing.T) {
 }
 
 func TestCoordinatorSkipsAlreadyDrainedBacklog(t *testing.T) {
-	p := NewDiskPolicy(WithoutIOBudget(), WithRejectWriteBacklog(16), WithWriteBacklogLowWatermark(0))
+	p := policy(WithoutIOBudget(), WithWriteBacklogLimit(16), WithWriteBacklogRecovery(0))
 	work := policyWrite(p, 16)
 	p.account(work)
 	p.release(work, &testRing)
@@ -211,7 +223,7 @@ func TestCoordinatorSkipsAlreadyDrainedBacklog(t *testing.T) {
 }
 
 func TestDiskServiceTimeDispatch(t *testing.T) {
-	p := NewDiskPolicy(WithLatencyGoal(100), WithWriteBandwidth(1e9), WithWriteIOPS(1e9))
+	p := policy(WithLatencyGoal(100))
 	var ring, other ringInFlight
 	works := make([]*submission, 8)
 	dispatched := 0
@@ -226,14 +238,14 @@ func TestDiskServiceTimeDispatch(t *testing.T) {
 		}
 	}
 	require.Equal(t, 4, dispatched)
-	require.Equal(t, time.Duration(100), p.Stats().Writes.ServiceTime)
+	require.Equal(t, time.Duration(100), p.Stats().Writes.InFlight)
 	require.EqualValues(t, 100, ring.writes)
 
 	idle := policyWrite(p, 25)
 	p.account(idle)
 	require.True(t, p.dispatch(idle, &other), "a ring with nothing in flight never waits on other rings")
 	idle.state = workIssued
-	require.Equal(t, time.Duration(125), p.Stats().Writes.ServiceTime)
+	require.Equal(t, time.Duration(125), p.Stats().Writes.InFlight)
 	busy := policyWrite(p, 25)
 	p.account(busy)
 	require.False(t, p.dispatch(busy, &other), "overcommit is one chain per ring")
@@ -269,13 +281,13 @@ func TestDiskServiceTimeDispatch(t *testing.T) {
 func TestMixedDispatchRollback(t *testing.T) {
 	p := NewDiskPolicy(WithLatencyGoal(100))
 	ring := ringInFlight{reads: 1, writes: 1} // busy in both classes
-	held := &submission{writes: ioCharge{serviceTime: 100}}
+	held := &submission{writes: ioCharge{inFlight: 100}}
 	require.True(t, p.dispatch(held, &ring))
 	held.state = workIssued
-	mixed := &submission{reads: ioCharge{serviceTime: 50}, writes: ioCharge{serviceTime: 50}}
+	mixed := &submission{reads: ioCharge{inFlight: 50}, writes: ioCharge{inFlight: 50}}
 	require.False(t, p.dispatch(mixed, &ring))
-	require.Zero(t, p.Stats().Reads.ServiceTime)
-	require.Equal(t, time.Duration(100), p.Stats().Writes.ServiceTime)
+	require.Zero(t, p.Stats().Reads.InFlight)
+	require.Equal(t, time.Duration(100), p.Stats().Writes.InFlight)
 	require.Equal(t, ringInFlight{reads: 1, writes: 101}, ring, "a failed dispatch charges the ring nothing")
 	p.release(held, &ring)
 	require.True(t, p.dispatch(mixed, &ring))
@@ -286,7 +298,7 @@ func TestMixedDispatchRollback(t *testing.T) {
 }
 
 func TestSharedDiskPolicy(t *testing.T) {
-	p := NewDiskPolicy(WithLatencyGoal(time.Millisecond), WithWriteBandwidth(1234), WithRejectWriteBacklog(2048), WithoutReadIOBudget())
+	p := policy(WithLatencyGoal(time.Millisecond), WithWriteBacklogLimit(2048), WithoutReadIOBudget())
 	a := makeSchedulerConfig([]Option{WithDiskPolicy(p), WithCoordinatorCPU(3), WithRingDepth(64)})
 	b := makeSchedulerConfig([]Option{WithDiskPolicy(p)})
 	require.Same(t, p, a.disk)
@@ -305,8 +317,8 @@ var _ func(...DiskPolicyOption) *DiskPolicy = NewDiskPolicy
 
 func TestRecoveryAndDispatchAreIndependent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		p := NewDiskPolicy(WithLatencyGoal(time.Second), WithWriteBandwidth(8),
-			WithRejectWriteBacklog(16), WithWriteBacklogLowWatermark(4))
+		p := NewDiskPolicy(append(eighthSecondPerByte, WithLatencyGoal(time.Second),
+			WithWriteBacklogLimit(2*time.Second), WithWriteBacklogRecovery(500*time.Millisecond))...)
 		var ring ringInFlight
 		first, second := policyWrite(p, 8), policyWrite(p, 8)
 		p.account(first)
@@ -315,7 +327,7 @@ func TestRecoveryAndDispatchAreIndependent(t *testing.T) {
 		require.True(t, p.dispatch(first, &ring))
 		first.state = workIssued
 		require.False(t, p.dispatch(second, &ring))
-		require.Equal(t, time.Second, p.Stats().Writes.ServiceTime)
+		require.Equal(t, time.Second, p.Stats().Writes.InFlight)
 		require.False(t, p.admit(policyWrite(p, 1)))
 		p.completeIO(first, &first.root, &ring)
 		p.release(first, &ring)
