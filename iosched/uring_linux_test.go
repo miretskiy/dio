@@ -392,13 +392,13 @@ func newRegisteredURingSched(t *testing.T) (*iosched.URingScheduler, []alloc.Mem
 	if !iosched.IOUringAvailable {
 		t.Skip("io_uring not available on this kernel")
 	}
-	allocator, err := alloc.NewSlabAllocator(align.HugepageSize)
-	require.NoError(t, err)
-	t.Cleanup(allocator.Close)
 	buffers := make([]alloc.Memory, 8)
+	allocator := alloc.NewAllocator(int64(len(buffers)) * align.BlockSize)
+	t.Cleanup(allocator.Close)
+	var err error
 	regions := make([][]byte, len(buffers))
 	for i := range buffers {
-		buffers[i], err = allocator.TryAcquire()
+		buffers[i], err = allocator.TryAcquire(align.BlockSize)
 		require.NoError(t, err)
 		regions[i] = buffers[i].Bytes()
 		t.Cleanup(func() { buffers[i].Unpin() })
@@ -478,15 +478,14 @@ func TestURing_FixedOp_MultipleSlots(t *testing.T) {
 func TestURing_FixedOp_WithoutRegistration(t *testing.T) {
 	s := newURingSched(t)
 
-	allocator, err := alloc.NewSlabAllocator(align.HugepageSize)
-	require.NoError(t, err)
+	allocator := alloc.NewAllocator(align.BlockSize)
 	defer allocator.Close()
 
 	path := filepath.Join(t.TempDir(), "noreg.dat")
 	require.NoError(t, os.WriteFile(path, make([]byte, align.BlockSize), 0644))
 	f := openRW(t, path)
 
-	slot, err := allocator.TryAcquire()
+	slot, err := allocator.TryAcquire(align.BlockSize)
 	require.NoError(t, err)
 	defer slot.Unpin()
 

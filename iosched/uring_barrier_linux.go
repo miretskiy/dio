@@ -139,8 +139,8 @@ func (c *coordinator) completedOperation(work *submission, op *operation) {
 
 	if op.kind() != OpOpenat && op.kind() != OpClose {
 		state.active--
-		if err := buildutil.Assert(state.active >= 0); err != nil {
-			panic(err)
+		if buildutil.TestMode {
+			buildutil.Assert(state.active >= 0)
 		}
 		if state.closeRemaining != 0 {
 			state.closeRemaining--

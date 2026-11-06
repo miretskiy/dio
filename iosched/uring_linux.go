@@ -490,8 +490,11 @@ func (c *coordinator) run() error {
 		placed, room := c.placeReady(c.sched.config.coalescing)
 
 		// Accepted work needs an issued operation to make progress.
-		if err := buildutil.Assert(c.occupied > doorbellSlots || c.accepted.len == 0); err != nil {
-			return fmt.Errorf("iosched: accepted work has no runnable or issued operation: %w", err)
+		if buildutil.TestMode {
+			buildutil.Assert(c.occupied > doorbellSlots || c.accepted.len == 0)
+		}
+		if c.occupied <= doorbellSlots && c.accepted.len != 0 {
+			return errors.New("iosched: accepted work has no runnable or issued operation")
 		}
 
 		if err := c.submitAndWait(placed, room); err != nil {
@@ -602,8 +605,8 @@ func (c *coordinator) accept(head *submission) {
 
 func (c *coordinator) releaseWait(work *submission) {
 	work.waitCount--
-	if err := buildutil.Assert(work.waitCount >= 0); err != nil {
-		panic(err)
+	if buildutil.TestMode {
+		buildutil.Assert(work.waitCount >= 0)
 	}
 	if work.waitCount == 0 {
 		c.makeReady(work)
@@ -1117,8 +1120,8 @@ func (c *coordinator) finishSync(batch submissionQueue, err error) {
 // then the work itself once nothing more is owed. The fdatasync covering a
 // durable write is retired as its write, the operation it makes durable.
 func (c *coordinator) operationDone(work *submission, op *operation) {
-	if err := buildutil.Assert(work.state == workIssued); err != nil {
-		panic(err)
+	if buildutil.TestMode {
+		buildutil.Assert(work.state == workIssued)
 	}
 	c.completedOperation(work, op)
 	work.remaining--
@@ -1169,8 +1172,8 @@ func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) 
 
 // makeReady moves work whose file barriers have all released to the ready queue.
 func (c *coordinator) makeReady(work *submission) {
-	if err := buildutil.Assert(work.state == workWaiting); err != nil {
-		panic(err)
+	if buildutil.TestMode {
+		buildutil.Assert(work.state == workWaiting)
 	}
 	work.state = workReady
 	c.readyClasses[work.dispatchClass()]++

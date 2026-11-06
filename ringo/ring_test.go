@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"github.com/miretskiy/dio/v2/collections"
+	"github.com/miretskiy/dio/v2/internal/buildutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
@@ -644,12 +645,15 @@ func TestReapCompletionAndGenerationSafety(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, first.slot == second.slot, "slot generation did not advance")
 	// An identity Reap cannot resolve means Ringo's own finality bookkeeping is
-	// wrong, so it asserts. This is a test binary, so the assertion panics
-	// before the production path drops the entry; that path is unobservable
-	// here because buildutil test mode cannot be turned back off.
+	// wrong, so it asserts before the production path drops the entry.
 	fake.complete(first, 0, 0)
 	require.Panics(t, func() { collect(ring.Reap()) },
 		"unresolvable identity did not trip the assertion")
+
+	t.Cleanup(buildutil.EnableTestMode(false))
+	fake.complete(first, 0, 0)
+	require.Empty(t, collect(ring.Reap()), "stale completion must be discarded")
+	require.Equal(t, uint32(3), fake.reaped(), "discarded completion did not advance the queue")
 
 	// Whichever way the assertion goes, no live operation was released.
 	_, live := ring.pending.TryValue(second.slot)

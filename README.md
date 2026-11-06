@@ -7,7 +7,7 @@ the final completion. For applications that want scheduling rather than direct
 ring control, `iosched` provides a higher-level operation and ticket API with
 io_uring and synchronous POSIX backends.
 
-The supporting packages provide aligned memory, fixed-size buffer allocators,
+The supporting packages provide aligned memory, an arena allocator,
 reusable handle-based lists, portable file operations, and a targeted TLS
 read-buffer optimization.
 
@@ -43,7 +43,7 @@ now `alloc`; its allocators return `alloc.Memory` lease handles.
 | [`ringo`](https://pkg.go.dev/github.com/miretskiy/dio/v2/ringo) | Lifetime-safe low-level io_uring operations and resource ownership |
 | [`iosched`](https://pkg.go.dev/github.com/miretskiy/dio/v2/iosched) | A common operation/ticket API over POSIX and io_uring |
 | [`align`](https://pkg.go.dev/github.com/miretskiy/dio/v2/align) | Page-aligned allocation and range arithmetic |
-| [`alloc`](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc) | Owned aligned buffers and extent and slab allocators |
+| [`alloc`](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc) | Owned aligned memory and a fixed-capacity, lock-free arena allocator |
 | [`collections`](https://pkg.go.dev/github.com/miretskiy/dio/v2/collections) | Lists with reusable handles and a concurrent sharded map with per-shard state |
 | [`sys`](https://pkg.go.dev/github.com/miretskiy/dio/v2/sys) | Portable file allocation, syncing, direct I/O, and hole punching |
 | [`netbuf`](https://pkg.go.dev/github.com/miretskiy/dio/v2/netbuf) | TLS read-buffer pre-sizing for golang/go#47672 |
@@ -114,58 +114,69 @@ allocation to `FreeAligned` when finished.
 ## Owned memory and allocators
 
 `alloc.Memory` owns page-aligned storage for direct I/O. Use `alloc.NewMemory(size)`
-for a standalone allocation, or choose an allocator for reusable storage:
-
-| Allocator | Purpose |
-| --- | --- |
-| `ExtentAllocator` | Borrow whole allocations from a bounded pool |
-| `SlabAllocator` | Subdivide one region into fixed-size chunks |
-
-Both implement `Allocator`: `Acquire(ctx)` waits for capacity, `TryAcquire()`
-returns `ErrExhausted` when none is free, and `Close()` releases retained storage.
-Each acquisition returns one contiguous, zeroed `Memory` of the allocator's unit
-size: one chunk or one extent. Backing is mapped up front; pages are committed on
-first use unless `WithWarmup()` is supplied. `WithoutZeroing()` skips zeroing
-for callers that overwrite every byte, such as direct-I/O reads. The slab
-allocator defaults to 4 KiB chunks; `WithChunkSize` changes the size.
-`WithBacking(region)` subdivides an existing page-aligned region instead of
-mapping one; the caller keeps it valid until the allocator is closed and its
-memory released.
+for a standalone allocation, or `alloc.NewAllocator` for reusable allocations
+of up to 128 KiB from one fixed arena:
 
 ```go
-allocator, err := alloc.NewSlabAllocator(
-    64<<20, // one 64 MiB slab
-    alloc.WithChunkSize(128<<10),
-)
-if err != nil {
-    return err
-}
+allocator := alloc.NewAllocator(1 << 30) // a 1 GiB arena
 defer allocator.Close()
 
-mem, err := allocator.Acquire(ctx)
+mem, err := allocator.Acquire(ctx, 20<<10)
 if err != nil {
     return err
 }
 defer mem.Unpin()
-copy(mem.Bytes(), payload)
+// The returned block may be smaller than 20 KiB; use its actual length.
+n, err := source.Read(mem.Bytes())
+_ = n
 ```
+
+`Acquire(ctx, size)` waits for capacity, retrying on a timer; `TryAcquire(size)`
+returns `ErrExhausted` when no pages are free. The requested size is capped at
+`MaxSize()` (128 KiB), then rounded up to a power of two, with a 4 KiB minimum.
+That sets an upper limit: each acquisition returns one contiguous, zeroed
+`Memory`, possibly smaller than requested. Use `len(mem.Bytes())` for its actual
+size, or `Buffer` to combine blocks until the full request is met. Every block fits in one
+128 KiB span and reserves its entire buddy block with one CAS. Each span stores
+two explicit 64 KiB buddy trees in 62 bits of one atomic word. Each tree uses
+heap numbering: node 1 is the root, with children `2*i` and `2*i+1` for node `i`.
+Bits 62 and 63 indicate that the first and second halves, respectively, are
+empty. The empty word is `0xc000000000000000`. These flags are updated in the
+same CAS as the trees. The trees track 4, 8, 16, 32, and 64 KiB blocks; a
+128 KiB allocation claims both trees together. `TryAcquire` and release are
+lock-free; exhaustion never maps additional storage or takes a growth lock.
+Searches select a persistent cursor using the caller's stack address. Each cursor
+retains positions inside and outside a preferred shard; a failed search can
+inspect every span. Buffer growth uses one cursor for the whole request and
+follows neighboring spans across shard boundaries, publishing progress once.
+Allocation marks a block's subtree and ancestors. Release clears the subtree
+and coalesces free buddies upward,
+publishing the entire update in one CAS. The first nonfull span supplies its
+largest eligible block. Masks and bit scans select the size and location
+without looping over size classes; the search does not compare block sizes
+across spans.
+The arena is mapped off the Go heap; pages are committed on first use unless
+`WithWarmup()` is supplied. `WithoutZeroing()` skips zeroing for callers that
+overwrite every byte, such as direct-I/O reads.
 
 `Memory` is a small value naming one lease; copies name the same lease, and
 acquiring memory allocates nothing on the Go heap. Each lease carries a
 generation, checked by every operation, so a handle kept past its lease fails
 `TryInc` and panics on `Unpin` even after the memory is lent again.
-Access the storage through `Memory.Bytes()`, which includes allocator rounding.
-Release memory with `Unpin()` after use, including pending I/O. It returns
-`true` only when this call released the final reference and returned storage to
-its owner. Callers may ignore the result; method values used as `func()` callbacks
-need a wrapper such as `func() { mem.Unpin() }`.
+Access the storage through `Memory.Bytes()`. Release memory with `Unpin()` after
+use, including pending I/O. It returns `true` only when this call released the
+final reference and returned storage to its owner. Callers may ignore the
+result; method values used as `func()` callbacks need a wrapper such as
+`func() { mem.Unpin() }`.
 `TryInc()` retains a reference when sharing memory.
-`WithReleaseHook(func(data []byte))` runs a callback on every final `Unpin`,
-before the memory returns to the allocator. This lets callers account for
-storage until the last borrower releases it.
+
+Internally, claims own raw page ranges without reference counts. Buffer growth
+joins adjacent new ranges before creating one lease per contiguous run. Extending
+an existing unshared lease invalidates its old handles without creating temporary
+leases for the added ranges.
 
 `alloc.Buffer` is a byte stream in the spirit of `bytes.Buffer`, growing by
-acquiring allocator units rather than reallocating. It supports `Read`, `Write`,
+acquiring `Memory` values of potentially different sizes. It supports `Read`, `Write`,
 `ReadFrom`, and `WriteTo`. Growth never moves existing bytes and returns allocation
 errors rather than waiting for capacity; a failed `Write` writes nothing.
 Once every byte has been read, the buffer reuses its memory from the start.
@@ -181,16 +192,23 @@ if _, err := buffer.ReadFrom(source); err != nil {
 _, err = buffer.WriteTo(destination)
 ```
 
+`buffer.Grow(320 << 10)` can obtain 320 KiB as 128 + 128 + 64 KiB, or as more,
+smaller blocks when spans are fragmented. Each `Memory` is one chunk; there is
+no separate chunk size setting. `Grow` requests the remaining bytes until it
+has enough capacity. `ReadFrom` requests up to 128 KiB at a time because the
+remaining stream length is unknown. The Memories need not be adjacent, and
+`Cap()` sums their actual lengths. A failed growth retains Memories already acquired. A standalone
+`NewMemory` can still be used when a larger contiguous mapping is required.
+
 `RawAllocations()` exposes the buffer's `Memory`; obtain an extra reference with
 `TryInc()` before retaining one independently. Reference counts protect lifetime,
 not contents: finish reading shared bytes before the buffer reuses them.
 
-Both concrete allocators expose `Capacity()` and `Available()` byte snapshots.
-Free capacity excludes memory still pinned by readers, writers, or I/O after a
-cache has dropped its reference; it becomes available on the final release. Snapshots
-do not reserve memory; acquisition remains authoritative. Slab availability scans
-its bitmaps, avoiding a shared accounting counter on each allocation/release.
-Return all acquired memory before closing its allocator. See the
+`Capacity()` and `Available()` report byte snapshots. Free capacity excludes
+memory still pinned by readers, writers, or I/O after a cache has dropped its
+reference; it becomes available on the final release. Snapshots do not reserve
+memory; acquisition remains authoritative. Return all acquired memory before
+closing its allocator. See the
 [`alloc` API documentation](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc)
 for configuration and ownership details.
 

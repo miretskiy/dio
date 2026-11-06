@@ -1,312 +1,351 @@
 package alloc
 
 import (
-	"context"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math/bits"
-	"math/rand/v2"
-	"runtime"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"unsafe"
 
-	"github.com/miretskiy/dio/v2/align"
 	"github.com/stretchr/testify/require"
 )
 
-func newSpanAllocator(t testing.TB, spans int, opts ...Option) *SpanAllocator {
-	t.Helper()
-	a, err := NewSpanAllocator(int64(spans)*spanBytes, opts...)
-	require.NoError(t, err)
-	t.Cleanup(a.Close)
-	return a
-}
+func run(start, n int) uint64 { return (uint64(1)<<n - 1) << start }
 
-// pageOf returns the page index of m within a's backing memory.
-func (a *SpanAllocator) pageOf(m Memory) int {
-	return int(uintptr(unsafe.Pointer(&m.Bytes()[0]))-uintptr(unsafe.Pointer(&a.region[0]))) / align.BlockSize
-}
-
-func TestSpanClassLayout(t *testing.T) {
-	for c, pages := range spanClassPages {
-		cl := newSpanAllocator(t, 1).classes[c]
-		slots := min(tagShift, spanPages/pages)
-		require.Equal(t, uint64(c), cl.empty>>tagShift)
-		require.Equal(t, slots, 64-4-bits.OnesCount64(cl.empty&slotMask), "class %d", c)
-		require.LessOrEqual(t, slots*pages, spanPages)
+// refWord builds the specified two-tree encoding from page occupancy, without
+// using production node masks or tree operations. A node is set if any leaf
+// in its range is occupied. Enumerate page ranges breadth-first, from root
+// to leaves, independently of the production claim masks and heap arithmetic.
+func refWord(pages uint64) spanWord {
+	var w uint64
+	for half := range 2 {
+		bit := half * 31
+		for block := 16; block >= 1; block /= 2 {
+			for start := 0; start < 16; start += block {
+				occupied := false
+				for page := start; page < start+block; page++ {
+					occupied = occupied || pages&(1<<(half*16+page)) != 0
+				}
+				if occupied {
+					w |= 1 << bit
+				}
+				bit++
+			}
+		}
+		if pages&(0xffff<<(half*16)) == 0 {
+			w |= 1 << (62 + half)
+		}
 	}
-	for p := 1; p <= maxSmallPages; p++ {
-		c := pagesToClass[p]
-		require.GreaterOrEqual(t, spanClassPages[c], p)
-		if c > 0 {
-			require.Less(t, spanClassPages[c-1], p)
+	return spanWord(w)
+}
+
+// refFit searches largest-first in a plain page bitmap, independently of the
+// production masks and bit scans. Above 16 pages, try every length and start;
+// smaller allocations retain buddy sizes and alignment.
+func refFit(pages uint64, n int) (block, bool) {
+	if n > halfPages {
+		for size := n; size > halfPages; size-- {
+			for start := 0; start+size <= spanPages; start++ {
+				if pages&run(start, size) == 0 {
+					return block{start: start, n: size}, true
+				}
+			}
+		}
+		n = halfPages
+	}
+	for ; n >= 1; n /= 2 {
+		for start := 0; start < spanPages; start += n {
+			if pages&run(start, n) == 0 {
+				return block{start: start, n: n}, true
+			}
+		}
+	}
+	return block{}, false
+}
+
+func TestSpanWordSingleOccupiedPage(t *testing.T) {
+	for page := range spanPages {
+		t.Run(fmt.Sprint(page), func(t *testing.T) {
+			w := refWord(1 << page)
+			next, b, ok := w.reserve(spanPages)
+			require.True(t, ok)
+			want := block{start: page + 1, n: spanPages - page - 1}
+			if page >= halfPages {
+				want = block{start: 0, n: page}
+			}
+			require.Equal(t, want, b)
+			require.Equal(t, refWord(1<<page|run(b.start, b.n)), next)
+			require.Equal(t, spanPages-1-b.n, next.freePages())
+			require.Equal(t, w, next.release(b))
+		})
+	}
+}
+
+// Exercise every possible large range, including free space on both sides.
+// Release neighbors before the large block as well as after it: coalescing
+// must use the current word, not the occupancy when the block was reserved.
+func TestSpanWordLargeRangeRelease(t *testing.T) {
+	for n := halfPages + 1; n <= spanPages; n++ {
+		for start := 0; start+n <= spanPages; start++ {
+			t.Run(fmt.Sprintf("start%d/pages%d", start, n), func(t *testing.T) {
+				occupied := run(0, spanPages) &^ run(start, n)
+				before := refWord(occupied)
+				next, b, ok := before.reserve(spanPages)
+				require.True(t, ok)
+				require.Equal(t, block{start: start, n: n}, b)
+				require.Equal(t, fullSpan, next)
+				require.Equal(t, before, next.release(b))
+
+				for page := range spanPages {
+					if occupied&(1<<page) == 0 {
+						continue
+					}
+					next = next.release(block{start: page, n: 1})
+					occupied &^= 1 << page
+					require.Equal(t, refWord(occupied|run(start, n)), next)
+					require.Equal(t, refWord(occupied), next.release(b))
+				}
+				require.Equal(t, emptySpan, next.release(b))
+			})
 		}
 	}
 }
 
-func TestSpanAllocatorSizes(t *testing.T) {
-	a := newSpanAllocator(t, 128)
-	for _, test := range []struct{ size, pages int }{
-		{1, 1}, {4096, 1}, {4097, 2}, {3 * 4096, 3}, {5 * 4096, 5}, {7 * 4096, 7},
-		{11 * 4096, 12}, {13 * 4096, 16}, {17 * 4096, 21}, {22 * 4096, 32},
-		{32 * 4096, 32}, {33 * 4096, 64}, {64 * 4096, 64},
-		{65 * 4096, 128}, {64 * 64 * 4096, 64 * 64},
+// Every large extent with every possible occupancy of all outside pages.
+// This also models neighbors changing between reservation and release.
+func TestSpanWordLargeExtentsExhaustive(t *testing.T) {
+	checked := 0
+	for n := halfPages + 1; n <= spanPages; n++ {
+		for start := 0; start+n <= spanPages; start++ {
+			extent := run(start, n)
+			outside := run(0, spanPages) &^ extent
+			// Enumerate every subset of the outside pages.
+			for occupied := outside; ; occupied = (occupied - 1) & outside {
+				before := refWord(occupied)
+				want := refWord(occupied | extent)
+				next, b := before.reserveLarge(start, n)
+				if next != want || b != (block{start: start, n: n}) {
+					t.Fatalf("reserveLarge(%032b, %d, %d) = %064b, %+v; want %064b", occupied, start, n, next, b, want)
+				}
+				if got := next.release(b); got != before {
+					t.Fatalf("release(%032b, %+v) = %064b; want %064b", occupied|extent, b, got, before)
+				}
+				checked++
+				if occupied == 0 {
+					break
+				}
+			}
+		}
+	}
+	if checked != 983_041 {
+		t.Fatalf("checked %d cases, want 983041", checked)
+	}
+}
+
+// Merging can produce an interval that is neither a buddy block nor a half
+// edge. Check every occupied interval against every outside pattern in both
+// halves, including independent retained neighbors on both sides.
+func TestSpanWordReleaseMergedRanges(t *testing.T) {
+	for half := range 2 {
+		for n := 1; n <= halfPages; n++ {
+			for start := 0; start+n <= halfPages; start++ {
+				mask := run(start, n)
+				outside := run(0, halfPages) &^ mask
+				for occupied := outside; ; occupied = (occupied - 1) & outside {
+					remaining := occupied<<(half*halfPages) | uint64(0xa55a)<<((1-half)*halfPages)
+					b := block{start: half*halfPages + start, n: n}
+					before := refWord(remaining | run(b.start, b.n))
+					if got, want := before.release(b), refWord(remaining); got != want {
+						t.Fatalf("release(%032b, %+v) = %064b, want %064b", remaining, b, got, want)
+					}
+					if occupied == 0 {
+						break
+					}
+				}
+			}
+		}
+	}
+	for start := range spanPages {
+		for n := 1; start+n <= spanPages; n++ {
+			b := block{start: start, n: n}
+			outside := run(0, spanPages) &^ run(start, n)
+			for _, pattern := range []uint64{0, outside, outside & 0xaaaaaaaa, outside & 0x55555555} {
+				require.Equal(t, refWord(pattern), refWord(pattern|run(start, n)).release(b))
+			}
+		}
+	}
+}
+
+func TestSpanWordLargeRequestFallback(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		pages uint64
+		want  block
+	}{
+		{"A-full", run(0, 16), block{16, 16}},
+		{"B-full", run(16, 16), block{0, 16}},
+		{"boundary-occupied", run(15, 2), block{0, 8}},
+		{"separate-free-ends", run(8, 16), block{0, 8}},
+		{"crossing-only-16", run(0, 8) | run(24, 8), block{8, 8}},
+		{"same-size-prefers-A", run(0, 14) | run(18, 14), block{14, 2}},
+		{"alternating", 0xaaaaaaaa, block{0, 1}},
 	} {
-		t.Run(fmt.Sprint(test.size), func(t *testing.T) {
-			m, err := a.TryAcquire(int64(test.size))
-			require.NoError(t, err)
-			data := m.Bytes()
-			require.Len(t, data, test.pages*align.BlockSize)
-			require.True(t, align.IsAligned(data))
-			require.Equal(t, make([]byte, len(data)), data)
-			for i := range data {
-				data[i] = 0xa5
-			}
-			m.Unpin()
+		t.Run(test.name, func(t *testing.T) {
+			w := refWord(test.pages)
+			next, b, ok := w.reserve(spanPages)
+			require.True(t, ok)
+			require.Equal(t, test.want, b)
+			require.Equal(t, refWord(test.pages|run(b.start, b.n)), next)
+			require.Equal(t, w, next.release(b))
 		})
 	}
-	require.EqualValues(t, 64*spanBytes, a.MaxSize())
-	_, err := a.TryAcquire(64*spanBytes + 1)
-	require.ErrorIs(t, err, ErrTooLarge)
-	require.Equal(t, a.Capacity(), a.Available())
 }
 
-// A request larger than the allocator fails at once instead of waiting.
-func TestSpanAllocatorMaxSize(t *testing.T) {
-	a := newSpanAllocator(t, 3)
-	require.EqualValues(t, 3*spanBytes, a.MaxSize())
-	m, err := a.TryAcquire(a.MaxSize())
-	require.NoError(t, err)
-	m.Unpin()
-	_, err = a.TryAcquire(a.MaxSize() + 1)
-	require.ErrorIs(t, err, ErrTooLarge)
-	_, err = a.Acquire(context.Background(), a.MaxSize()+1)
-	require.ErrorIs(t, err, ErrTooLarge)
-}
-
-// Runs cross inUse words: free spans 32..95 fill neither word alone.
-func TestSpanAllocatorRunAcrossWords(t *testing.T) {
-	a := newSpanAllocator(t, 128)
-	for i := range a.largeHints {
-		a.largeHints[i].word.Store(1)
-	}
-	quarters := make([]Memory, 4) // spans 96, 64, 32, 0 in claim order
-	for i := range quarters {
-		m, err := a.TryAcquire(32 * spanBytes)
-		require.NoError(t, err)
-		require.Equal(t, (3-i)*32, a.pageOf(m)/spanPages)
-		quarters[i] = m
-	}
-	quarters[1].Unpin()
-	quarters[2].Unpin()
-	run, err := a.TryAcquire(64 * spanBytes)
-	require.NoError(t, err)
-	require.Equal(t, 32, a.pageOf(run)/spanPages)
-	_, err = a.TryAcquire(1)
-	require.ErrorIs(t, err, ErrExhausted)
-	run.Unpin()
-
-	// A shorter run takes as much as fits from the upper word.
-	run, err = a.TryAcquire(48 * spanBytes)
-	require.NoError(t, err)
-	require.Equal(t, 48, a.pageOf(run)/spanPages)
-	run.Unpin()
-	quarters[0].Unpin()
-	quarters[3].Unpin()
-	require.Equal(t, a.Capacity(), a.Available())
-	for range 2 {
-		m, err := a.TryAcquire(64 * spanBytes)
-		require.NoError(t, err)
-		defer m.Unpin()
-	}
-}
-
-// Concurrent large runs over a region whose words they must share and cross,
-// including the partial last word. Span ownership is tracked independently.
-func TestSpanAllocatorConcurrentRuns(t *testing.T) {
-	const spans = 200
-	a := newSpanAllocator(t, spans)
-	owner := make([]atomic.Int32, spans)
-	var wg sync.WaitGroup
-	for worker := 1; worker <= 16; worker++ {
-		wg.Go(func() {
-			r := rand.New(rand.NewPCG(uint64(worker), 11))
-			for range 2000 {
-				k := 2 + r.IntN(maxLargeSpans-1)
-				m, err := a.TryAcquire(int64(k) * spanBytes)
-				if err == ErrExhausted {
-					continue
+// Every half state, beside an empty, full, identical, or complementary half.
+// Empty flags must not affect free-page accounting.
+func TestSpanWordReserve(t *testing.T) {
+	for p := range uint64(1 << halfPages) {
+		for _, other := range []uint64{0, 0xFFFF, p, p ^ 0xFFFF} {
+			for _, pages := range []uint64{p | other<<halfPages, other | p<<halfPages} {
+				w := refWord(pages)
+				if got, want := w.freePages(), spanPages-bits.OnesCount64(pages); got != want {
+					t.Fatalf("freePages(%032b) = %d, want %d", pages, got, want)
 				}
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				s := a.pageOf(m) / spanPages
-				for j := s; j < s+k; j++ {
-					if !owner[j].CompareAndSwap(0, int32(worker)) {
-						t.Errorf("span %d already owned by worker %d", j, owner[j].Load())
+				for n := 1; n <= spanPages; n *= 2 {
+					next, b, ok := w.reserve(n)
+					wantBlock, wantOK := refFit(pages, n)
+					if b != wantBlock || ok != wantOK {
+						t.Fatalf("reserve(%032b, %d) = %+v, %v; want %+v, %v", pages, n, b, ok, wantBlock, wantOK)
+					}
+					var want spanWord
+					if wantOK {
+						want = refWord(pages | run(wantBlock.start, wantBlock.n))
+					}
+					if next != want {
+						t.Fatalf("reserve(%032b, %d) left %064b, want %064b", pages, n, next, want)
+					}
+					if ok && next.release(b) != w {
+						t.Fatalf("release after reserve(%032b, %d) did not restore the word", pages, n)
 					}
 				}
-				runtime.Gosched()
-				for j := s; j < s+k; j++ {
-					owner[j].Store(0)
-				}
-				m.Unpin()
 			}
-		})
-	}
-	wg.Wait()
-	require.Equal(t, a.Capacity(), a.Available())
-	for range spans / 64 {
-		m, err := a.TryAcquire(64 * spanBytes)
-		require.NoError(t, err)
-		defer m.Unpin()
-	}
-}
-
-// Filling the region with one class, then freeing it, must leave every span
-// reusable by a large run: empty spans retire or are reclaimed from lanes.
-func TestSpanAllocatorExhaustAndReclaim(t *testing.T) {
-	const spans = 4
-	a := newSpanAllocator(t, spans)
-	var held []Memory
-	for {
-		m, err := a.TryAcquire(4096)
-		if err != nil {
-			require.ErrorIs(t, err, ErrExhausted)
-			break
 		}
-		held = append(held, m)
 	}
-	require.Len(t, held, spans*tagShift)
-	_, err := a.TryAcquire(spanBytes)
-	require.ErrorIs(t, err, ErrExhausted)
-	for _, m := range held {
-		m.Unpin()
+}
+
+// The nearest occupied buddy determines which shared ancestors survive.
+// Include multiple occupied buddies and a whole subtree being released.
+func TestSpanWordReleaseSharedAncestors(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		n         int
+		neighbors uint64
+	}{
+		{"leaf/neighbor-4K", 1, 1 << 5},
+		{"leaf/neighbor-8K", 1, 1 << 6},
+		{"leaf/neighbor-16K", 1, 1 << 0},
+		{"leaf/neighbor-32K", 1, 1 << 8},
+		{"leaf/several-buddies", 1, 1<<0 | 1<<5 | 1<<6 | 1<<8},
+		{"leaf/empty-half", 1, 0},
+		{"subtree/neighbor-16K", 4, 1 << 0},
+		{"subtree/neighbor-32K", 4, 1 << 8},
+		{"subtree/several-buddies", 4, 1<<0 | 1<<8},
+		{"subtree/empty-half", 4, 0},
+	} {
+		for half := range 2 {
+			t.Run(fmt.Sprintf("half%d/%s", half, test.name), func(t *testing.T) {
+				b := block{start: half*halfPages + 4, n: test.n}
+				// Keep one page in the other half occupied throughout.
+				remaining := test.neighbors<<(half*halfPages) | 1<<((1-half)*halfPages)
+				w := refWord(remaining | run(b.start, b.n))
+				require.Equal(t, refWord(remaining), w.release(b))
+			})
+		}
 	}
-	require.Equal(t, a.Capacity(), a.Available())
-	all, err := a.TryAcquire(spans * spanBytes)
-	require.NoError(t, err, "idle class spans must be reclaimed for a large run")
-	require.Zero(t, a.Available())
-	_, err = a.TryAcquire(1)
-	require.ErrorIs(t, err, ErrExhausted)
-	all.Unpin()
-	require.Equal(t, a.Capacity(), a.Available())
 }
 
-func TestSpanAllocatorPlacement(t *testing.T) {
-	a := newSpanAllocator(t, 8)
-	small, err := a.TryAcquire(4096)
-	require.NoError(t, err)
-	defer small.Unpin()
-	medium, err := a.TryAcquire(8 * 4096)
-	require.NoError(t, err)
-	defer medium.Unpin()
-	large, err := a.TryAcquire(spanBytes + 1)
-	require.NoError(t, err)
-	defer large.Unpin()
-	require.Equal(t, 0, a.pageOf(small)/spanPages, "class spans pack from the bottom")
-	require.Equal(t, 1, a.pageOf(medium)/spanPages)
-	require.Equal(t, 6, a.pageOf(large)/spanPages, "large runs pack from the top")
-	again, err := a.TryAcquire(4096)
-	require.NoError(t, err)
-	defer again.Unpin()
-	require.Equal(t, 0, a.pageOf(again)/spanPages, "a partial span is reused")
-}
-
-func TestSpanAllocatorAcquireCancel(t *testing.T) {
-	a := newSpanAllocator(t, 1)
-	m, err := a.TryAcquire(spanBytes)
-	require.NoError(t, err)
-	defer m.Unpin()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = a.Acquire(ctx, 1)
-	require.ErrorIs(t, err, context.Canceled)
-}
-
-var spanTestSizes = []int{1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64, 100, 128}
-
-// Concurrent mixed sizes. Page ownership is tracked independently to detect
-// overlapping allocations, and contents are checked after yielding.
-func TestSpanAllocatorConcurrent(t *testing.T) {
-	const spans = 64
-	a := newSpanAllocator(t, spans)
-	owner := make([]atomic.Int32, spans*spanPages)
-	var wg sync.WaitGroup
-	for worker := 1; worker <= 32; worker++ {
-		wg.Go(func() {
-			r := rand.New(rand.NewPCG(uint64(worker), 7))
-			var held []Memory
-			for i := range 3000 {
-				if len(held) > 0 && (len(held) > 8 || r.IntN(2) == 0) {
-					j := r.IntN(len(held))
-					m := held[j]
-					held[j] = held[len(held)-1]
-					held = held[:len(held)-1]
-					data := m.Bytes()
-					if data[0] != byte(worker) || data[len(data)-1] != byte(worker) {
-						t.Error("memory overwritten by another borrower")
+// Release every fully occupied buddy block in every half occupancy pattern,
+// including blocks that reserve would not choose first. The other half stays
+// partially occupied to catch accidental changes across the tree boundary.
+func TestSpanWordRelease(t *testing.T) {
+	for p := range uint64(1 << halfPages) {
+		for half := range 2 {
+			shift := half * halfPages
+			pages := p<<shift | uint64(0xa55a)<<((1-half)*halfPages)
+			w := refWord(pages)
+			for n := 1; n <= halfPages; n *= 2 {
+				for start := 0; start < halfPages; start += n {
+					mask := run(start, n)
+					if p&mask != mask {
+						continue
 					}
-					p := a.pageOf(m)
-					for k := range len(data) / align.BlockSize {
-						owner[p+k].Store(0)
+					b := block{start: shift + start, n: n}
+					want := refWord(pages &^ (mask << shift))
+					if got := w.release(b); got != want {
+						t.Fatalf("release(%032b, %+v) = %064b, want %064b", pages, b, got, want)
 					}
-					m.Unpin()
-					continue
-				}
-				m, err := a.TryAcquire(int64(spanTestSizes[r.IntN(len(spanTestSizes))]) * align.BlockSize)
-				if err == ErrExhausted {
-					continue
-				}
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				data := m.Bytes()
-				p := a.pageOf(m)
-				for k := range len(data) / align.BlockSize {
-					if !owner[p+k].CompareAndSwap(0, int32(worker)) {
-						t.Errorf("page %d already owned by worker %d", p+k, owner[p+k].Load())
-					}
-				}
-				data[0], data[len(data)-1] = byte(worker), byte(worker)
-				held = append(held, m)
-				if i%16 == 0 {
-					runtime.Gosched()
 				}
 			}
-			for _, m := range held {
-				p := a.pageOf(m)
-				for k := range len(m.Bytes()) / align.BlockSize {
-					owner[p+k].Store(0)
+		}
+	}
+}
+
+// Matches of a snapshot's empty-span pattern must start at word boundaries,
+// including when two nonempty spans have adjacent empty inner halves.
+func TestSpanWordEmptyPattern(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		order binary.ByteOrder
+	}{
+		{"little", binary.LittleEndian},
+		{"big", binary.BigEndian},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			empty := uint64(refWord(0))
+			var pattern [24]byte
+			for i := 0; i < len(pattern); i += 8 {
+				test.order.PutUint64(pattern[i:], empty)
+			}
+			var data [64]byte
+			for pages := uint64(1); pages < 1<<16; pages++ {
+				left, right := uint64(refWord(pages)), uint64(refWord(pages<<16))
+				// Both occupied includes words with a zero high byte, e.g. pages 0 and 16.
+				both := uint64(refWord(pages | pages<<16))
+				for _, word := range []uint64{left, right, both} {
+					lowestByte := bits.TrailingZeros64(word) &^ 7
+					if byte(word>>lowestByte) == 0xc0 {
+						t.Fatalf("nonempty word %016x has 0xc0 as its lowest nonzero byte", word)
+					}
 				}
-				m.Unpin()
+				for i, word := range [...]uint64{both, left, right, empty, empty, right, left, both} {
+					test.order.PutUint64(data[i*8:], word)
+				}
+				for _, search := range []struct {
+					n       int
+					offsets []int
+				}{
+					{8, []int{24, 32}},
+					{16, []int{24}},
+					{24, nil},
+				} {
+					cursor, found := 0, 0
+					for {
+						at := bytes.Index(data[cursor:], pattern[:search.n])
+						if at < 0 {
+							break
+						}
+						at += cursor
+						if found >= len(search.offsets) || at != search.offsets[found] {
+							t.Fatalf("pages %016b, %d-byte match at %d; want offsets %v", pages, search.n, at, search.offsets)
+						}
+						found++
+						cursor = at + 1 // Include overlapping and unaligned matches.
+					}
+					if found != len(search.offsets) {
+						t.Fatalf("pages %016b, %d-byte search found %d matches; want %v", pages, search.n, found, search.offsets)
+					}
+				}
 			}
 		})
 	}
-	wg.Wait()
-	require.Equal(t, a.Capacity(), a.Available())
-	all, err := a.TryAcquire(spans * spanBytes)
-	require.NoError(t, err, "every span must be reusable once all memory is returned")
-	all.Unpin()
-}
-
-func TestSpanAllocatorBacking(t *testing.T) {
-	backing := NewMemory(3 * spanBytes)
-	defer backing.Unpin()
-	a, err := NewSpanAllocator(0, WithBacking(backing.Bytes()))
-	require.NoError(t, err)
-	require.EqualValues(t, 3*spanBytes, a.Capacity())
-	m, err := a.TryAcquire(spanBytes)
-	require.NoError(t, err)
-	m.Bytes()[0] = 1
-	m.Unpin()
-	a.Close()
-
-	_, err = NewSpanAllocator(0, WithBacking(backing.Bytes()[:spanBytes-4096]))
-	require.ErrorContains(t, err, "at least 256 KiB")
-	_, err = NewSpanAllocator(0, WithBacking(backing.Bytes()[1:]))
-	require.ErrorContains(t, err, "page-aligned")
 }

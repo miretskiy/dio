@@ -4,16 +4,19 @@ import (
 	"flag"
 	"os"
 	"strings"
-	"sync/atomic"
 )
 
-// testMode is set at package init by detecting whether the current process is
-// a Go test binary. Once set it is never cleared, so [TestMode] is a single
-// atomic load on the hot path.
-var testMode atomic.Bool
+// TestMode enables invariant assertions. It defaults to true in Go test
+// binaries, including benchmarks, and false otherwise. Set it before starting
+// concurrent work; it must not change while assertions may be checked.
+var TestMode = isTestBinary()
 
-func init() {
-	testMode.Store(isTestBinary())
+// EnableTestMode sets TestMode and returns a function that restores its previous
+// value. Neither call may race concurrent work that checks assertions.
+func EnableTestMode(enabled bool) func() {
+	previous := TestMode
+	TestMode = enabled
+	return func() { TestMode = previous }
 }
 
 func isTestBinary() bool {
@@ -29,12 +32,3 @@ func isTestBinary() bool {
 	return strings.HasSuffix(os.Args[0], ".test") ||
 		strings.HasSuffix(os.Args[0], "_test")
 }
-
-// TestMode reports whether the current process is a Go test binary. Determined
-// once at package init; subsequent calls are a single atomic load.
-func TestMode() bool { return testMode.Load() }
-
-// EnableTestMode forces test mode on. Use from test infrastructure whose
-// binary doesn't fit the standard "go test" convention (e.g. a bespoke test
-// runner whose argv0 doesn't end in ".test").
-func EnableTestMode() { testMode.Store(true) }

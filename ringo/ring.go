@@ -407,7 +407,10 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 			// no operation the caller holds, and reporting its raw user_data as
 			// a Handle would resurrect the stale identity the generation tag
 			// exists to reject.
-			if err := buildutil.Assert(resolved); err != nil {
+			if buildutil.TestMode {
+				buildutil.Assert(resolved)
+			}
+			if !resolved {
 				continue
 			}
 

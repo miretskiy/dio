@@ -1,650 +1,855 @@
 package alloc
 
 import (
-	"context"
-	"errors"
 	"math/bits"
-	"runtime"
-	"sync/atomic"
-	"time"
-	"unsafe"
 
 	"github.com/miretskiy/dio/v2/align"
 )
 
-// ErrTooLarge means a request exceeds the largest supported allocation.
-var ErrTooLarge = errors.New("alloc: allocation too large")
-
-// SpanAllocator lends variable-size, page-aligned, contiguous memory from one
-// region. Small requests claim a slot with a single CAS.
-//
-// The region is divided into 256 KiB spans of 64 pages. A request of up to
-// 128 KiB is rounded up to a size class and served from a span assigned to
-// that class, cut into equal slots. A larger request takes up to 64 whole
-// contiguous spans. Spans are assigned to classes on demand and returned when
-// empty:
-//
-//	region:  span 0    span 1    span 2              span n-2  span n-1
-//	        +---------+---------+---------+--   --+---------+---------+
-//	        | class 0 | class 5 |  free   |  ...  |   large run (2)   |
-//	        +---------+---------+---------+--   --+---------+---------+
-//	         class spans: lowest first   -->   <--   large runs: from the top
-//
-//	span 1 (class 5: 8-page slots, 8 per span):
-//	        page 0    8         16        24                  56       63
-//	        +---------+---------+---------+--   --+---------+
-//	        | slot 0  | slot 1  | slot 2  |  ...  | slot 7  |
-//	        +---------+---------+---------+--   --+---------+
-//
-// Each span has a 64-bit slot word, kept outside the region. All ones marks a
-// span that is free or part of a large run:
-//
-//	+-------+------------------------------------------+
-//	| class | one bit per slot: 1 = taken (or unused)  |
-//	+-------+------------------------------------------+
-//	 4 bits   60 bits
-//
-// Region-wide bitmaps have one bit per span, 64 spans per word. They change
-// when a span changes state and are scanned in searches, so they are packed
-// densely:
-//
-//	inUse                the span is in use (in a class or a large run)
-//	nonFull (per class)  the span is in this class and has a free slot
-//
-// Acquiring a slot of a class tries, in order:
-//  1. one of the class's active spans, cached spans picked per goroutine;
-//  2. the lowest span in nonFull;
-//  3. the lowest free span, which joins the class.
-type SpanAllocator struct {
-	region        []byte  // whole spans
-	mapped        []byte  // the region, when the allocator mapped it
-	leases        *leases // one unit per page; an allocation uses its first page
-	spans         []spanState
-	inUse         bitmap // per span: in a class or a large run
-	classes       [len(spanClassPages)]sizeClass
-	largeHints    []largeHint // per goroutine slot: inUse word to search first
-	retryInterval time.Duration
-	noZero        bool
-}
-
-// SpanSize is a SpanAllocator's span: regions are used in whole spans, and
-// requests above 128 KiB round up to whole spans.
-const SpanSize = spanBytes
-
+// A span holds 32 pages of 4 KiB each (align.BlockSize), for 128 KiB total.
 const (
-	spanPages     = 64
-	spanBytes     = spanPages * align.BlockSize
-	maxSmallPages = 32
-	maxLargeSpans = 64 // A run spans at most two inUse words.
-	tagShift      = 60
-	tagMask       = uint64(0xF) << tagShift
-	slotMask      = ^tagMask
+	spanPages = 32
+	spanBytes = spanPages * align.BlockSize
 )
 
-// spanClassPages lists slot sizes in pages, chosen so slots fill a span:
-var spanClassPages = [...]int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16, 21, 32}
-
-// Class tags are 4 bits, and the all-ones tag marks spans outside any class.
-const _ = uint(15 - len(spanClassPages))
-
-// pagesToClass maps a page count of 1..32 to the smallest class that fits.
-var pagesToClass = func() (t [maxSmallPages + 1]uint8) {
-	c := 0
-	for p := 1; p <= maxSmallPages; p++ {
-		for spanClassPages[c] < p {
-			c++
-		}
-		t[p] = uint8(c)
-	}
-	return t
-}()
-
-// bitmap is a dense atomic bitmap, 64 bits per word.
-type bitmap []atomic.Uint64
-
-func newBitmap(bits int) bitmap { return make(bitmap, (bits+63)/64) }
-
-func (b bitmap) has(i int) bool { return b[i/64].Load()&(1<<(i%64)) != 0 }
-
-// set sets bit i and reports whether its word was zero before.
-func (b bitmap) set(i int) (wasZero bool) { return b[i/64].Or(1<<(i%64)) == 0 }
-
-// clear clears bit i and reports whether its word is now zero.
-func (b bitmap) clear(i int) (nowZero bool) {
-	m := uint64(1) << (i % 64)
-	return b[i/64].And(^m)&^m == 0
-}
-
-// wordHas reports whether the word holding bit i has any bit set.
-func (b bitmap) wordHas(i int) bool { return b[i/64].Load() != 0 }
-
-// spanState fills a cache line: concurrent acquisitions and releases on
-// different spans write their slot words independently.
-type spanState struct {
-	slots atomic.Uint64
-	held  atomic.Int32 // active entries caching this span
-	_     [52]byte
-}
-
-// largeHint remembers the inUse word where a goroutine slot last claimed a
-// large run. It fills a cache line for the same reason as activeSpan.
-type largeHint struct {
-	word atomic.Int32
-	_    [60]byte
-}
-
-// activeSpan caches a span that acquisitions of its class try first. Each
-// class has GOMAXPROCS entries, the most goroutines that can run at once,
-// spreading concurrent acquisitions across spans. An acquisition picks its
-// entry with entryIndex. An entry fills a cache line so replacing it leaves the
-// others cached in every core. Unmeasured: entries change only when a span fills.
-type activeSpan struct {
-	span atomic.Int32 // span index + 1; zero means none
-	_    [60]byte
-}
-
-type sizeClass struct {
-	pages        int
-	tag          uint64
-	empty        uint64 // slot word with every slot free
-	nonFull      bitmap // per span: in this class, with a free slot; see clearNonFull
-	nonFullIndex bitmap // per nonFull word: has a bit set; bounds the search
-	active       []activeSpan
-}
-
-// NewSpanAllocator creates an allocator over size bytes rounded up to whole
-// 256 KiB spans, mapped during construction. WithBacking instead supplies a
-// page-aligned region of at least one span, in which case size is ignored.
-// WithWarmup commits all pages.
-func NewSpanAllocator(size int64, opts ...Option) (*SpanAllocator, error) {
-	cfg := allocatorConfig{retryInterval: 100 * time.Millisecond}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	if cfg.chunkSize != 0 {
-		return nil, errors.New("alloc: WithChunkSize requires NewSlabAllocator")
-	}
-	var mapped []byte
-	region := cfg.backing
-	if region == nil {
-		// Round size up to whole spans: ceil(size / spanBytes) * spanBytes.
-		mapped = align.AllocAligned((size + spanBytes - 1) / spanBytes * spanBytes)
-		region = mapped
-	} else if len(region) < spanBytes || !align.IsAligned(region) {
-		return nil, errors.New("alloc: backing must be page-aligned and at least 256 KiB")
-	}
-	n := len(region) / spanBytes
-	region = region[: n*spanBytes : n*spanBytes]
-	if cfg.warmup {
-		warmup(region, align.BlockSize)
-	}
-	a := &SpanAllocator{
-		region:        region,
-		mapped:        mapped,
-		spans:         make([]spanState, n),
-		inUse:         newBitmap(n),
-		largeHints:    make([]largeHint, runtime.GOMAXPROCS(0)),
-		retryInterval: cfg.retryInterval,
-		noZero:        cfg.noZero,
-	}
-	for i := range a.spans {
-		a.spans[i].slots.Store(^uint64(0))
-	}
-	// Spread first searches over the top words, one per goroutine slot.
-	for i := range a.largeHints {
-		a.largeHints[i].word.Store(int32(len(a.inUse) - 1 - i%len(a.inUse)))
-	}
-	// inUse holds 64 spans per word. Mark bits past the last span as in use
-	// so claimSpans never returns a span that does not exist.
-	if tail := n % 64; tail != 0 {
-		a.inUse[len(a.inUse)-1].Store(^uint64(0) << tail)
-	}
-	for c := range a.classes {
-		cl := &a.classes[c]
-		cl.pages = spanClassPages[c]
-		cl.tag = uint64(c) << tagShift
-		cl.empty = cl.tag | slotMask&(^uint64(0)<<min(tagShift, spanPages/cl.pages))
-		cl.nonFull = newBitmap(n)
-		cl.nonFullIndex = newBitmap(len(cl.nonFull))
-		cl.active = make([]activeSpan, runtime.GOMAXPROCS(0))
-	}
-	a.leases = newLeases(n*spanPages, func(page int, data []byte) {
-		a.release(page, len(data)/align.BlockSize)
-	}, cfg.releaseHook)
-	return a, nil
-}
-
-// TryAcquire returns memory of at least size bytes, rounded up to the size
-// class or to whole spans, zeroed unless built WithoutZeroing. It returns
-// ErrExhausted instead of waiting, and ErrTooLarge above MaxSize. Size must be
-// positive.
-func (a *SpanAllocator) TryAcquire(size int64) (Memory, error) {
-	if size > a.MaxSize() {
-		return Memory{}, ErrTooLarge
-	}
-	pages := int((size + align.BlockSize - 1) / align.BlockSize)
-	page, n, ok := a.tryAcquire(pages)
-	if !ok {
-		return Memory{}, ErrExhausted
-	}
-	off := page * align.BlockSize
-	data := a.region[off : off+n*align.BlockSize]
-	if !a.noZero {
-		clear(data)
-	}
-	return a.leases.lease(page, data), nil
-}
-
-// Acquire tries immediately, then retries every 100 ms (or WithRetryInterval)
-// when exhausted. Context cancellation interrupts the wait.
-func (a *SpanAllocator) Acquire(ctx context.Context, size int64) (Memory, error) {
-	if m, err := a.TryAcquire(size); err != ErrExhausted {
-		return m, err
-	}
-	timer := time.NewTimer(a.retryInterval)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return Memory{}, ctx.Err()
-		case <-timer.C:
-			if m, err := a.TryAcquire(size); err != ErrExhausted {
-				return m, err
-			}
-			timer.Reset(a.retryInterval)
-		}
-	}
-}
-
-// Capacity reports the bytes in whole spans. It must not race Close.
-func (a *SpanAllocator) Capacity() int64 { return int64(len(a.spans)) * spanBytes }
-
-// MaxSize reports the largest request the allocator can ever serve: 64 spans
-// (16 MiB), or Capacity if smaller. It needs that many contiguous free spans,
-// so fragmentation can keep such a request waiting.
-func (a *SpanAllocator) MaxSize() int64 {
-	return int64(min(maxLargeSpans, len(a.spans))) * spanBytes
-}
-
-// Available reports a snapshot of free bytes: unassigned and idle spans plus
-// free slots in other class spans. It scans all spans and must not race Close.
-func (a *SpanAllocator) Available() int64 {
-	var pages int
-	for i := range a.spans {
-		w := a.spans[i].slots.Load()
-		if w == ^uint64(0) {
-			if !a.inUse.has(i) {
-				pages += spanPages
-			}
-			continue
-		}
-		cl := &a.classes[w>>tagShift]
-		if w == cl.empty { // Idle: reclaimable as a whole span.
-			pages += spanPages
-			continue
-		}
-		pages += bits.OnesCount64(^w&slotMask) * cl.pages
-	}
-	return int64(pages) * align.BlockSize
-}
-
-// Close unmaps the region if the allocator mapped it. It must not race other
-// use; the caller must release borrowed memory first. Repeated closes are harmless.
-func (a *SpanAllocator) Close() {
-	if a.mapped != nil {
-		align.FreeAligned(a.mapped)
-	}
-	a.region, a.mapped = nil, nil
-}
-
-// tryAcquire returns the first page and page count of a new allocation.
-func (a *SpanAllocator) tryAcquire(pages int) (page, n int, ok bool) {
-	if pages <= maxSmallPages {
-		c := int(pagesToClass[pages])
-		page, ok = a.acquireSlot(c)
-		return page, a.classes[c].pages, ok
-	}
-	k := (pages + spanPages - 1) / spanPages
-	s, ok := a.acquireSpans(k, true)
-	return s * spanPages, k * spanPages, ok
-}
-
-// release frees n pages from page; n is the class or run size tryAcquire returned.
-func (a *SpanAllocator) release(page, n int) {
-	if n <= maxSmallPages {
-		a.releaseSlot(page)
-		return
-	}
-	a.releaseSpans(page/spanPages, n/spanPages)
-}
-
-// releaseSpans frees the run of k spans from s, which may continue into the
-// next inUse word. runMask drops the bits above the first word.
-func (a *SpanAllocator) releaseSpans(s, k int) {
-	a.inUse[s/64].And(^runMask(k, s%64))
-	if over := s%64 + k - 64; over > 0 {
-		a.inUse[s/64+1].And(^runMask(over, 0))
-	}
-}
-
-// acquireSlot claims a slot of class c: active span, then non-full span, then
-// fresh span. When the active span's CAS loses a race, it takes a fresh span
-// directly, so contended entries move to separate spans. When inUse is full,
-// it retries contended non-full spans until it claims a slot.
-func (a *SpanAllocator) acquireSlot(c int) (int, bool) {
-	cl := &a.classes[c]
-	entry := &cl.active[entryIndex(len(cl.active))]
-	busy := false
-	if s := int(entry.span.Load()) - 1; s >= 0 {
-		page, ok, contended := a.claimSlot(s, c, false)
-		if ok {
-			return page, true
-		}
-		busy = contended
-	}
-	if !busy {
-		if page, ok := a.claimNonFull(entry, c, false); ok {
-			return page, true
-		}
-	}
-	if page, ok := a.claimFresh(entry, c); ok {
-		return page, true
-	}
-	// No free span: wait out contention on any non-full span.
-	return a.claimNonFull(entry, c, true)
-}
-
-// claimNonFull claims a slot in a span with its nonFull bit set, lowest first.
-// Without persist, it skips spans whose CAS loses a race.
-func (a *SpanAllocator) claimNonFull(entry *activeSpan, c int, persist bool) (int, bool) {
-	cl := &a.classes[c]
-	for si := range cl.nonFullIndex {
-		for sum := cl.nonFullIndex[si].Load(); sum != 0; sum &= sum - 1 {
-			w := si*64 + bits.TrailingZeros64(sum)
-			for hint := cl.nonFull[w].Load(); hint != 0; hint &= hint - 1 {
-				s := w*64 + bits.TrailingZeros64(hint)
-				if page, ok, _ := a.claimSlot(s, c, persist); ok {
-					a.setActive(entry, s)
-					return page, true
-				}
-			}
-		}
-	}
-	return 0, false
-}
-
-// claimFresh assigns a free span to class c, claims its first slot, and makes
-// it entry's span.
-func (a *SpanAllocator) claimFresh(entry *activeSpan, c int) (int, bool) {
-	cl := &a.classes[c]
-	s, ok := a.acquireSpans(1, false)
-	if !ok {
-		return 0, false
-	}
-	// Publishing the slot word makes the span visible to claimers of class c.
-	a.spans[s].slots.Store(cl.empty | 1)
-	if cl.empty|1|tagMask != ^uint64(0) {
-		a.setNonFull(c, s)
-	}
-	a.setActive(entry, s)
-	return s * spanPages, true
-}
-
-// claimSlot claims a free slot in span s if it belongs to class c. The CAS
-// compares the class bits too, so it fails once the span has moved to another
-// class. Without persist, a lost CAS race returns contended instead of retrying.
-func (a *SpanAllocator) claimSlot(s, c int, persist bool) (page int, ok, contended bool) {
-	cl := &a.classes[c]
-	word := &a.spans[s].slots
-	for {
-		w := word.Load()
-		free := ^w & slotMask
-		if w&tagMask != cl.tag || free == 0 {
-			a.clearNonFull(c, s)
-			return 0, false, contended
-		}
-		i := bits.TrailingZeros64(free)
-		bit := uint64(1) << i
-		if word.CompareAndSwap(w, w|bit) {
-			if free == bit {
-				a.clearNonFull(c, s)
-			}
-			return s*spanPages + i*cl.pages, true, contended
-		}
-		contended = true
-		if !persist {
-			return 0, false, true
-		}
-	}
-}
-
-// releaseSlot frees the slot starting at page. The caller owns the slot, so
-// the span's class is stable until the slot bit is cleared.
-func (a *SpanAllocator) releaseSlot(page int) {
-	s := page / spanPages
-	word := &a.spans[s].slots
-	c := int(word.Load() >> tagShift)
-	cl := &a.classes[c]
-	bit := uint64(1) << (page % spanPages / cl.pages)
-	old := word.And(^bit)
-	if old|tagMask == ^uint64(0) {
-		a.setNonFull(c, s)
-	}
-	if old&^bit == cl.empty {
-		a.retireIfIdle(s)
-	}
-}
-
-// retireIfIdle returns span s to inUse if it is empty in its current class and
-// no active entry holds it. The CAS fails if a slot was claimed meanwhile.
-func (a *SpanAllocator) retireIfIdle(s int) bool {
-	sp := &a.spans[s]
-	if sp.held.Load() != 0 {
-		return false
-	}
-	w := sp.slots.Load()
-	c := int(w >> tagShift)
-	if c >= len(a.classes) || w != a.classes[c].empty || !sp.slots.CompareAndSwap(w, ^uint64(0)) {
-		return false
-	}
-	a.clearNonFullBit(c, s)
-	a.inUse.clear(s)
-	return true
-}
-
-// setActive makes s entry's span. The caller holds a slot in s, so s cannot be
-// retired meanwhile. The span it replaces may have emptied while the entry
-// held it.
-func (a *SpanAllocator) setActive(entry *activeSpan, s int) {
-	old := int(entry.span.Swap(int32(s+1))) - 1
-	if old == s {
-		return
-	}
-	a.spans[s].held.Add(1)
-	if old >= 0 && a.spans[old].held.Add(-1) == 0 {
-		a.retireIfIdle(old)
-	}
-}
-
-// entryIndex picks an active entry from the address of a stack variable. Each
-// goroutine has its own stack, so concurrent callers spread across entries,
-// and a goroutine keeps returning to the same entry, span, and cache lines.
-func entryIndex(n int) int {
-	var local byte
-	h := uint64(uintptr(unsafe.Pointer(&local))) * 0x9E3779B97F4A7C15
-	return int(h >> 32 % uint64(n))
-}
-
-// reclaimIdle releases active entries holding empty spans, or spans that have
-// moved to another class, and retires those spans. It runs only when inUse has
-// no room, and reports whether any span was retired.
-func (a *SpanAllocator) reclaimIdle() bool {
-	retired := false
-	for c := range a.classes {
-		cl := &a.classes[c]
-		for i := range cl.active {
-			entry := &cl.active[i].span
-			s := int(entry.Load()) - 1
-			if s < 0 {
-				continue
-			}
-			w := a.spans[s].slots.Load()
-			if w&tagMask == cl.tag && w != cl.empty || !entry.CompareAndSwap(int32(s+1), 0) {
-				continue
-			}
-			if a.spans[s].held.Add(-1) == 0 {
-				retired = a.retireIfIdle(s) || retired
-			}
-		}
-	}
-	return retired
-}
-
-// setNonFull sets span s's nonFull bit, and its word's nonFullIndex bit when
-// the word was empty.
-func (a *SpanAllocator) setNonFull(c, s int) {
-	cl := &a.classes[c]
-	if !cl.nonFull.has(s) && cl.nonFull.set(s) {
-		cl.nonFullIndex.set(s / 64)
-	}
-}
-
-// clearNonFull clears the hint, then re-checks the span: a concurrent release
-// either sees the cleared bit and sets it again, or this re-check sees its slot.
-func (a *SpanAllocator) clearNonFull(c, s int) {
-	if !a.clearNonFullBit(c, s) {
-		return
-	}
-	if w := a.spans[s].slots.Load(); w&tagMask == a.classes[c].tag && w|tagMask != ^uint64(0) {
-		a.setNonFull(c, s)
-	}
-}
-
-// clearNonFullBit clears span s's nonFull bit and reports whether it was set.
-// When the nonFull word becomes zero, its nonFullIndex bit is cleared and
-// re-checked the same way: a concurrent setter either sees a zero word and
-// sets the index bit, or this re-check sees its bit.
-func (a *SpanAllocator) clearNonFullBit(c, s int) bool {
-	cl := &a.classes[c]
-	if !cl.nonFull.has(s) {
-		return false
-	}
-	if cl.nonFull.clear(s) {
-		cl.nonFullIndex.clear(s / 64)
-		if cl.nonFull.wordHas(s) {
-			cl.nonFullIndex.set(s / 64)
-		}
-	}
-	return true
-}
-
-// acquireSpans claims k contiguous spans, reclaiming idle cached spans once if
-// the bitmap has no room.
-func (a *SpanAllocator) acquireSpans(k int, top bool) (int, bool) {
-	if s := a.claimSpans(k, top); s >= 0 {
-		return s, true
-	}
-	if a.reclaimIdle() {
-		if s := a.claimSpans(k, top); s >= 0 {
-			return s, true
-		}
-	}
-	return 0, false
-}
-
-// claimSpans claims k <= 64 contiguous free spans. Class spans search upward
-// from the bottom; large runs search downward from the goroutine's hint,
-// wrapping around. Each inUse word is tried alone, then with the next word.
-func (a *SpanAllocator) claimSpans(k int, top bool) int {
-	n := len(a.inUse)
-	var hint *largeHint
-	start := 0
-	if top {
-		// Start where this goroutine's last large claim succeeded: concurrent
-		// claims stay on separate words, and a word with room is found first.
-		hint = &a.largeHints[entryIndex(len(a.largeHints))]
-		start = int(hint.word.Load())
-	}
-	for j := range n {
-		i := start + j
-		if top {
-			if i = start - j; i < 0 {
-				i += n
-			}
-		}
-		s := -1
-		for {
-			w := a.inUse[i].Load()
-			starts := runStarts(^w, k)
-			if starts == 0 {
-				break
-			}
-			bit := bits.TrailingZeros64(starts)
-			if top {
-				bit = bits.Len64(starts) - 1
-			}
-			if a.inUse[i].CompareAndSwap(w, w|runMask(k, bit)) {
-				s = i*64 + bit
-				break
-			}
-		}
-		// A run across words needs the top span of word i free.
-		if s < 0 && k > 1 && i+1 < n && a.inUse[i].Load()>>63 == 0 {
-			s = a.claimAcross(i, k)
-		}
-		if s >= 0 {
-			if hint != nil && i != start {
-				hint.word.Store(int32(i))
-			}
-			return s
-		}
-	}
-	return -1
-}
-
-// claimAcross claims k spans that cross from the top of inUse word i into the
-// bottom of word i+1, taking as many as fit from word i+1:
+// A span has two 64 KiB halves, A and B. Each half serves allocations of
+// 4, 8, 16, 32, or 64 KiB. A binary buddy tree describes those possible blocks:
+// the root represents the whole half, its children represent two 32 KiB
+// blocks, and each split halves the block size down to 4 KiB pages.
+// This gives sixteen leaves and 1 + 2 + 4 + 8 + 16 = 31 nodes per tree.
 //
-//	word i:   ...used | below free     word i+1:   above free | used...
+// "Buddies" are the two equal-sized children of the same parent block.
+// When both are free, they can merge back into that parent, recursively.
+// Adjacent blocks with different parents are not buddies and cannot merge.
+const (
+	halfPages = 16
+	treeBits  = 31
+)
+
+// spanWord represents each tree node with one bit. A set bit means some or
+// all pages in the node's block are occupied; a clear bit means the entire
+// block is free. Each half uses heap indices 1..31: node 1 is the root,
+// node i has children 2*i and 2*i+1, parent i/2, and buddy i^1 (except the root).
+// Node i occupies bit i-1 in A, or bit 31+i-1 in B. A covers pages 0..15;
+// B covers pages 16..31. Nodes at a level follow increasing page addresses.
 //
-// It reserves word i first, then word i+1, and clears its word i bits if word
-// i+1 was taken meanwhile. Reserved bits stay unavailable to other claims
-// until then, so the run is returned only when both words are held.
-func (a *SpanAllocator) claimAcross(i, k int) int {
-	lo, hi := &a.inUse[i], &a.inUse[i+1]
-	for {
-		w := lo.Load()
-		above := min(bits.TrailingZeros64(hi.Load()), k-1)
-		below := k - above
-		if above == 0 || below > bits.LeadingZeros64(w) {
-			return -1
-		}
-		lowMask, highMask := runMask(below, 64-below), runMask(above, 0)
-		if !lo.CompareAndSwap(w, w|lowMask) {
-			continue
-		}
-		for {
-			v := hi.Load()
-			if v&highMask != 0 {
-				lo.And(^lowMask)
-				break
-			}
-			if hi.CompareAndSwap(v, v|highMask) {
-				return i*64 + 64 - below
-			}
-		}
-	}
+//	level:       0       1       2       3       4
+//	block size:  4 KiB   8 KiB  16 KiB  32 KiB  64 KiB
+//	heap nodes: 16..31   8..15   4..7    2..3    1
+//	bits in A:  15..30   7..14   3..6    1..2    0
+//	bits in B:  46..61  38..45  34..37  32..33  31
+//
+// Bit 62 means A is empty; bit 63 means B is empty. The trees and empty flags
+// are published together with one CAS by the arena.
+//
+//	memory:      A [0 ... 15] | B [16 ... 31]
+//	leaf fields: A [15 ... 0] | B [31 ... 16]  (each high bit first)
+//
+// A's leading zeros count its free suffix; B's trailing zeros count its free
+// prefix. Together they give the free run crossing A/B, where every run over
+// 16 pages must lie. uint16(w>>15) and uint16(w>>46) isolate these leaf fields,
+// excluding parent bits and empty flags. Smaller runs need a buddy search.
+type spanWord uint64
+
+// An empty span has just its empty flags set. A fully occupied span has all
+// tree bits set and both empty flags clear. One 128 KiB allocation and a full
+// set of smaller allocations share that encoding; Memory records the extent.
+//
+// The high byte can be zero. Instead, consider the lowest nonzero byte:
+// if A is occupied, bit 0 makes the low byte odd; if only B is occupied,
+// bit 31 makes its lowest nonzero byte 0x80. Only an empty span has 0xc0
+// as its lowest nonzero byte, in the high byte of the word.
+// Thus an unaligned little-endian match of seven zeros followed by 0xc0
+// would require the next word to begin with zeros and then 0xc0 before its
+// high byte, which no valid word does. Big endian reverses this argument
+// using the preceding word's suffix. In a consistent snapshot, one or more
+// repeated empty-span patterns can therefore match only at word boundaries.
+const (
+	emptySpan = spanWord(0xc000000000000000)
+	fullSpan  = spanWord(0x3fffffffffffffff)
+)
+
+// block identifies a contiguous interval in pages. reserve returns an aligned
+// buddy block of 1, 2, 4, 8, or 16 pages, or a run of 17..32 pages crossing the
+// half boundary. release also accepts intervals formed by merging adjacent
+// claims. Span operations use a span-relative start; arena claims translate
+// it to an arena-relative start.
+type block struct {
+	start int
+	n     int
 }
 
-// runStarts returns a mask whose bit i is set iff bits i..i+k-1 of free are set.
-func runStarts(free uint64, k int) uint64 {
-	for have := 1; have < k; {
-		step := min(have, k-have)
-		free &= free >> step
-		have += step
+// reserve claims a contiguous block of at most n pages. A whole-span request
+// first tries the free run crossing the half boundary when it exceeds 16 pages.
+// Otherwise, it chooses the largest free buddy block, then the lowest starting
+// page on ties. The caller must round the limit to a size class: 1, 2, 4, 8,
+// 16, or 32 pages. TryAcquire validates this before entering the arena scan.
+// A full span returns zero values and false. The returned block records the
+// actual page count. The caller publishes next by CAS only on success.
+func (w spanWord) reserve(n int) (next spanWord, b block, ok bool) {
+	if w == fullSpan {
+		return 0, block{}, false
 	}
-	return free
+	if n == spanPages {
+		if w == emptySpan {
+			return fullSpan, block{start: 0, n: spanPages}, true
+		}
+		// A run longer than one half must cross the A/B boundary.
+		tail := bits.LeadingZeros16(uint16(w >> 15))
+		head := bits.TrailingZeros16(uint16(w >> 46))
+		if pages := tail + head; pages > halfPages {
+			next, b = w.reserveLarge(halfPages-tail, pages)
+			return next, b, true
+		}
+		n = halfPages
+	}
+	if w != emptySpan {
+		// Folding finds the largest free size class. Search that class in
+		// the original word below so A's lower addresses take priority over B.
+		free := ^w & fullSpan
+		bit := bits.TrailingZeros64(uint64(free | free>>treeBits))
+		n = min(n, claimTab[bit].block.n)
+	}
+
+	level := bits.TrailingZeros(uint(n))
+	free := ^w & buddyTab[level]
+	claim := &claimTab[bits.TrailingZeros64(uint64(free))]
+	next = w | claim.setMask
+	next &^= claim.emptyFlag
+	return next, claim.block, true
 }
 
-// runMask returns k set bits starting at bit start, for 1 <= k <= 64.
-func runMask(k, start int) uint64 { return ^uint64(0) >> (64 - k) << start }
+// release returns b, which must identify a live allocation.
+func (w spanWord) release(b block) spanWord {
+	if b.n == spanPages {
+		return emptySpan
+	}
+	if b.n > halfPages {
+		return w.releaseLarge(b)
+	}
+	if b.n&(b.n-1) != 0 || b.start&(b.n-1) != 0 {
+		return w.releaseSmallRange(b)
+	}
+	level := bits.TrailingZeros(uint(b.n))
+	node := (halfPages + b.start%halfPages) >> level
+	return w.releaseBuddy(b.start/halfPages*treeBits + node - 1)
+}
+
+// Merging can produce a small interval that is not an aligned buddy block.
+func (w spanWord) releaseSmallRange(b block) spanWord {
+	if b.start >= halfPages {
+		return w.releaseHalfRange(1, b.start-halfPages, b.n)
+	}
+	pages := min(b.n, halfPages-b.start)
+	w = w.releaseHalfRange(0, b.start, pages)
+	if pages < b.n {
+		w = w.releaseHalfRange(1, 0, b.n-pages)
+	}
+	return w
+}
+
+// Intersecting a suffix and prefix describes any interval in one half. Unlike
+// an edge, an interior interval can have live neighbors on both sides, so both
+// outside ancestor paths must survive.
+func (w spanWord) releaseHalfRange(half, start, pages int) spanWord {
+	suffix := &edgeTab[halfPages-start].suffix
+	prefix := &edgeTab[start+pages].prefix
+	shift := half * treeBits
+	setMask := spanWord(suffix.setMask&prefix.setMask) << shift
+	keep := w.outsideAncestors(spanWord(suffix.buddyMask)<<shift) |
+		w.outsideAncestors(spanWord(prefix.buddyMask)<<shift)
+	w &^= setMask &^ keep
+	if keep == 0 {
+		w |= 1 << (62 + half)
+	}
+	return w
+}
+
+func (w spanWord) outsideAncestors(mask spanWord) spanWord {
+	occupied := w & mask
+	if occupied == 0 {
+		return 0
+	}
+	return claimTab[bits.Len64(uint64(occupied))-1].setMask
+}
+
+// releaseMasks releases a buddy block, prefix, or suffix within one half.
+// setMask includes the released pages and every node above them; buddyMask
+// selects the maximal outside subtrees whose parents touch the release.
+// Their shared ancestor paths are nested for these supported shapes, so the
+// deepest occupied outside subtree determines all ancestors that must remain.
+func (w spanWord) releaseMasks(setMask, buddyMask, emptyFlag spanWord) spanWord {
+	occupied := w & buddyMask
+	if occupied == 0 {
+		return (w &^ setMask) | emptyFlag
+	}
+	buddy := bits.Len64(uint64(occupied)) - 1
+	keep := claimTab[buddy].setMask
+	return w &^ (setMask &^ keep)
+}
+
+// releaseBuddy clears one buddy subtree, preserving shared ancestors.
+func (w spanWord) releaseBuddy(bit int) spanWord {
+	claim := &claimTab[bit]
+	return w.releaseMasks(claim.setMask, claim.buddyMask, claim.emptyFlag)
+}
+
+// reserveLarge claims an A suffix and B prefix, covering 17..32 pages.
+// Keep this out of reserve: inlining regressed full-span scans on arm64.
+//
+//go:noinline
+func (w spanWord) reserveLarge(start, pages int) (spanWord, block) {
+	aMasks := &edgeTab[halfPages-start].suffix
+	bMasks := &edgeTab[start+pages-halfPages].prefix
+	setMask := spanWord(aMasks.setMask) | spanWord(bMasks.setMask)<<treeBits
+	return (w | setMask) &^ emptySpan, block{start: start, n: pages}
+}
+
+// releaseLarge releases each half once, including whole-span allocations.
+func (w spanWord) releaseLarge(b block) spanWord {
+	aMasks := &edgeTab[halfPages-b.start].suffix
+	bMasks := &edgeTab[b.start+b.n-halfPages].prefix
+	w = w.releaseMasks(spanWord(aMasks.setMask), spanWord(aMasks.buddyMask), 1<<62)
+	return w.releaseMasks(spanWord(bMasks.setMask)<<treeBits, spanWord(bMasks.buddyMask)<<treeBits, 1<<63)
+}
+
+// freePages counts unoccupied leaves (4 KiB pages).
+func (w spanWord) freePages() int {
+	return spanPages - bits.OnesCount64(uint64(w&buddyTab[0]))
+}
+
+// levelOf rounds a positive page count up to its buddy level: 1 -> 0,
+// 2 -> 1, 3..4 -> 2, through 17..32 -> 5 (a whole span).
+func levelOf(n int) int { return bits.Len(uint(n - 1)) }
+
+// buddyTab selects candidate node bits across both trees, indexed by buddy level.
+//
+// Binary masks in both tables read from high to low: empty flags (B then A),
+// tree B, tree A. Within each tree, leaves come first and the root last.
+// R means root (level 4, 64 KiB): the first R is Rb at bit 31, the second Ra
+// at bit 0. L3, L2, L1, L0 name the 32, 16, 8, and 4 KiB levels.
+var buddyTab = [5]spanWord{
+	// 4 KiB (1 page)
+	0b00_1111111111111111_00000000_0000_00_0_1111111111111111_00000000_0000_00_0,
+	// 8 KiB (2 pages)
+	0b00_0000000000000000_11111111_0000_00_0_0000000000000000_11111111_0000_00_0,
+	// 16 KiB (4 pages)
+	0b00_0000000000000000_00000000_1111_00_0_0000000000000000_00000000_1111_00_0,
+	// 32 KiB (8 pages)
+	0b00_0000000000000000_00000000_0000_11_0_0000000000000000_00000000_0000_11_0,
+	// 64 KiB (16 pages)
+	0b00_0000000000000000_00000000_0000_00_1_0000000000000000_00000000_0000_00_1,
+}
+
+// claimTab is indexed by the selected bit in spanWord. Each tree bit
+// identifies one block, so all size classes share this table. Bits 62 and
+// 63 are empty flags, not tree nodes; their entries are unused.
+//
+// setMask includes the node, its descendants, and its ancestors. buddyMask
+// includes the sibling of the node and of each ancestor below the root; the
+// two roots have no buddies. emptyFlag is cleared on reserve and restored
+// when release empties that half.
+// block gives the starting page and page count within the whole span.
+var claimTab = [64]struct {
+	setMask   spanWord
+	buddyMask spanWord
+	emptyFlag spanWord
+	block     block
+}{
+	// A: 64 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	0: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_1111111111111111_11111111_1111_11_1,
+		buddyMask: 0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 0, n: 16},
+	},
+
+	// A: 32 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	1: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000011111111_00001111_0011_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000000_0000_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 0, n: 8},
+	},
+	2: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_1111111100000000_11110000_1100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000000_0000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 8, n: 8},
+	},
+
+	// A: 16 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	3: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000001111_00000011_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000000_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 0, n: 4},
+	},
+	4: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000011110000_00001100_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000000_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 4, n: 4},
+	},
+	5: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000111100000000_00110000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 8, n: 4},
+	},
+	6: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_1111000000000000_11000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 12, n: 4},
+	},
+
+	// A: 8 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	7: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000000011_00000001_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000010_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 0, n: 2},
+	},
+	8: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000001100_00000010_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000001_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 2, n: 2},
+	},
+	9: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000110000_00000100_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00001000_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 4, n: 2},
+	},
+	10: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000011000000_00001000_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00000100_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 6, n: 2},
+	},
+	11: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000001100000000_00010000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00100000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 8, n: 2},
+	},
+	12: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000110000000000_00100000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_00010000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 10, n: 2},
+	},
+	13: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0011000000000000_01000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_10000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 12, n: 2},
+	},
+	14: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_1100000000000000_10000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000000_01000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 14, n: 2},
+	},
+
+	// A: 4 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	15: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000000001_00000001_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000010_00000010_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 0, n: 1},
+	},
+	16: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000000010_00000001_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000001_00000010_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 1, n: 1},
+	},
+	17: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000000100_00000010_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000001000_00000001_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 2, n: 1},
+	},
+	18: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000001000_00000010_0001_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000000100_00000001_0010_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 3, n: 1},
+	},
+	19: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000010000_00000100_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000100000_00001000_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 4, n: 1},
+	},
+	20: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000000100000_00000100_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000000010000_00001000_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 5, n: 1},
+	},
+	21: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000001000000_00001000_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000010000000_00000100_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 6, n: 1},
+	},
+	22: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000010000000_00001000_0010_01_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000001000000_00000100_0001_10_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 7, n: 1},
+	},
+
+	// A: 4 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	23: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000000100000000_00010000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000001000000000_00100000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 8, n: 1},
+	},
+	24: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000001000000000_00010000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000000100000000_00100000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 9, n: 1},
+	},
+	25: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000010000000000_00100000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000100000000000_00010000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 10, n: 1},
+	},
+	26: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0000100000000000_00100000_0100_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0000010000000000_00010000_1000_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 11, n: 1},
+	},
+	27: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0001000000000000_01000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0010000000000000_10000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 12, n: 1},
+	},
+	28: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0010000000000000_01000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0001000000000000_10000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 13, n: 1},
+	},
+	29: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_0100000000000000_10000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_1000000000000000_01000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 14, n: 1},
+	},
+	30: {
+		setMask:   0b00_0000000000000000_00000000_0000_00_0_1000000000000000_10000000_1000_10_1,
+		buddyMask: 0b00_0000000000000000_00000000_0000_00_0_0100000000000000_01000000_0100_01_0,
+		emptyFlag: 1 << 62,
+		block:     block{start: 15, n: 1},
+	},
+
+	// B: 64 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	31: {
+		setMask:   0b00_1111111111111111_11111111_1111_11_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 16, n: 16},
+	},
+
+	// B: 32 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	32: {
+		setMask:   0b00_0000000011111111_00001111_0011_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000000_0000_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 16, n: 8},
+	},
+	33: {
+		setMask:   0b00_1111111100000000_11110000_1100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000000_0000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 24, n: 8},
+	},
+
+	// B: 16 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	34: {
+		setMask:   0b00_0000000000001111_00000011_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000000_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 16, n: 4},
+	},
+	35: {
+		setMask:   0b00_0000000011110000_00001100_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000000_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 20, n: 4},
+	},
+	36: {
+		setMask:   0b00_0000111100000000_00110000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 24, n: 4},
+	},
+	37: {
+		setMask:   0b00_1111000000000000_11000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 28, n: 4},
+	},
+
+	// B: 8 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	38: {
+		setMask:   0b00_0000000000000011_00000001_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000010_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 16, n: 2},
+	},
+	39: {
+		setMask:   0b00_0000000000001100_00000010_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000001_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 18, n: 2},
+	},
+	40: {
+		setMask:   0b00_0000000000110000_00000100_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00001000_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 20, n: 2},
+	},
+	41: {
+		setMask:   0b00_0000000011000000_00001000_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00000100_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 22, n: 2},
+	},
+	42: {
+		setMask:   0b00_0000001100000000_00010000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00100000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 24, n: 2},
+	},
+	43: {
+		setMask:   0b00_0000110000000000_00100000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_00010000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 26, n: 2},
+	},
+	44: {
+		setMask:   0b00_0011000000000000_01000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_10000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 28, n: 2},
+	},
+	45: {
+		setMask:   0b00_1100000000000000_10000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000000_01000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 30, n: 2},
+	},
+
+	// B: 4 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	46: {
+		setMask:   0b00_0000000000000001_00000001_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000010_00000010_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 16, n: 1},
+	},
+	47: {
+		setMask:   0b00_0000000000000010_00000001_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000001_00000010_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 17, n: 1},
+	},
+	48: {
+		setMask:   0b00_0000000000000100_00000010_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000001000_00000001_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 18, n: 1},
+	},
+	49: {
+		setMask:   0b00_0000000000001000_00000010_0001_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000000100_00000001_0010_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 19, n: 1},
+	},
+	50: {
+		setMask:   0b00_0000000000010000_00000100_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000100000_00001000_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 20, n: 1},
+	},
+	51: {
+		setMask:   0b00_0000000000100000_00000100_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000000010000_00001000_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 21, n: 1},
+	},
+	52: {
+		setMask:   0b00_0000000001000000_00001000_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000010000000_00000100_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 22, n: 1},
+	},
+	53: {
+		setMask:   0b00_0000000010000000_00001000_0010_01_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000001000000_00000100_0001_10_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 23, n: 1},
+	},
+
+	// B: 4 KiB blocks.
+	//    EE|         B: leaves to root         |         A: leaves to root
+	//    EE_       L0       _   L1   _ L2 _L3_R_       L0       _   L1   _ L2 _L3_R
+	54: {
+		setMask:   0b00_0000000100000000_00010000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000001000000000_00100000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 24, n: 1},
+	},
+	55: {
+		setMask:   0b00_0000001000000000_00010000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000000100000000_00100000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 25, n: 1},
+	},
+	56: {
+		setMask:   0b00_0000010000000000_00100000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000100000000000_00010000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 26, n: 1},
+	},
+	57: {
+		setMask:   0b00_0000100000000000_00100000_0100_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0000010000000000_00010000_1000_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 27, n: 1},
+	},
+	58: {
+		setMask:   0b00_0001000000000000_01000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0010000000000000_10000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 28, n: 1},
+	},
+	59: {
+		setMask:   0b00_0010000000000000_01000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0001000000000000_10000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 29, n: 1},
+	},
+	60: {
+		setMask:   0b00_0100000000000000_10000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_1000000000000000_01000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 30, n: 1},
+	},
+	61: {
+		setMask:   0b00_1000000000000000_10000000_1000_10_1_0000000000000000_00000000_0000_00_0,
+		buddyMask: 0b00_0100000000000000_01000000_0100_01_0_0000000000000000_00000000_0000_00_0,
+		emptyFlag: 1 << 63,
+		block:     block{start: 31, n: 1},
+	},
+}
+
+// edgeMasks describes a prefix or suffix in one 31-bit tree. Both masks
+// use positions relative to A; shift by treeBits when applying them to B.
+type edgeMasks struct {
+	setMask   uint32
+	buddyMask uint32
+}
+
+// edgeTab[n] describes the first n and last n pages of a half. Its
+// 17 entries occupy 272 bytes. Binary fields are L0_L1_L2_L3_R.
+// These are static geometry masks; current occupancy stays in spanWord.
+var edgeTab = [halfPages + 1]struct {
+	prefix edgeMasks
+	suffix edgeMasks
+}{
+	0: {},
+	1: {
+		prefix: edgeMasks{
+			setMask:   0b0000000000000001_00000001_0001_01_1,
+			buddyMask: 0b0000000000000010_00000010_0010_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1000000000000000_10000000_1000_10_1,
+			buddyMask: 0b0100000000000000_01000000_0100_01_0,
+		},
+	},
+	2: {
+		prefix: edgeMasks{
+			setMask:   0b0000000000000011_00000001_0001_01_1,
+			buddyMask: 0b0000000000000000_00000010_0010_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1100000000000000_10000000_1000_10_1,
+			buddyMask: 0b0000000000000000_01000000_0100_01_0,
+		},
+	},
+	3: {
+		prefix: edgeMasks{
+			setMask:   0b0000000000000111_00000011_0001_01_1,
+			buddyMask: 0b0000000000001000_00000000_0010_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1110000000000000_11000000_1000_10_1,
+			buddyMask: 0b0001000000000000_00000000_0100_01_0,
+		},
+	},
+	4: {
+		prefix: edgeMasks{
+			setMask:   0b0000000000001111_00000011_0001_01_1,
+			buddyMask: 0b0000000000000000_00000000_0010_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111000000000000_11000000_1000_10_1,
+			buddyMask: 0b0000000000000000_00000000_0100_01_0,
+		},
+	},
+	5: {
+		prefix: edgeMasks{
+			setMask:   0b0000000000011111_00000111_0011_01_1,
+			buddyMask: 0b0000000000100000_00001000_0000_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111100000000000_11100000_1100_10_1,
+			buddyMask: 0b0000010000000000_00010000_0000_01_0,
+		},
+	},
+	6: {
+		prefix: edgeMasks{
+			setMask:   0b0000000000111111_00000111_0011_01_1,
+			buddyMask: 0b0000000000000000_00001000_0000_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111110000000000_11100000_1100_10_1,
+			buddyMask: 0b0000000000000000_00010000_0000_01_0,
+		},
+	},
+	7: {
+		prefix: edgeMasks{
+			setMask:   0b0000000001111111_00001111_0011_01_1,
+			buddyMask: 0b0000000010000000_00000000_0000_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111000000000_11110000_1100_10_1,
+			buddyMask: 0b0000000100000000_00000000_0000_01_0,
+		},
+	},
+	8: {
+		prefix: edgeMasks{
+			setMask:   0b0000000011111111_00001111_0011_01_1,
+			buddyMask: 0b0000000000000000_00000000_0000_10_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111100000000_11110000_1100_10_1,
+			buddyMask: 0b0000000000000000_00000000_0000_01_0,
+		},
+	},
+	9: {
+		prefix: edgeMasks{
+			setMask:   0b0000000111111111_00011111_0111_11_1,
+			buddyMask: 0b0000001000000000_00100000_1000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111110000000_11111000_1110_11_1,
+			buddyMask: 0b0000000001000000_00000100_0001_00_0,
+		},
+	},
+	10: {
+		prefix: edgeMasks{
+			setMask:   0b0000001111111111_00011111_0111_11_1,
+			buddyMask: 0b0000000000000000_00100000_1000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111000000_11111000_1110_11_1,
+			buddyMask: 0b0000000000000000_00000100_0001_00_0,
+		},
+	},
+	11: {
+		prefix: edgeMasks{
+			setMask:   0b0000011111111111_00111111_0111_11_1,
+			buddyMask: 0b0000100000000000_00000000_1000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111100000_11111100_1110_11_1,
+			buddyMask: 0b0000000000010000_00000000_0001_00_0,
+		},
+	},
+	12: {
+		prefix: edgeMasks{
+			setMask:   0b0000111111111111_00111111_0111_11_1,
+			buddyMask: 0b0000000000000000_00000000_1000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111110000_11111100_1110_11_1,
+			buddyMask: 0b0000000000000000_00000000_0001_00_0,
+		},
+	},
+	13: {
+		prefix: edgeMasks{
+			setMask:   0b0001111111111111_01111111_1111_11_1,
+			buddyMask: 0b0010000000000000_10000000_0000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111111000_11111110_1111_11_1,
+			buddyMask: 0b0000000000000100_00000001_0000_00_0,
+		},
+	},
+	14: {
+		prefix: edgeMasks{
+			setMask:   0b0011111111111111_01111111_1111_11_1,
+			buddyMask: 0b0000000000000000_10000000_0000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111111100_11111110_1111_11_1,
+			buddyMask: 0b0000000000000000_00000001_0000_00_0,
+		},
+	},
+	15: {
+		prefix: edgeMasks{
+			setMask:   0b0111111111111111_11111111_1111_11_1,
+			buddyMask: 0b1000000000000000_00000000_0000_00_0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111111110_11111111_1111_11_1,
+			buddyMask: 0b0000000000000001_00000000_0000_00_0,
+		},
+	},
+	16: {
+		prefix: edgeMasks{
+			setMask:   0b1111111111111111_11111111_1111_11_1,
+			buddyMask: 0,
+		},
+		suffix: edgeMasks{
+			setMask:   0b1111111111111111_11111111_1111_11_1,
+			buddyMask: 0,
+		},
+	},
+}
