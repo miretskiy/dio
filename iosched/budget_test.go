@@ -107,6 +107,7 @@ func policyWrite(p *DiskPolicy, bytes int) *submission {
 
 func TestDiskAdmissionLimit(t *testing.T) {
 	p := policy(WithoutIOBudget(), WithWriteBacklogLimit(12))
+	require.NoError(t, p.CanAdmit(OpWrite))
 	a, b, next := policyWrite(p, 7), policyWrite(p, 5), policyWrite(p, 1)
 	require.True(t, p.admit(a))
 	require.True(t, p.admit(b))
@@ -115,10 +116,15 @@ func TestDiskAdmissionLimit(t *testing.T) {
 	p.account(b)
 	p.updateAdmission()
 	require.False(t, p.admit(next))
+	require.ErrorIs(t, p.CanAdmit(OpWrite), ErrRejected)
+	require.ErrorIs(t, p.CanAdmit(OpWritev|opVirtual), ErrRejected)
+	require.NoError(t, p.CanAdmit(OpRead))
+	require.NoError(t, p.CanAdmit(OpClose))
 	require.Equal(t, DiskUsage{Backlog: 12}, p.Stats().Writes)
 	require.EqualValues(t, 1, next.writes.backlog, "rejection does not mutate request totals")
 	p.release(a, &testRing)
 	require.True(t, p.admit(next))
+	require.NoError(t, p.CanAdmit(OpWrite))
 	p.account(next)
 	p.release(b, &testRing)
 	p.release(next, &testRing)
@@ -160,6 +166,8 @@ func TestWriteBacklogRecovery(t *testing.T) {
 		p.account(b)
 		p.updateAdmission() // 2 s - 250 ms = 1.75 s.
 		require.False(t, p.admit(policyWrite(p, 1)))
+		require.ErrorIs(t, p.CanAdmit(OpWrite), ErrRejected)
+		require.NoError(t, p.CanAdmit(OpRead))
 		p.release(a, &testRing)
 		p.release(b, &testRing)
 		require.Equal(t, DiskStats{}, p.Stats())
@@ -180,6 +188,7 @@ func TestWriteBacklogRecovery(t *testing.T) {
 		time.Sleep(time.Nanosecond)
 		synctest.Wait()
 		require.True(t, p.admit(policyWrite(p, 1)), "the pause ends with no coordinator activity")
+		require.NoError(t, p.CanAdmit(OpWrite))
 	})
 }
 

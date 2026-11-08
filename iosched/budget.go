@@ -76,15 +76,34 @@ var monotonicBase = time.Now()
 
 func monotonicNow() int64 { return int64(time.Since(monotonicBase)) }
 
+// CanAdmit reports the current admission state for an I/O opcode. Reads and
+// writes use their respective backlog limits; other operations are unrestricted.
+// It returns ErrRejected when that class is rejecting work. The check neither
+// reserves capacity nor guarantees a later Submit will succeed. Callers can use
+// it before acquiring buffers; Submit still checks the complete operation chain.
+func (p *DiskPolicy) CanAdmit(opcode uint8) error {
+	switch opcode &^ (opVirtual | opFixed) {
+	case OpRead, OpReadv:
+		if p.readBudget.rejects() {
+			return ErrRejected
+		}
+	case OpWrite, OpWritev:
+		if p.writeBudget.rejects() {
+			return ErrRejected
+		}
+	}
+	return nil
+}
+
 // admit only observes the coordinator-controlled rejection state.
 func (p *DiskPolicy) admit(work *submission) bool {
 	if work.root.opFlags&opMustAdmit != 0 {
 		return true
 	}
-	if work.reads.backlog > 0 && p.readBudget.rejects() {
+	if work.reads.backlog > 0 && p.CanAdmit(OpRead) != nil {
 		return false
 	}
-	if work.writes.backlog > 0 && p.writeBudget.rejects() {
+	if work.writes.backlog > 0 && p.CanAdmit(OpWrite) != nil {
 		return false
 	}
 	return true
