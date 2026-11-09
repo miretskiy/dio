@@ -35,7 +35,7 @@ func TestBufferMatchesBytesBuffer(t *testing.T) {
 	var reference bytes.Buffer
 	rng := rand.New(rand.NewPCG(7, 11))
 	for step := 0; step < 1000; step++ {
-		switch rng.IntN(6) {
+		switch rng.IntN(7) {
 		case 0, 1:
 			p := make([]byte, rng.IntN(3*chunk))
 			for i := range p {
@@ -69,11 +69,51 @@ func TestBufferMatchesBytesBuffer(t *testing.T) {
 		case 5:
 			b.Reset()
 			reference.Reset()
+		case 6:
+			b.Trim()
 		}
 		require.Equal(t, reference.Len(), b.Len())
 	}
 	b.Release()
 	require.Equal(t, a.Capacity(), a.Available())
+}
+
+func TestBufferTrimReturnsMergedTail(t *testing.T) {
+	a := newAllocator(t, 8*spanBytes)
+	a.arena.cursors = []arenaCursor{{end: len(a.arena.words)}}
+	b := NewAllocatingBuffer(a)
+	defer b.Release()
+	require.NoError(t, b.Grow(4*spanBytes))
+	require.Len(t, b.mem, 1)
+	old := b.mem[0]
+	payload := bytes.Repeat([]byte{0x5a}, spanBytes+31)
+	_, err := b.Write(payload)
+	require.NoError(t, err)
+	_, err = b.Read(make([]byte, 19))
+	require.NoError(t, err)
+	b.Trim()
+	require.Equal(t, spanBytes+chunk, b.Cap())
+	require.EqualValues(t, a.Capacity()-int64(b.Cap()), a.Available())
+	require.False(t, old.TryInc(), "the old, larger extent must no longer be pinnable")
+
+	// Reacquire and overwrite all returned pages while the prefix stays live.
+	other := NewAllocatingBuffer(a)
+	defer other.Release()
+	require.NoError(t, other.Grow(int(a.Available())))
+	for _, m := range other.RawAllocations() {
+		clear(m.Bytes())
+	}
+	got, err := io.ReadAll(b)
+	require.NoError(t, err)
+	require.Equal(t, payload[19:], got)
+
+	retained := b.mem[0]
+	require.True(t, retained.TryInc())
+	b.Release()
+	require.Zero(t, a.Available())
+	require.True(t, retained.Unpin())
+	other.Release()
+	a.requireEmpty(t)
 }
 
 func TestBufferGrowthAccounting(t *testing.T) {

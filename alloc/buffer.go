@@ -81,6 +81,36 @@ func (b *Buffer) Release() {
 	b.Reset()
 }
 
+// Trim releases unused capacity after the written bytes, rounded up to a page.
+// Contents and read/write positions are preserved. Call before sharing the
+// buffer or submitting I/O: shrinking a lease requires exclusive ownership and
+// invalidates unpinned copies of that handle, just like growth.
+func (b *Buffer) Trim() {
+	size := int(align.PageAlign(int64(b.write.offset)))
+	if size == 0 {
+		b.Release()
+		return
+	}
+	remaining := size
+	for i := range b.mem {
+		if n := len(b.mem[i].data); remaining >= n {
+			remaining -= n
+			continue
+		}
+		if remaining != 0 {
+			b.mem[i].trim(remaining)
+			i++
+		}
+		for _, m := range b.mem[i:] {
+			m.Unpin()
+		}
+		clear(b.mem[i:])
+		b.mem = b.mem[:i]
+		b.capacity = size
+		return
+	}
+}
+
 // appendRaw consumes a raw range, extending the last lease or publishing a new
 // one. Only this boundary between raw storage and Buffer ownership needs leases.
 func (b *Buffer) appendRaw(m rawMemory) {

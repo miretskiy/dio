@@ -70,6 +70,20 @@ func (m *Memory) extend(other rawMemory) bool {
 	return true
 }
 
+// trim returns an exclusively owned lease's unused tail to the arena. Like
+// extend, changing the extent retires copies of the old handle.
+func (m *Memory) trim(size int) {
+	word := m.word()
+	if word.Load() != uint64(m.gen)<<32|1 {
+		panic("alloc: trim requires exclusive ownership")
+	}
+	tail := len(m.data) - size
+	m.data = m.data[:size:size]
+	m.gen++
+	word.Store(uint64(m.gen)<<32 | 1)
+	m.leases.owner.freePages(int(m.unit)+size/align.BlockSize, tail/align.BlockSize)
+}
+
 // word returns the lease word, or nil for the zero Memory.
 func (m Memory) word() *atomic.Uint64 {
 	if m.leases == nil {
