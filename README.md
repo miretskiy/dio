@@ -136,6 +136,11 @@ the ring. Each logical operation produces one result. `NVMeWriteOp(...).Durable(
 sets Force Unit Access on every constituent write. `NVMeFlushOp` flushes the
 entire namespace.
 
+`NVMeReadBufferOp` and `NVMeWriteBufferOp` accept an `alloc.Buffer` directly.
+They submit its underlying allocations without copying the whole value into a
+contiguous staging buffer, splitting at allocation boundaries and the device
+limit. The complete transfer still has one ticket and one admission decision.
+
 For vendor-specific commands or other NVMe command sets, build a `ringo.Op` with
 `nvme.Command.Op`, `nvme.Command.AdminOp`, or `ringo.UringCmd`, then wrap it with
 `iosched.RawNVMeCmdOp(file, request, &completion)`. Raw commands retain their

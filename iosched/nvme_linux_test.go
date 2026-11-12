@@ -6,11 +6,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"sort"
 	"strconv"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/nvme"
 	"github.com/miretskiy/dio/v2/ringo"
 	"github.com/stretchr/testify/require"
@@ -183,6 +186,54 @@ func TestNVMeHardware(t *testing.T) {
 		run(NVMeReadOp(scratch, readback, 0), length)
 		require.Equal(t, data, readback)
 	}
+	// Fragment allocator buffers into more pieces than a logical chain holds.
+	memory := alloc.NewAllocator(16 << 20)
+	defer memory.Close()
+	var blockers []alloc.Memory
+	for {
+		block, err := memory.TryAcquire(4096)
+		if err != nil {
+			require.ErrorIs(t, err, alloc.ErrExhausted)
+			break
+		}
+		blockers = append(blockers, block)
+	}
+	sort.Slice(blockers, func(i, j int) bool {
+		return uintptr(unsafe.Pointer(&blockers[i].Bytes()[0])) < uintptr(unsafe.Pointer(&blockers[j].Bytes()[0]))
+	})
+	for i := 0; i < len(blockers); i += 2 {
+		blockers[i].Unpin()
+	}
+	defer func() {
+		for i := 1; i < len(blockers); i += 2 {
+			blockers[i].Unpin()
+		}
+	}()
+	fragmented := func(data []byte) *alloc.Buffer {
+		buffer := alloc.NewAllocatingBuffer(memory)
+		_, err := buffer.Write(data)
+		require.NoError(t, err)
+		if len(buffer.RawAllocations()) <= maxChainLength {
+			buffer.Release()
+			t.Fatal("expected a fragmented buffer")
+		}
+		return buffer
+	}
+	pattern := make([]byte, 20*65536+int(info.BlockSize))
+	for i := range pattern {
+		pattern[i] = byte(i/4096) ^ byte(i) ^ 0xa7
+	}
+	writeBuffer := fragmented(pattern)
+	defer writeBuffer.Release()
+	run(NVMeWriteBufferOp(scratch, writeBuffer, len(pattern), 0).Durable(), len(pattern))
+	readBuffer := fragmented(make([]byte, len(pattern)))
+	defer readBuffer.Release()
+	run(NVMeReadBufferOp(scratch, readBuffer, len(pattern), 0), len(pattern))
+	gotPattern := make([]byte, 0, len(pattern))
+	for _, part := range readBuffer.RawAllocations() {
+		gotPattern = append(gotPattern, part.Bytes()[:min(len(pattern)-len(gotPattern), len(part.Bytes()))]...)
+	}
+	require.Equal(t, pattern, gotPattern)
 	last := int64(size - uint64(len(buf)))
 	data := bytes.Repeat([]byte{0x5a}, len(buf))
 	run(NVMeWriteOp(scratch, data, last), len(data))

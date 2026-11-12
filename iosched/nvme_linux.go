@@ -9,6 +9,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/nvme"
 	"github.com/miretskiy/dio/v2/ringo"
 )
@@ -26,6 +27,34 @@ func NVMeReadOp(device *nvme.Device, buf []byte, offset int64) Op {
 // After an error, writes beyond the reported prefix may also have reached storage.
 func NVMeWriteOp(device *nvme.Device, buf []byte, offset int64) Op {
 	return nvmeDataOp(OpWrite, device, buf, offset)
+}
+
+// NVMeReadBufferOp reads length bytes into buffer's allocations. The scheduler
+// splits at allocation boundaries and the device command limit, retaining one
+// logical result. length must fit within Cap(), and allocations and transfer
+// lengths must be block aligned. Keep buffer alive and unchanged through completion.
+func NVMeReadBufferOp(device *nvme.Device, buffer *alloc.Buffer, length int, offset int64) Op {
+	return nvmeBufferOp(OpReadv, device, buffer, length, offset)
+}
+
+// NVMeWriteBufferOp writes length bytes from buffer's allocations with the same
+// splitting as NVMeReadBufferOp. Durable applies FUA to each constituent write.
+func NVMeWriteBufferOp(device *nvme.Device, buffer *alloc.Buffer, length int, offset int64) Op {
+	return nvmeBufferOp(OpWritev, device, buffer, length, offset)
+}
+
+func nvmeBufferOp(kind uint8, device *nvme.Device, buffer *alloc.Buffer, length int, offset int64) Op {
+	op := nvmeDataOp(kind, device, nil, offset)
+	op.length = int64(length)
+	if length < 0 || length > buffer.Cap() {
+		panic("iosched: NVMe buffer length outside capacity")
+	}
+	if length != 0 {
+		parts := buffer.RawAllocations()
+		op.buf = parts[0].Bytes()[:min(length, len(parts[0].Bytes()))]
+		op.allocations = parts[1:]
+	}
+	return op
 }
 
 func nvmeDataOp(kind uint8, device *nvme.Device, buf []byte, offset int64) Op {
@@ -51,9 +80,9 @@ func NVMeFlushOp(device *nvme.Device) Op {
 
 func nvmeCommand(op *operation) (nvme.Command, error) {
 	switch op.kind() {
-	case OpRead:
+	case OpRead, OpReadv:
 		return op.nvme.ReadCommand(op.buf, uint64(op.offset))
-	case OpWrite:
+	case OpWrite, OpWritev:
 		return op.nvme.WriteCommand(op.buf, uint64(op.offset), op.opFlags&opDurable != 0)
 	case OpFdatasync:
 		return op.nvme.FlushCommand(), nil
@@ -72,12 +101,25 @@ func (s *URingScheduler) validateNVMe(op *operation) error {
 	if op.nvme == nil || op.nvme.File() == nil {
 		return fmt.Errorf("iosched: NVMe operation requires an open device")
 	}
-	if op.offset < 0 || int64(len(op.buf)) > math.MaxInt64-op.offset {
+	length := opBytes(op)
+	if op.offset < 0 || int64(length) > math.MaxInt64-op.offset {
 		return fmt.Errorf("iosched: NVMe byte offset exceeds int64 range")
 	}
 	switch op.kind() {
-	case OpRead, OpWrite:
-		return op.nvme.ValidateIO(uint64(op.offset), uint64(len(op.buf)))
+	case OpRead, OpWrite, OpReadv, OpWritev:
+		if err := op.nvme.ValidateIO(uint64(op.offset), uint64(length)); err != nil {
+			return err
+		}
+		block := int(op.nvme.Info().BlockSize)
+		if len(op.buf)%block != 0 {
+			return fmt.Errorf("iosched: unaligned NVMe buffer allocation")
+		}
+		for _, memory := range op.allocations {
+			if len(memory.Bytes())%block != 0 {
+				return fmt.Errorf("iosched: unaligned NVMe buffer allocation")
+			}
+		}
+		return nil
 	case OpFdatasync:
 		return nil
 	default:
@@ -109,8 +151,8 @@ func nvmeResult(op *operation, completion ringo.Completion) (int, error) {
 	if err := nvme.Status(completion); err != nil {
 		return 0, err
 	}
-	if op.kind() == OpRead || op.kind() == OpWrite {
-		return len(op.buf), nil
+	if op.kind() == OpRead || op.kind() == OpReadv || op.isWrite() {
+		return opBytes(op), nil
 	}
 	return 0, nil
 }
@@ -120,28 +162,40 @@ func nvmeResult(op *operation, completion ringo.Completion) (int, error) {
 // This bounds state independently of request size and keeps linked successors
 // behind the entire logical transfer.
 type nvmeSplit struct {
-	started bool  // The submission already holds its dispatch allowance.
-	index   int   // Current logical operation in the caller's chain.
-	cursor  int   // Bytes placed for the current operation.
-	pending int   // Commands still awaiting completion in this batch.
-	prefix  int   // First failed byte offset, or the complete operation length.
-	err     error // Error at the earliest failing byte offset.
-	failed  bool  // Kernel link failure: Linux error or ordinary short I/O.
+	started         bool  // The submission already holds its dispatch allowance.
+	index           int   // Current logical operation in the caller's chain.
+	cursor          int   // Bytes placed for the current operation.
+	pending         int   // Commands still awaiting completion in this batch.
+	prefix          int   // First failed byte offset, or the complete operation length.
+	err             error // Error at the earliest failing byte offset.
+	failed          bool  // Kernel link failure: Linux error or ordinary short I/O.
+	allocation      int   // Allocation containing cursor; zero selects op.buf.
+	allocationStart int   // Logical offset of the current allocation.
 }
 
 func (c *coordinator) placeNVMeParts(work *submission) {
 	state := work.nvmeSplit
 	op := work.op(state.index)
 	if state.cursor == 0 {
-		state.prefix = len(op.buf)
+		state.prefix = opBytes(op)
 	}
 	for c.occupied < int(c.sched.config.ringDepth) {
 		part := *op
-		start, length := 0, len(op.buf)
+		start, length := 0, opBytes(op)
 		if op.isNVMe() && op.kind() != OpFdatasync {
 			start = state.cursor
-			length = min(len(op.buf)-start, nvmeCommandLimit(op.nvme))
-			part.buf = op.buf[start : start+length]
+			chunk := op.buf
+			if state.allocation > 0 {
+				chunk = op.allocations[state.allocation-1].Bytes()
+			}
+			for start >= state.allocationStart+len(chunk) && start < opBytes(op) {
+				state.allocationStart += len(chunk)
+				state.allocation++
+				chunk = op.allocations[state.allocation-1].Bytes()
+			}
+			within := start - state.allocationStart
+			length = min(opBytes(op)-start, len(chunk)-within, nvmeCommandLimit(op.nvme))
+			part.buf = chunk[within : within+length]
 			part.offset += int64(start)
 		}
 		handle, err := c.ring.Push(c.translateOp(&part))
@@ -156,7 +210,7 @@ func (c *coordinator) placeNVMeParts(work *submission) {
 		c.place(handle, ringSlot{kind: slotNVMePart, work: work, op: op, partOffset: start, partLength: length})
 		state.pending++
 		state.cursor += length
-		if !op.isNVMe() || state.cursor == len(op.buf) {
+		if !op.isNVMe() || state.cursor == opBytes(op) {
 			break
 		}
 	}
@@ -198,7 +252,7 @@ func (c *coordinator) finishNVMePart(slot ringSlot, completion ringo.Completion)
 		return
 	}
 	if op.isNVMe() {
-		if state.err == nil && state.cursor < len(op.buf) {
+		if state.err == nil && state.cursor < opBytes(op) {
 			c.resumeNVMe(work)
 			return
 		}

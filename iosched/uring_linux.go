@@ -231,7 +231,7 @@ func (s *URingScheduler) prepareSubmission(op *Op) (*submission, error) {
 			if err := s.validateNVMe(current); err != nil {
 				return nil, err
 			}
-			if len(current.buf) > nvmeCommandLimit(current.nvme) && work.nvmeSplit == nil {
+			if (opBytes(current) > nvmeCommandLimit(current.nvme) || len(current.allocations) != 0) && work.nvmeSplit == nil {
 				work.nvmeSplit = new(nvmeSplit)
 			}
 		}

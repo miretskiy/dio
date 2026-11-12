@@ -46,15 +46,35 @@ func (d *deviceIO) operationTime(op *operation) int64 {
 	bytes := opBytes(op)
 	if op.isNVMe() {
 		limit := nvmeCommandLimit(op.nvme)
-		if limit > 0 && bytes > limit {
-			elapsed := int64(bytes/limit) * d.serviceTime(int64(limit))
-			if tail := bytes % limit; tail != 0 {
-				elapsed += d.serviceTime(int64(tail))
+		if limit > 0 {
+			if len(op.allocations) == 0 {
+				return d.commandTime(bytes, limit)
+			}
+			elapsed := d.commandTime(len(op.buf), limit)
+			left := bytes - len(op.buf)
+			for _, memory := range op.allocations {
+				if left == 0 {
+					break
+				}
+				n := min(left, len(memory.Bytes()))
+				elapsed += d.commandTime(n, limit)
+				left -= n
 			}
 			return elapsed
 		}
 	}
 	return d.serviceTime(int64(bytes))
+}
+
+func (d *deviceIO) commandTime(bytes, limit int) int64 {
+	if bytes <= limit {
+		return d.serviceTime(int64(bytes))
+	}
+	elapsed := int64(bytes/limit) * d.serviceTime(int64(limit))
+	if tail := bytes % limit; tail != 0 {
+		elapsed += d.serviceTime(int64(tail))
+	}
+	return elapsed
 }
 
 // ioBudget is one class's shared accounting and rejection state.

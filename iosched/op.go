@@ -572,6 +572,9 @@ func (t Ticket) AllResults() []Result {
 func opBytes(op *operation) int {
 	switch op.kind() {
 	case OpWritev, OpReadv:
+		if op.isNVMe() {
+			return int(op.length)
+		}
 		if len(op.allocations) != 0 {
 			return int(op.length)
 		}
