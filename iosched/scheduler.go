@@ -27,8 +27,10 @@ type Scheduler interface {
 	// when the caller does not need the result. A Submit error means the
 	// operation was not accepted and the returned Ticket is invalid; execution
 	// errors are returned by a valid Ticket's Wait.
-	// Reads absorb EINTR and may complete with a short count. Writes are not
-	// retried; a short write reports io.ErrShortWrite together with its count.
+	// Reads absorb EINTR and may complete with a short count. URingScheduler
+	// also retries EAGAIN completions of standalone reads on the same ticket.
+	// Linked-operation completion errors are returned without replaying the chain.
+	// Writes are not retried; a short write reports io.ErrShortWrite together with its count.
 	//
 	// Operations in a Link or HardLink chain execute in order. Link cancels the
 	// remaining chain after a failure; HardLink continues it. A chain holds at

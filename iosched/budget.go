@@ -57,6 +57,17 @@ type ioBudget struct {
 // The caller retains its operands and decides whether to retry.
 var ErrRejected = errors.New("iosched: admission limit exceeded")
 
+// RejectedError reports a whole-submission admission rejection. RetryAfter is
+// a suggested delay before offering more work, not a reservation or guarantee.
+// It uses the recovery deadline when configured; otherwise it estimates the
+// service time needed to make room for this submission.
+type RejectedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RejectedError) Error() string { return ErrRejected.Error() }
+func (e *RejectedError) Unwrap() error { return ErrRejected }
+
 // DiskPolicy combines device configuration and shared atomic accounting.
 // Configure it with NewDiskPolicy, then share its pointer across a device's
 // schedulers. Capacity is returned by completion, not replenished by elapsed time.
@@ -76,6 +87,18 @@ var monotonicBase = time.Now()
 
 func monotonicNow() int64 { return int64(time.Since(monotonicBase)) }
 
+// LatencyGoal reports the configured in-flight service-time limit for opcode.
+// Zero means that class is unbudgeted.
+func (p *DiskPolicy) LatencyGoal(opcode uint8) time.Duration {
+	switch opcode &^ (opVirtual | opFixed) {
+	case OpRead, OpReadv:
+		return p.device.reads.latency
+	case OpWrite, OpWritev:
+		return p.device.writes.latency
+	}
+	return 0
+}
+
 // CanAdmit reports the current admission state for an I/O opcode. Reads and
 // writes use their respective backlog limits; other operations are unrestricted.
 // It returns ErrRejected when that class is rejecting work. The check neither
@@ -84,29 +107,43 @@ func monotonicNow() int64 { return int64(time.Since(monotonicBase)) }
 func (p *DiskPolicy) CanAdmit(opcode uint8) error {
 	switch opcode &^ (opVirtual | opFixed) {
 	case OpRead, OpReadv:
-		if p.readBudget.rejects() {
-			return ErrRejected
-		}
+		return p.readBudget.admissionError(p.device.reads.serviceTime(0))
 	case OpWrite, OpWritev:
-		if p.writeBudget.rejects() {
-			return ErrRejected
-		}
+		return p.writeBudget.admissionError(p.device.writes.serviceTime(0))
 	}
 	return nil
 }
 
 // admit only observes the coordinator-controlled rejection state.
-func (p *DiskPolicy) admit(work *submission) bool {
-	if work.root.opFlags&opMustAdmit != 0 {
-		return true
+func (p *DiskPolicy) admit(work *submission) error {
+	if work.root.opFlags&(opMustAdmit|opAllowBacklog) != 0 {
+		return nil
 	}
-	if work.reads.backlog > 0 && p.CanAdmit(OpRead) != nil {
-		return false
+	if work.reads.backlog > 0 {
+		if err := p.readBudget.admissionError(work.reads.backlog); err != nil {
+			return err
+		}
 	}
-	if work.writes.backlog > 0 && p.CanAdmit(OpWrite) != nil {
-		return false
+	if work.writes.backlog > 0 {
+		return p.writeBudget.admissionError(work.writes.backlog)
 	}
-	return true
+	return nil
+}
+
+func (b *ioBudget) admissionError(charge int64) error {
+	if !b.rejecting.Load() {
+		return nil
+	}
+	var delay int64
+	if reopenAt := b.reopenAt.Load(); reopenAt != 0 {
+		delay = reopenAt - monotonicNow()
+		if delay <= 0 {
+			return nil
+		}
+	} else {
+		delay = max(1, b.backlog.Load()-b.limit+charge)
+	}
+	return &RejectedError{RetryAfter: time.Duration(delay)}
 }
 
 func (b *ioBudget) rejects() bool {

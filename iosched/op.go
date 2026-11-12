@@ -7,6 +7,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/miretskiy/dio/v2/align"
+	"github.com/miretskiy/dio/v2/alloc"
 )
 
 // Opcode identifies the type of I/O operation. The low bits name the operation;
@@ -41,8 +44,9 @@ const (
 // coordinator. Its linked I/O operations and final virtual close use AllocateVFD
 // to address the same slot. Ticket.Wait returns the allocated index and any chain
 // error; Ticket.AllResults distinguishes open success from a follower's failure.
-// Use allocation consistently within a scheduler: do not combine it with opens
-// into caller-chosen slots. Closing an allocated slot relinquishes its index;
+// WithFiles reserves an initial prefix for already-open files. Other slots
+// use allocation consistently: do not combine it with opens into caller-chosen
+// slots. Closing an allocated slot relinquishes its index;
 // obtain a new allocation before using a virtual file again.
 // Allocation failure completes the open with ENFILE: Link cancels followers,
 // while HardLink continues them. Followers using an unallocated slot fail with
@@ -79,6 +83,7 @@ type operation struct {
 	mode        uint32
 	buf         []byte
 	bufs        [][]byte
+	allocations []alloc.Memory // remaining vectors of buffer I/O; buf is the first
 	offset      int64
 	length      int64
 	opFlags     uint32
@@ -98,6 +103,7 @@ const (
 	opReleaseVFD   uint32 = 1 << 2 // failed root open returns its slot after the chain
 	opMustAdmit    uint32 = 1 << 3 // root bypasses admission limits for the whole submission
 	opWriteSync    uint32 = 1 << 4 // synthesized fdatasync after a non-final Durable write
+	opAllowBacklog uint32 = 1 << 5 // root bypasses backlog rejection, retaining all charges
 )
 
 // MustAdmit exempts the whole submission from every DiskPolicy throttle: it is
@@ -107,6 +113,15 @@ const (
 // execution failures remain possible.
 func (o Op) MustAdmit() Op {
 	o.opFlags |= opMustAdmit
+	return o
+}
+
+// AllowBacklog admits the whole submission even when its backlog limit is
+// reached. Its I/O remains accounted and waits for the normal dispatch allowance.
+// Apply it to the root of a chain. Other submission and execution errors remain
+// possible.
+func (o Op) AllowBacklog() Op {
+	o.opFlags |= opAllowBacklog
 	return o
 }
 
@@ -189,6 +204,84 @@ func VReadvOp(vfd uint32, bufs [][]byte, offset int64) Op {
 // descriptor.
 func VWritevOp(vfd uint32, bufs [][]byte, offset int64) Op {
 	return Op{operation: operation{opcode: OpWritev | opVirtual, vfd: vfd, bufs: bufs, offset: offset}}
+}
+
+// WriteBufferOp writes length bytes from the start of buffer's allocations.
+// It borrows the sealed buffer without consuming it or retaining its memory.
+// Keep its allocations valid until completion. length must be within Cap().
+func WriteBufferOp(f *os.File, buffer *alloc.Buffer, length int, offset int64) Op {
+	return bufferOp(operation{opcode: OpWrite, f: f, offset: offset}, buffer, length)
+}
+
+// VWriteBufferOp is WriteBufferOp against a virtual descriptor. Buffer writes
+// that exceed the kernel's vector or byte limit form one hard-linked chain.
+func VWriteBufferOp(vfd uint32, buffer *alloc.Buffer, length int, offset int64) Op {
+	return bufferOp(operation{opcode: OpWrite | opVirtual, vfd: vfd, offset: offset}, buffer, length)
+}
+
+// ReadBufferOp reads length bytes into buffer's allocations without consuming
+// the buffer or moving its cursors. Keep the buffer alive until completion.
+// length must be within Cap(); only bytes reported as read are initialized.
+func ReadBufferOp(f *os.File, buffer *alloc.Buffer, length int, offset int64) Op {
+	return bufferOp(operation{opcode: OpRead, f: f, offset: offset}, buffer, length)
+}
+
+// VReadBufferOp is ReadBufferOp against a virtual descriptor. It follows the
+// same vector and byte limits, and linked submission rules, as VWriteBufferOp.
+func VReadBufferOp(vfd uint32, buffer *alloc.Buffer, length int, offset int64) Op {
+	return bufferOp(operation{opcode: OpRead | opVirtual, vfd: vfd, offset: offset}, buffer, length)
+}
+
+func bufferOp(base operation, buffer *alloc.Buffer, length int) Op {
+	// Linux MAX_RW_COUNT and IOV_MAX. Keep these submission limits here rather
+	// than requiring callers to construct temporary vector lists and chains.
+	const maxBufferBytes = math.MaxInt32 &^ (align.BlockSize - 1)
+	parts := buffer.RawAllocations()
+	var root Op
+	var previous *operation
+	skip := 0
+	for length != 0 {
+		first := parts[0].Bytes()[skip:]
+		size := min(length, len(first), maxBufferBytes)
+		op := base
+		op.buf = first[:size]
+		count := 1
+		for count < len(parts) && count < maxCoalescedWrites && size < min(length, maxBufferBytes) {
+			size += min(len(parts[count].Bytes()), length-size, maxBufferBytes-size)
+			count++
+		}
+		if count > 1 {
+			if base.kind() == OpRead {
+				op.opcode = OpReadv | (base.opcode & opVirtual)
+			} else {
+				op.opcode = OpWritev | (base.opcode & opVirtual)
+			}
+			op.allocations = parts[1:count]
+			op.length = int64(size)
+		}
+		if previous == nil {
+			root.operation = op
+			previous = &root.operation
+		} else {
+			previous.sqeFlags = sqeHardLink
+			root.linked = append(root.linked, op)
+			previous = &root.linked[len(root.linked)-1]
+		}
+		length -= size
+		base.offset += int64(size)
+		for size > 0 {
+			n := min(size, len(parts[0].Bytes())-skip)
+			size -= n
+			skip += n
+			if skip == len(parts[0].Bytes()) {
+				parts, skip = parts[1:], 0
+			}
+		}
+	}
+	if previous == nil {
+		root.operation = base
+	}
+	return root
 }
 
 // OpenatOp constructs a plain openat operation that opens path and returns the
@@ -364,7 +457,7 @@ type completion struct {
 	started time.Time // submission preparation; monotonic clock
 
 	Slat time.Duration // Preparation to ring placement (POSIX: execution starts).
-	Clat time.Duration // Ring placement to ticket completion, including any Durable sync.
+	Clat time.Duration // First ring placement to completion, including read retries and any Durable sync.
 
 	wait sync.WaitGroup                // Wait does not allocate a channel
 	done atomic.Pointer[chan struct{}] // made only when Done is requested
@@ -407,7 +500,9 @@ type Ticket struct {
 }
 
 func (c *completion) markIssued() {
-	c.Slat = time.Since(c.started)
+	if c.Slat == 0 {
+		c.Slat = time.Since(c.started)
+	}
 }
 
 // SubmitNotify submits op to s, like s.Submit, and has whenDone called with
@@ -465,6 +560,9 @@ func (t Ticket) AllResults() []Result {
 func opBytes(op *operation) int {
 	switch op.kind() {
 	case OpWritev, OpReadv:
+		if len(op.allocations) != 0 {
+			return int(op.length)
+		}
 		total := 0
 		for _, buf := range op.bufs {
 			total += len(buf)

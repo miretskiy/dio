@@ -13,7 +13,8 @@ import (
 type arena struct {
 	region  []byte // whole spans
 	words   []atomic.Uint64
-	leases  *leases // one unit per page; an allocation uses its first page
+	free    atomic.Int64 // free pages, updated with each successful claim/release
+	leases  *leases      // one unit per page; an allocation uses its first page
 	cursors []arenaCursor
 }
 
@@ -104,6 +105,7 @@ func (s *arenaBatch) record(i int, full bool, spans int) {
 // newArena creates metadata for spans. The caller sets region.
 func newArena(spans int) *arena {
 	a := &arena{words: make([]atomic.Uint64, spans)}
+	a.free.Store(int64(spans * spanPages))
 	for i := range a.words {
 		a.words[i].Store(uint64(emptySpan))
 	}
@@ -216,6 +218,7 @@ func (a *arena) claimNode(i, n int) (b block, full, ok bool) {
 			return block{}, true, false
 		}
 		if word.CompareAndSwap(uint64(w), uint64(next)) {
+			a.free.Add(-int64(b.n))
 			return b, next == fullSpan, true
 		}
 	}
@@ -227,12 +230,14 @@ func (a *arena) freeSpan(i, start, n int) {
 	word := &a.words[i]
 	if n == spanPages {
 		word.Store(uint64(emptySpan))
+		a.free.Add(int64(n))
 		return
 	}
 	b := block{start: start, n: n}
 	for {
 		w := spanWord(word.Load())
 		if word.CompareAndSwap(uint64(w), uint64(w.release(b))) {
+			a.free.Add(int64(n))
 			return
 		}
 	}
@@ -251,9 +256,7 @@ func (a *arena) freePages(page, n int) {
 
 // available returns a snapshot of the free pages.
 func (a *arena) available() int {
-	free := 0
-	for i := range a.words {
-		free += spanWord(a.words[i].Load()).freePages()
-	}
-	return free
+	// A claim/release updates its span word before the counter. Concurrent
+	// snapshots may briefly include one side of those updates; keep them in range.
+	return int(max(0, min(int64(len(a.words)*spanPages), a.free.Load())))
 }

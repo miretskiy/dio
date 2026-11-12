@@ -30,6 +30,7 @@ func (a *Allocator) pageOf(m Memory) int {
 func (a *Allocator) requireEmpty(t *testing.T) {
 	t.Helper()
 	require.Equal(t, a.Capacity(), a.Available())
+	require.EqualValues(t, len(a.arena.words)*spanPages, a.arena.free.Load())
 	for i := range a.arena.words {
 		require.Equal(t, emptySpan, spanWord(a.arena.words[i].Load()), "span %d", i)
 	}

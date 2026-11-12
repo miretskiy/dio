@@ -116,7 +116,7 @@ func (a *Allocator) Capacity() int64 { return int64(len(a.arena.region)) }
 func (a *Allocator) MaxSize() int64 { return MaxAllocationSize }
 
 // Available reports a snapshot of free bytes. Memory stays in use until
-// its last Unpin. It scans every span and must not race Close.
+// its last Unpin. It reads an atomic page counter and must not race Close.
 func (a *Allocator) Available() int64 {
 	if a.arena.region == nil {
 		return 0

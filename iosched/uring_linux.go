@@ -153,6 +153,12 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 		return errors.Join(err, ring.Close(), unix.Close(doorbellFD))
 	}
 
+	if len(cfg.files) != 0 {
+		if _, err := ring.FixedFiles().Update(0, cfg.files...); err != nil {
+			return nil, abandon(fmt.Errorf("iosched: initial virtual files: %w", err))
+		}
+	}
+
 	fixedFiles := make([]ringo.FixedFile, cfg.vfiles)
 	for index := range fixedFiles {
 		fixedFiles[index], err = ring.FixedFiles().File(uint32(index))
@@ -190,8 +196,8 @@ func (s *URingScheduler) Submit(op Op) (Ticket, error) {
 	if err != nil {
 		return Ticket{}, err
 	}
-	if !s.config.disk.admit(work) {
-		return Ticket{}, ErrRejected
+	if err := s.config.disk.admit(work); err != nil {
+		return Ticket{}, err
 	}
 	if !s.tryPush(work) {
 		return Ticket{}, s.stopCause()
@@ -379,10 +385,11 @@ type coordinator struct {
 	// in the ready queue can dispatch.
 	readyClasses [4]int
 
-	vfiles       []uint64 // bitmap of slots reserved through AllocateVFD
-	nextVFile    int      // first bitmap word to search
-	files        fileTable
-	nextSequence uint64
+	vfiles         []uint64 // bitmap of slots reserved through AllocateVFD
+	nextVFile      int      // first bitmap word to search
+	reservedVFiles uint32   // initial WithFiles prefix, excluded from allocation
+	files          fileTable
+	nextSequence   uint64
 
 	// syncPending holds the files with durable writes waiting for an fdatasync
 	// that is not placed yet, in the order their first write completed.
@@ -410,6 +417,10 @@ func newCoordinator(s *URingScheduler) *coordinator {
 		files:    newFileTable(s.config.vfiles),
 	}
 	c.initVFiles(s.config.vfiles)
+	c.reservedVFiles = uint32(len(s.config.files))
+	for i := range s.config.files {
+		c.vfiles[i/64] |= uint64(1) << (i % 64)
+	}
 	return c
 }
 
@@ -884,10 +895,30 @@ func (c *coordinator) translateOp(op *operation) ringo.Op {
 			return ringo.WriteFixed(fd, buffer, op.offset, recycle)
 		}
 		return ringo.Write(fd, op.buf, op.offset, recycle)
-	case OpReadv:
-		return ringo.Readv(fd, op.bufs, op.offset, 0, recycle)
-	case OpWritev:
-		return ringo.Writev(fd, op.bufs, op.offset, 0, recycle)
+	case OpReadv, OpWritev:
+		vectors := op.bufs
+		if len(op.allocations) != 0 {
+			if c.coalesceBuffers == nil {
+				c.coalesceBuffers = make([][]byte, maxCoalescedWrites)
+			}
+			vectors = c.coalesceBuffers[:1+len(op.allocations)]
+			vectors[0] = op.buf
+			left := int(op.length) - len(op.buf)
+			for i, memory := range op.allocations {
+				vectors[i+1] = memory.Bytes()[:min(left, len(memory.Bytes()))]
+				left -= len(vectors[i+1])
+			}
+		}
+		var request ringo.Op
+		if op.kind() == OpReadv {
+			request = ringo.Readv(fd, vectors, op.offset, 0, recycle)
+		} else {
+			request = ringo.Writev(fd, vectors, op.offset, 0, recycle)
+		}
+		if len(op.allocations) != 0 {
+			clear(vectors)
+		} // Ringo owns the iovecs.
+		return request
 	case OpFsync:
 		return ringo.Fsync(fd, recycle)
 	case OpFdatasync:
@@ -1011,18 +1042,9 @@ func (c *coordinator) reapOne(completion ringo.Completion) {
 	c.slots[index] = ringSlot{}
 	c.occupied--
 
-	// Operation errors pass through unchanged, including a spurious -EAGAIN on
-	// a regular-file read or write that never set RWF_NOWAIT. Before Linux
-	// 6.14, io_rw_should_reissue declines the kernel's io-wq reissue when the
-	// completion runs outside the submitting thread group or task context.
-	// Observed on 6.8.0-aws (XFS direct read): the kernel's own IOCB_NOWAIT
-	// first attempt fails xfs_ilock_nowait after part of the read is issued,
-	// the dio completes on a kworker, and the CQE carries -EAGAIN. Upstream
-	// b08e02045002 ("io_uring/rw: don't gate retry on completion context")
-	// removes that check; it was not tagged for stable. Callers on older
-	// kernels must treat EAGAIN as retryable. Retrying here would mean resuming
-	// a chain from the failed operation, since the kernel has already cancelled
-	// or run its linked followers, and it could not push from reapOne.
+	// Older kernels can return EAGAIN from a regular-file read without
+	// RWF_NOWAIT (fixed upstream by b08e02045002). finishOperation requeues
+	// standalone reads; linked operations retain their individual outcomes.
 	n, err := completion.Result, completion.Err
 	if errors.Is(err, syscall.ECANCELED) && c.sched.stopCause() == errSchedulerClosed {
 		err = errSchedulerClosed
@@ -1065,6 +1087,17 @@ func (c *coordinator) finishWrite(leader *submission, n int, err error) {
 // durable write that succeeded then waits for its file's next fdatasync; one
 // that failed has nothing to make durable, so its fdatasync is retired with it.
 func (c *coordinator) finishOperation(work *submission, op *operation, n int, err error) {
+	if errors.Is(err, syscall.EAGAIN) && len(work.linked) == 0 &&
+		(op.kind() == OpRead || op.kind() == OpReadv) && c.sched.stopCause() == nil {
+		// Keep the ticket, buffer, backlog and file pin until the read finishes.
+		// Return this attempt's allowance; normal placement claims it again.
+		charge := work.reads.inFlight
+		c.sched.config.disk.completeIO(work, op, &c.inFlight)
+		work.reads.inFlight = charge
+		work.state = workWaiting
+		c.makeReady(work) // Reap only queues; the next pass submits the retry.
+		return
+	}
 	if op.opFlags&opAllocatedVFD != 0 {
 		if err != nil {
 			op.opFlags |= opReleaseVFD

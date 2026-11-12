@@ -10,6 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// setSpanForTest installs synthetic occupancy without losing page accounting.
+func (a *arena) setSpanForTest(i int, word uint64) {
+	old := a.words[i].Swap(word)
+	a.free.Add(int64(spanWord(word).freePages() - spanWord(old).freePages()))
+}
+
 func TestArenaBatchCrossesPreferredBoundaryAndSavesOnce(t *testing.T) {
 	a := newArena(7)
 	a.cursors = []arenaCursor{{start: 2, end: 4}}
@@ -41,8 +47,8 @@ func TestArenaBatchStartsAtRetainedOverflowHint(t *testing.T) {
 	a.cursors = []arenaCursor{{start: 2, end: 4}}
 	c := &a.cursors[0]
 	c.position.Store(3 | 6<<32)
-	a.words[2].Store(uint64(fullSpan))
-	a.words[3].Store(uint64(fullSpan))
+	a.setSpanForTest(2, uint64(fullSpan))
+	a.setSpanForTest(3, uint64(fullSpan))
 	batch := a.startBatch()
 	b, ok := batch.claim(a, spanPages)
 	require.True(t, ok)
@@ -152,7 +158,7 @@ func TestArenaCursorOverflowCoverage(t *testing.T) {
 	const spans = 7
 	a := newArena(spans)
 	for i := range a.words {
-		a.words[i].Store(uint64(fullSpan))
+		a.setSpanForTest(i, uint64(fullSpan))
 	}
 	for start := range spans {
 		for end := start + 1; end <= spans; end++ {
@@ -167,7 +173,7 @@ func TestArenaCursorOverflowCoverage(t *testing.T) {
 					require.False(t, ok)
 					require.Equal(t, initial, position, "exhaustion preserves both hints")
 					for free := range spans {
-						a.words[free].Store(uint64(emptySpan))
+						a.setSpanForTest(free, uint64(emptySpan))
 						b, position, ok := a.claimFrom(&c, initial, spanPages)
 						require.True(t, ok, "home=[%d,%d) hints=(%d,%d) free=%d", start, end, home, spill, free)
 						require.Equal(t, block{start: free * spanPages, n: spanPages}, b)
@@ -187,12 +193,12 @@ func TestArenaCursorOverflowCoverage(t *testing.T) {
 	a.cursors = []arenaCursor{{start: 2, end: 4}}
 	c := &a.cursors[0]
 	c.position.Store(3 | 6<<32)
-	a.words[6].Store(uint64(emptySpan))
+	a.setSpanForTest(6, uint64(emptySpan))
 	b, ok := a.claim(1)
 	require.True(t, ok)
 	require.Equal(t, 6*spanPages, b.start)
 	require.Equal(t, uint64(3|6<<32), c.position.Load())
-	a.words[2].Store(uint64(emptySpan))
+	a.setSpanForTest(2, uint64(emptySpan))
 	b, ok = a.claim(spanPages)
 	require.True(t, ok)
 	require.Equal(t, 2*spanPages, b.start)
@@ -239,21 +245,21 @@ func TestArenaScanFindsOnlyFreeNode(t *testing.T) {
 			limit := 1 << levelOf(n)
 			a := newArena(spans)
 			for i := range a.words {
-				a.words[i].Store(full)
+				a.setSpanForTest(i, full)
 			}
 			_, ok := a.claim(limit)
 			require.False(t, ok)
 			start := spanPages - n
 			before := uint64(refWord(run(0, spanPages) &^ run(start, n)))
 			for i := range a.words {
-				a.words[i].Store(before)
+				a.setSpanForTest(i, before)
 				b, ok := a.claim(limit)
 				require.True(t, ok, "free node in span %d", i)
 				require.Equal(t, block{start: i*spanPages + start, n: n}, b)
 				require.Equal(t, full, a.words[i].Load(), "claim reserves the whole free range")
 				a.freePages(b.start, b.n)
 				require.Equal(t, before, a.words[i].Load())
-				a.words[i].Store(full)
+				a.setSpanForTest(i, full)
 			}
 			require.Zero(t, a.available())
 		})
@@ -275,4 +281,27 @@ func TestArenaWholeSpan(t *testing.T) {
 	a.freePages(b.start, b.n)
 	require.Equal(t, uint64(3)<<62, a.words[0].Load())
 	require.Equal(t, spanPages, a.available())
+}
+
+func TestArenaFreeCounterMatchesOccupancy(t *testing.T) {
+	a := newArena(16)
+	var held []block
+	for step := range 1000 {
+		if step%3 == 0 && len(held) > 0 {
+			b := held[0]
+			held = held[1:]
+			a.freePages(b.start, b.n)
+		} else if b, ok := a.claim(1 << (step % 6)); ok {
+			held = append(held, b)
+		}
+		free := 0
+		for i := range a.words {
+			free += spanWord(a.words[i].Load()).freePages()
+		}
+		require.Equal(t, int64(free), a.free.Load())
+	}
+	for _, b := range held {
+		a.freePages(b.start, b.n)
+	}
+	require.Equal(t, len(a.words)*spanPages, a.available())
 }

@@ -1,6 +1,7 @@
 package iosched
 
 import (
+	"os"
 	"slices"
 	"time"
 )
@@ -18,6 +19,7 @@ type schedulerConfig struct {
 	ringDepth      uint32
 	sqPoll         bool
 	vfiles         uint32
+	files          []*os.File
 	coalescing     bool
 	dmaBuffers     [][]byte
 	disk           *DiskPolicy
@@ -36,6 +38,7 @@ func makeSchedulerConfig(opts []Option) schedulerConfig {
 		c.ringDepth = defaultRingDepth
 	}
 	c.ringDepth = max(c.ringDepth, minRingDepth)
+	c.vfiles = max(c.vfiles, uint32(len(c.files)))
 	if c.disk == nil {
 		c.disk = NewDiskPolicy()
 	}
@@ -45,7 +48,7 @@ func makeSchedulerConfig(opts []Option) schedulerConfig {
 // Option configures a scheduler. Device rates and admission limits belong to
 // the DiskPolicy passed with WithDiskPolicy. Out-of-range values select the
 // default or disable the feature; options never fail. The POSIX fallback honors
-// only WithVFiles.
+// WithVFiles and WithFiles.
 type Option interface {
 	apply(*schedulerConfig)
 }
@@ -67,6 +70,15 @@ func WithDiskPolicy(policy *DiskPolicy) Option {
 // emulates the table in userspace.
 func WithVFiles(n uint32) Option {
 	return optionFunc(func(c *schedulerConfig) { c.vfiles = n })
+}
+
+// WithFiles installs already-open files in VFD slots 0, 1, ... at startup.
+// Those slots are excluded from AllocateVFD. Files are borrowed: keep them open
+// until the scheduler closes; the scheduler does not close the original files.
+// Combine with WithVFiles to leave space for dynamically opened objects.
+func WithFiles(files ...*os.File) Option {
+	files = slices.Clone(files)
+	return optionFunc(func(c *schedulerConfig) { c.files = files })
 }
 
 // WithCoordinatorCPU requests best-effort affinity for the io_uring coordinator.

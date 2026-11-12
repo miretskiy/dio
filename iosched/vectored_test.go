@@ -1,6 +1,7 @@
 package iosched_test
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
+	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/iosched"
 )
 
@@ -130,4 +132,143 @@ func testVectoredVirtual(t *testing.T, s iosched.Scheduler) {
 	require.Equal(t, []byte("hello world"), bytesConcat(p...))
 
 	runOp(t, s, iosched.VCloseOp(vfd))
+}
+
+func TestInitialVirtualFiles(t *testing.T) {
+	for name, makeScheduler := range map[string]func(...iosched.Option) iosched.Scheduler{
+		"posix":   func(opts ...iosched.Option) iosched.Scheduler { return iosched.NewPOSIXScheduler(opts...) },
+		"default": func(opts ...iosched.Option) iosched.Scheduler { return iosched.NewDefaultScheduler(opts...) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newEmptyFile(t)
+			s := makeScheduler(iosched.WithVFiles(2), iosched.WithFiles(f))
+			t.Cleanup(func() {
+				if s != nil {
+					require.NoError(t, s.Close())
+				}
+			})
+			runOp(t, s, iosched.VWriteOp(0, []byte("data"), 0))
+			path := filepath.Join(t.TempDir(), "object")
+			ticket, err := s.Submit(iosched.VOpenatOp(unix.AT_FDCWD, path, os.O_CREATE|os.O_RDWR, 0600, iosched.AllocateVFD))
+			require.NoError(t, err)
+			vfd, err := ticket.Wait()
+			require.NoError(t, err)
+			require.Equal(t, 1, vfd, "initial slots must not be dynamically allocated")
+			ticket, err = s.Submit(iosched.VOpenatOp(unix.AT_FDCWD, path, os.O_RDWR, 0600, iosched.AllocateVFD))
+			require.NoError(t, err)
+			_, err = ticket.Wait()
+			require.ErrorIs(t, err, unix.ENFILE)
+			runOp(t, s, iosched.VCloseOp(uint32(vfd)))
+			// Borrowed files survive scheduler shutdown.
+			require.NoError(t, s.Close())
+			s = nil
+			_, err = f.WriteAt([]byte("live"), 0)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestWriteBufferLengthAndOwnership(t *testing.T) {
+	forEachScheduler(t, func(t *testing.T, scheduler iosched.Scheduler) {
+		allocator := alloc.NewAllocator(4 << 20)
+		defer allocator.Close()
+		buffer := alloc.NewAllocatingBuffer(allocator)
+		defer buffer.Release()
+		_, err := buffer.Write(bytes.Repeat([]byte("a"), 4096))
+		require.NoError(t, err)
+		gap, err := allocator.TryAcquire(4096)
+		require.NoError(t, err)
+		defer gap.Unpin()
+		_, err = buffer.Write(bytes.Repeat([]byte("b"), 256<<10))
+		require.NoError(t, err)
+		const length = 4096 + 37
+		const offset = 13
+		f := newEmptyFile(t)
+		before := allocator.Available()
+		op := iosched.WriteBufferOp(f, buffer, length, offset)
+		require.Equal(t, length, runOp(t, scheduler, op))
+		require.Equal(t, before, allocator.Available(), "submission only borrows the buffer")
+		contents, err := os.ReadFile(f.Name())
+		require.NoError(t, err)
+		require.Len(t, contents, offset+length)
+		require.Equal(t, bytesConcat(bytes.Repeat([]byte("a"), 4096), bytes.Repeat([]byte("b"), 37)), contents[offset:])
+		var constructed iosched.Op
+		require.Zero(t, testing.AllocsPerRun(100, func() { constructed = iosched.WriteBufferOp(f, buffer, length, offset) }), "buffer operation construction must not allocate a vector slice")
+		_ = constructed
+	})
+}
+
+func TestReadBufferLengthAndOwnership(t *testing.T) {
+	forEachScheduler(t, func(t *testing.T, s iosched.Scheduler) {
+		a := alloc.NewAllocator(4 << 20)
+		defer a.Close()
+		var held []alloc.Memory
+		for {
+			m, err := a.TryAcquire(4096)
+			if err != nil {
+				require.ErrorIs(t, err, alloc.ErrExhausted)
+				break
+			}
+			held = append(held, m)
+		}
+		for i := 0; i < len(held); i += 2 {
+			held[i].Unpin()
+		}
+		defer func() {
+			for i := 1; i < len(held); i += 2 {
+				held[i].Unpin()
+			}
+		}()
+		b := alloc.NewAllocatingBuffer(a)
+		defer b.Release()
+		_, err := b.Write(bytes.Repeat([]byte("z"), 260<<10))
+		require.NoError(t, err)
+		require.Greater(t, len(b.RawAllocations()), 1)
+
+		const length = 4096 + 37
+		const offset = 13
+		want := bytes.Repeat([]byte("v"), length)
+		f := newFileWith(t, append(make([]byte, offset), want...))
+		before := a.Available()
+		beforeLen := b.Len()
+		require.Equal(t, length, runOp(t, s, iosched.ReadBufferOp(f, b, length, offset)))
+		require.Equal(t, before, a.Available(), "I/O borrows existing allocations")
+		require.Equal(t, beforeLen, b.Len(), "I/O does not change stream cursors")
+		var got []byte
+		for _, m := range b.RawAllocations() {
+			got = append(got, m.Bytes()...)
+		}
+		require.Equal(t, want, got[:length])
+		require.Equal(t, bytes.Repeat([]byte("z"), beforeLen-length), got[length:beforeLen], "bytes past the requested length are untouched")
+		var constructed iosched.Op
+		require.Zero(t, testing.AllocsPerRun(100, func() { constructed = iosched.ReadBufferOp(f, b, length, offset) }))
+		_ = constructed
+	})
+}
+
+func TestVirtualReadBuffer(t *testing.T) {
+	for name, makeScheduler := range map[string]func(...iosched.Option) iosched.Scheduler{
+		"posix":   func(opts ...iosched.Option) iosched.Scheduler { return iosched.NewPOSIXScheduler(opts...) },
+		"default": func(opts ...iosched.Option) iosched.Scheduler { return iosched.NewDefaultScheduler(opts...) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := makeScheduler(iosched.WithVFiles(1))
+			defer s.Close()
+			a := alloc.NewAllocator(1 << 20)
+			defer a.Close()
+			b := alloc.NewAllocatingBuffer(a)
+			defer b.Release()
+			require.NoError(t, b.Grow(8192))
+			want := bytes.Repeat([]byte("v"), 7000)
+			f := newFileWith(t, want)
+			op := iosched.VOpenatOp(unix.AT_FDCWD, f.Name(), os.O_RDONLY, 0, iosched.AllocateVFD).Link(
+				iosched.VReadBufferOp(iosched.AllocateVFD, b, len(want), 0).HardLink(iosched.VCloseOp(iosched.AllocateVFD)))
+			ticket, err := s.Submit(op)
+			require.NoError(t, err)
+			_, err = ticket.Wait()
+			require.NoError(t, err)
+			require.Equal(t, len(want), ticket.AllResults()[1].N)
+			require.Equal(t, want, b.RawAllocations()[0].Bytes()[:len(want)])
+		})
+	}
 }

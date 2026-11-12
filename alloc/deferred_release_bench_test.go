@@ -101,6 +101,7 @@ func (d *deferredReleases) collect(span int) {
 			left &^= uint32((uint64(1)<<n - 1) << start)
 		}
 		if word.CompareAndSwap(uint64(old), uint64(next)) {
+			d.arena.free.Add(int64(bits.OnesCount32(mask)))
 			return
 		}
 	}

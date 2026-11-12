@@ -18,7 +18,7 @@ func BenchmarkArenaOverflow(b *testing.B) {
 				a.cursors[0].position.Store(uint64(home) << 32)
 				if overflow {
 					for i := range home {
-						a.words[i].Store(uint64(fullSpan))
+						a.setSpanForTest(i, uint64(fullSpan))
 					}
 				}
 				b.ReportAllocs()
@@ -52,7 +52,7 @@ func BenchmarkArenaOverflowBatch(b *testing.B) {
 				a.cursors = []arenaCursor{{end: home}}
 				a.cursors[0].position.Store(uint64(home) << 32)
 				for i := range home {
-					a.words[i].Store(uint64(fullSpan))
+					a.setSpanForTest(i, uint64(fullSpan))
 				}
 				b.ReportAllocs()
 				b.ResetTimer()

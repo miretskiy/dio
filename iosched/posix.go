@@ -24,20 +24,26 @@ import (
 type POSIXScheduler struct {
 	closed atomic.Bool
 
-	mu     sync.Mutex
-	vfiles []posixVFile
+	mu           sync.Mutex
+	vfiles       []posixVFile
+	firstDynamic int
 }
 
 type posixVFile struct {
 	file     *os.File
+	borrowed bool // The descriptor belongs to WithFiles, not this scheduler.
 	reserved bool // an AllocateVFD chain owns the slot before its open completes
 }
 
 // NewPOSIXScheduler creates a synchronous scheduler backed by POSIX file I/O.
-// It honors WithVFiles and ignores the io_uring-specific options.
+// It honors WithFiles and WithVFiles and ignores io_uring-specific options.
 func NewPOSIXScheduler(opts ...Option) *POSIXScheduler {
 	cfg := makeSchedulerConfig(opts)
-	return &POSIXScheduler{vfiles: make([]posixVFile, cfg.vfiles)}
+	s := &POSIXScheduler{vfiles: make([]posixVFile, cfg.vfiles), firstDynamic: len(cfg.files)}
+	for i, f := range cfg.files {
+		s.vfiles[i] = posixVFile{file: f, borrowed: true, reserved: true}
+	}
+	return s
 }
 
 // Submit executes op synchronously and returns a completed Ticket.
@@ -109,8 +115,9 @@ func (s *POSIXScheduler) allocateVFD(work *submission) {
 		return
 	}
 	s.mu.Lock()
-	i := slices.IndexFunc(s.vfiles, func(v posixVFile) bool { return v.file == nil && !v.reserved })
+	i := slices.IndexFunc(s.vfiles[s.firstDynamic:], func(v posixVFile) bool { return v.file == nil && !v.reserved })
 	if i >= 0 {
+		i += s.firstDynamic
 		s.vfiles[i].reserved = true
 	}
 	s.mu.Unlock()
@@ -144,22 +151,26 @@ func (s *POSIXScheduler) run(op *operation) (int, error) {
 			return 0, err
 		}
 		s.mu.Lock()
-		old := s.vfiles[op.vfd].file
+		old := s.vfiles[op.vfd]
 		s.vfiles[op.vfd] = posixVFile{file: os.NewFile(uintptr(fd), name)}
 		s.mu.Unlock()
-		if old != nil {
-			_ = old.Close()
+		if old.file != nil && !old.borrowed {
+			_ = old.file.Close()
 		}
 		return 0, nil
 	case OpClose:
 		s.mu.Lock()
-		f := s.vfiles[op.vfd].file
+		entry := s.vfiles[op.vfd]
+		f := entry.file
 		if f != nil {
 			s.vfiles[op.vfd] = posixVFile{}
 		}
 		s.mu.Unlock()
 		if f == nil {
 			return 0, syscall.EBADF
+		}
+		if entry.borrowed {
+			return 0, nil
 		}
 		return 0, f.Close()
 	default:
@@ -179,7 +190,7 @@ func (s *POSIXScheduler) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, v := range s.vfiles {
-		if v.file != nil {
+		if v.file != nil && !v.borrowed {
 			_ = v.file.Close()
 		}
 		s.vfiles[i] = posixVFile{}
@@ -213,12 +224,32 @@ func runPOSIXOp(op *operation, f *os.File) (n int, err error) {
 		// synchronous, so reaching this operation has already drained earlier
 		// submissions and linked predecessors.
 		err = nil
-	case OpReadv:
-		n, err = vectoredPOSIX(syscall.Pread, int(f.Fd()), op.bufs, op.offset)
-	case OpWritev:
-		n, err = vectoredPOSIX(syscall.Pwrite, int(f.Fd()), op.bufs, op.offset)
-		err = writeResultError(op, n, err)
-		err = posixDurable(op, f, err)
+	case OpReadv, OpWritev:
+		perform := syscall.Pread
+		if op.kind() == OpWritev {
+			perform = syscall.Pwrite
+		}
+		if len(op.allocations) != 0 {
+			n, err = ignoringEINTR(perform, int(f.Fd()), op.buf, op.offset)
+			for _, memory := range op.allocations {
+				if err != nil || n < len(op.buf) || n == int(op.length) {
+					break
+				}
+				data := memory.Bytes()[:min(int(op.length)-n, len(memory.Bytes()))]
+				var done int
+				done, err = ignoringEINTR(perform, int(f.Fd()), data, op.offset+int64(n))
+				n += done
+				if done != len(data) {
+					break
+				}
+			}
+		} else {
+			n, err = vectoredPOSIX(perform, int(f.Fd()), op.bufs, op.offset)
+		}
+		if op.kind() == OpWritev {
+			err = writeResultError(op, n, err)
+			err = posixDurable(op, f, err)
+		}
 	case OpUnlinkat:
 		err = unix.Unlinkat(op.dfd, string(op.path[:len(op.path)-1]), 0)
 	case OpOpenat:

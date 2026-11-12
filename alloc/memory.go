@@ -84,6 +84,19 @@ func (m *Memory) trim(size int) {
 	m.leases.owner.freePages(int(m.unit)+size/align.BlockSize, tail/align.BlockSize)
 }
 
+// trimPrefix releases a page-aligned prefix of an exclusively owned lease.
+// Both the old handle and any historical handle at the new start stay retired.
+func (m *Memory) trimPrefix(size int) {
+	word := m.word()
+	if word.Load() != uint64(m.gen)<<32|1 {
+		panic("alloc: trimPrefix requires exclusive ownership")
+	}
+	owner, unit := m.leases.owner, int(m.unit)
+	word.Store(uint64(m.gen+1) << 32)
+	*m = m.leases.lease(unit+size/align.BlockSize, m.data[size:])
+	owner.freePages(unit, size/align.BlockSize)
+}
+
 // word returns the lease word, or nil for the zero Memory.
 func (m Memory) word() *atomic.Uint64 {
 	if m.leases == nil {

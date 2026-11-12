@@ -122,7 +122,7 @@ func acceptOps(c *coordinator, ops ...Op) ([]Ticket, []*submission) {
 		if err != nil {
 			panic(err)
 		}
-		if !c.sched.config.disk.admit(request) {
+		if err := c.sched.config.disk.admit(request); err != nil {
 			panic(ErrRejected)
 		}
 		tickets[i] = Ticket{&request.completion}
@@ -278,7 +278,7 @@ func TestRunStopsWithoutPlacingSubmissionAcceptedBeforeClose(t *testing.T) {
 	op := VReadOp(0, make([]byte, 1), 0)
 	request := prepareForTest(op)
 	ticket := Ticket{&request.completion}
-	require.True(t, s.config.disk.admit(request))
+	require.NoError(t, s.config.disk.admit(request))
 	if !s.tryPush(request) {
 		t.Fatal("submission was rejected before close")
 	}
@@ -761,4 +761,101 @@ func TestPlaceReadyStopsWhenNothingCanDispatch(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.Equal(t, [4]int{}, c.readyClasses)
+}
+
+func TestStandaloneReadRetriesCompletionEAGAIN(t *testing.T) {
+	for _, vectored := range []bool{false, true} {
+		t.Run(map[bool]string{false: "read", true: "readv"}[vectored], func(t *testing.T) {
+			policy := NewDiskPolicy(WithLatencyGoal(time.Millisecond), WithReadBacklogLimit(time.Second))
+			c := newTestCoordinator(t, 4, 0, WithDiskPolicy(policy))
+			payload := []byte("read survives completion EAGAIN")
+			f := testFile(t, len(payload))
+			_, err := f.WriteAt(payload, 0)
+			require.NoError(t, err)
+			buffer := make([]byte, len(payload))
+			op := ReadOp(f, buffer, 0)
+			if vectored {
+				op = ReadvOp(f, [][]byte{buffer[:7], buffer[7:]}, 0)
+			}
+			callbacks := 0
+			op.whenDone = func(n int, err error) {
+				callbacks++
+				require.NoError(t, err)
+				require.Equal(t, len(payload), n)
+			}
+			tickets, works := acceptOps(c, op, DrainOp(f))
+			work := works[0]
+			backlog := policy.readBudget.backlog.Load()
+			var firstSlat time.Duration
+			for attempt := range 2 {
+				require.True(t, policy.dispatch(work, &c.inFlight))
+				c.take(work)
+				work.markIssued()
+				if attempt == 0 {
+					firstSlat = work.Slat
+				}
+				c.finishOperation(work, &work.root, 0, syscall.EAGAIN)
+				require.Equal(t, workReady, work.state)
+				require.EqualValues(t, 1, work.remaining)
+				require.Equal(t, backlog, policy.readBudget.backlog.Load())
+				require.Zero(t, policy.readBudget.inFlight.Load())
+				require.Zero(t, c.inFlight.reads)
+				require.EqualValues(t, 1, works[1].waitCount, "Drain must keep waiting for the retried read")
+				require.Zero(t, callbacks, "the I/O buffer must stay owned until the final completion")
+				select {
+				case <-tickets[0].Done():
+					t.Fatal("ticket completed before the retry")
+				default:
+				}
+			}
+			c.placeReady(false)
+			submitAndReapUntil(t, c, func() bool { return work.state == workDone })
+			n, err := tickets[0].Wait()
+			require.NoError(t, err)
+			require.Equal(t, len(payload), n)
+			require.Equal(t, payload, buffer)
+			require.Equal(t, 1, callbacks)
+			require.Equal(t, firstSlat, tickets[0].Slat, "retry time belongs in completion latency")
+			require.Zero(t, policy.readBudget.backlog.Load())
+			require.Zero(t, policy.readBudget.inFlight.Load())
+			c.placeReady(false)
+			submitAndReapUntil(t, c, func() bool { return works[1].state == workDone })
+			_, err = tickets[1].Wait()
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCompletionEAGAINNotRetriedForWritesChainsOrShutdown(t *testing.T) {
+	for _, kind := range []string{"write", "linked-read", "shutdown"} {
+		t.Run(kind, func(t *testing.T) {
+			c := newTestCoordinator(t, 4, 0)
+			f := testFile(t, 8)
+			op := ReadOp(f, make([]byte, 8), 0)
+			switch kind {
+			case "write":
+				op = WriteOp(f, make([]byte, 8), 0)
+			case "linked-read":
+				op = op.HardLink(ReadOp(f, make([]byte, 8), 0))
+			}
+			callbacks := 0
+			op.whenDone = func(_ int, err error) { callbacks++; require.ErrorIs(t, err, syscall.EAGAIN) }
+			tickets, works := acceptOps(c, op)
+			work := works[0]
+			require.True(t, c.sched.config.disk.dispatch(work, &c.inFlight))
+			c.take(work)
+			if kind == "shutdown" {
+				c.sched.signalShutdown(errSchedulerClosed)
+			}
+			c.finishOperation(work, &work.root, 0, syscall.EAGAIN)
+			for i := 1; i < work.opCount(); i++ {
+				c.finishOperation(work, work.op(i), 8, nil)
+			}
+			_, err := tickets[0].Wait()
+			require.ErrorIs(t, err, syscall.EAGAIN)
+			require.Equal(t, 1, callbacks)
+			require.Zero(t, c.ready.len)
+			require.Zero(t, c.accepted.len)
+		})
+	}
 }

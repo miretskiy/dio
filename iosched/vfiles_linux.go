@@ -31,6 +31,9 @@ func (c *coordinator) allocVFD() uint32 {
 }
 
 func (c *coordinator) freeVFD(vfd uint32) {
+	if vfd < c.reservedVFiles {
+		return
+	}
 	c.vfiles[vfd/64] &^= uint64(1) << (vfd % 64)
 	c.nextVFile = int(vfd / 64)
 }

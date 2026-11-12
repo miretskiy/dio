@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"io"
+	"sync/atomic"
 
 	"github.com/miretskiy/dio/v2/align"
 )
@@ -81,7 +82,20 @@ func (b *Buffer) Release() {
 	b.Reset()
 }
 
-// Trim releases unused capacity after the written bytes, rounded up to a page.
+// TakeAllocations transfers the allocation slice and its owned references to the
+// caller, leaving b empty. It neither copies handles nor increments references.
+// The caller must eventually Unpin each allocation. Existing borrowed views of
+// this slice remain valid; unlike Release, taking it does not clear the handles.
+func (b *Buffer) TakeAllocations() []Memory {
+	memory := b.mem
+	b.mem = nil
+	b.capacity = 0
+	b.Reset()
+	return memory
+}
+
+// Trim releases unused capacity after the written bytes, rounded up to a page,
+// and clears the padding between the written end and that page boundary.
 // Contents and read/write positions are preserved. Call before sharing the
 // buffer or submitting I/O: shrinking a lease requires exclusive ownership and
 // invalidates unpinned copies of that handle, just like growth.
@@ -107,12 +121,43 @@ func (b *Buffer) Trim() {
 		clear(b.mem[i:])
 		b.mem = b.mem[:i]
 		b.capacity = size
-		return
+		break
 	}
+	last := b.mem[len(b.mem)-1].data
+	clear(last[len(last)-(size-b.write.offset):])
 }
 
 // appendRaw consumes a raw range, extending the last lease or publishing a new
 // one. Only this boundary between raw storage and Buffer ownership needs leases.
+// TrimPrefix removes and releases n bytes from the beginning before any reads.
+// n must be page-aligned and no greater than the written length. Remaining
+// bytes do not move. Call before sharing allocations; every removed or resized
+// lease requires exclusive ownership and invalidates old copies of its handle.
+func (b *Buffer) TrimPrefix(n int) {
+	if n < 0 || n%align.BlockSize != 0 || n > b.write.offset || b.read.offset != 0 {
+		panic("alloc: invalid prefix trim")
+	}
+	if n == 0 {
+		return
+	}
+	left, removed := n, 0
+	for left > 0 {
+		m := &b.mem[removed]
+		if left < len(m.data) {
+			m.trimPrefix(left)
+			break
+		}
+		left -= len(m.data)
+		m.Unpin()
+		removed++
+	}
+	kept := copy(b.mem, b.mem[removed:])
+	clear(b.mem[kept:])
+	b.mem = b.mem[:kept]
+	b.capacity -= n
+	b.write = bufferCursor{offset: b.write.offset - n}
+}
+
 func (b *Buffer) appendRaw(m rawMemory) {
 	if last := len(b.mem) - 1; last < 0 || !b.mem[last].extend(m) {
 		b.mem = append(b.mem, m.lease(b.allocator.arena))
@@ -257,3 +302,127 @@ var (
 	_ io.ReaderFrom = (*Buffer)(nil)
 	_ io.WriterTo   = (*Buffer)(nil)
 )
+
+// ReadOnlyBuffer owns a frozen buffer. Retain acquires one reference to the
+// whole buffer; Release frees its allocations when the last owner leaves.
+// Borrowed slices must not be modified and remain valid while a reference is held.
+type ReadOnlyBuffer struct {
+	buffer   *Buffer
+	capacity int
+	refs     atomic.Int64
+}
+
+// Freeze transfers ownership of b's allocations. Do not write, grow, trim or
+// release b afterward. Outstanding I/O may initialize the allocations while
+// holding a reference; wait for it before reading views. After initialization,
+// contents and allocation boundaries stay fixed.
+func (b *Buffer) Freeze() *ReadOnlyBuffer {
+	r := &ReadOnlyBuffer{buffer: b, capacity: b.Cap()}
+	r.refs.Store(1)
+	return r
+}
+
+func (b *ReadOnlyBuffer) Cap() int { return b.capacity }
+
+// Retain requires an existing reference and returns another independently owned reference.
+func (b *ReadOnlyBuffer) Retain() *ReadOnlyBuffer {
+	b.refs.Add(1)
+	return b
+}
+
+// Release returns the number of allocation bytes actually freed.
+func (b *ReadOnlyBuffer) Release() (freed int64) {
+	if b.refs.Add(-1) != 0 {
+		return 0
+	}
+	for _, m := range b.buffer.mem {
+		size := len(m.data)
+		if m.Unpin() {
+			freed += int64(size)
+		}
+	}
+	clear(b.buffer.mem)
+	b.buffer.mem = nil
+	b.buffer.capacity = 0
+	b.buffer.Reset()
+	return freed
+}
+
+// First returns a borrowed view of the first allocation, or nil for an empty buffer.
+func (b *ReadOnlyBuffer) First() []byte {
+	if len(b.buffer.mem) == 0 {
+		return nil
+	}
+	p := b.buffer.mem[0].data
+	return p[:len(p):len(p)]
+}
+
+// View creates an independent cursor over a byte range within Cap(). It borrows
+// b's reference. The caller must initialize the range before reading it; this
+// permits views of buffers filled directly by I/O rather than Buffer.Write.
+func (b *ReadOnlyBuffer) View(offset, length int) BufferView {
+	if offset < 0 || length < 0 || offset > b.capacity-length {
+		panic("alloc: invalid buffer view")
+	}
+	return BufferView{buffer: b.buffer, cursor: bufferCursor{offset: offset}, end: offset + length, size: length}
+}
+
+// BufferView is a read-only cursor. Copies have independent positions and borrow
+// the same storage. Keep its ReadOnlyBuffer alive until all views are finished.
+type BufferView struct {
+	buffer *Buffer
+	cursor bufferCursor
+	end    int
+	size   int
+}
+
+func (v *BufferView) Size() int64 { return int64(v.size) }
+func (v *BufferView) Len() int    { return v.end - v.cursor.offset }
+
+func (v *BufferView) readable() []byte {
+	p := v.buffer.at(&v.cursor)
+	n := min(len(p), v.Len())
+	return p[:n:n]
+}
+
+// Next consumes the next contiguous chunk without copying. A returned slice
+// remains valid until the owning ReadOnlyBuffer is released, including across
+// subsequent Next or Read calls. Exhaustion returns io.EOF and no bytes.
+func (v *BufferView) Next() ([]byte, error) {
+	if v.Len() == 0 {
+		return nil, io.EOF
+	}
+	p := v.readable()
+	v.cursor.offset += len(p)
+	return p, nil
+}
+
+func (v *BufferView) Read(p []byte) (int, error) {
+	if len(p) > 0 && v.Len() == 0 {
+		return 0, io.EOF
+	}
+	n := 0
+	for n < len(p) && v.Len() > 0 {
+		size := copy(p[n:], v.readable())
+		v.cursor.offset += size
+		n += size
+	}
+	return n, nil
+}
+
+func (v *BufferView) WriteTo(w io.Writer) (int64, error) {
+	var total int64
+	for v.Len() > 0 {
+		p := v.readable()
+		n, err := w.Write(p)
+		v.cursor.offset += n
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+		if n != len(p) {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
+}

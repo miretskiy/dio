@@ -116,6 +116,38 @@ func TestBufferTrimReturnsMergedTail(t *testing.T) {
 	a.requireEmpty(t)
 }
 
+// Dirty allocator pages must never survive in a trimmed buffer's I/O padding,
+// including when capacity was already exactly the rounded written length.
+func TestBufferTrimClearsPadding(t *testing.T) {
+	for _, size := range []int{0, 1, chunk - 1, chunk, chunk + 1, 3*chunk - 1} {
+		a := newAllocator(t, spanBytes, WithoutZeroing())
+		b := NewAllocatingBuffer(a)
+		require.NoError(t, b.Grow(3*chunk))
+		for _, m := range b.RawAllocations() {
+			for i := range m.Bytes() {
+				m.Bytes()[i] = 0xa5
+			}
+		}
+		payload := bytes.Repeat([]byte{0x5a}, size)
+		_, err := b.Write(payload)
+		require.NoError(t, err)
+		b.Trim()
+		require.EqualValues(t, align.PageAlign(int64(size)), b.Cap())
+		framed := make([]byte, 0, b.Cap())
+		for _, m := range b.RawAllocations() {
+			framed = append(framed, m.Bytes()...)
+		}
+		require.Equal(t, payload, framed[:size])
+		require.Equal(t, make([]byte, b.Cap()-size), framed[size:])
+		b.Trim() // Also clear a previously trimmed final page.
+		got, err := io.ReadAll(b)
+		require.NoError(t, err)
+		require.Equal(t, payload, got)
+		b.Release()
+		a.requireEmpty(t)
+	}
+}
+
 func TestBufferGrowthAccounting(t *testing.T) {
 	a := newAllocator(t, spanBytes)
 	b := NewAllocatingBuffer(a)
@@ -508,4 +540,106 @@ func TestBufferReadFromAllocationFailure(t *testing.T) {
 	got, err := io.ReadAll(b)
 	require.NoError(t, err)
 	require.Equal(t, p[:chunk], got)
+}
+
+func TestBufferTrimPrefixKeepsSuffix(t *testing.T) {
+	for _, prefix := range []int{chunk, spanBytes + chunk, 3 * spanBytes} {
+		a := newAllocator(t, 8*spanBytes, WithoutZeroing())
+		a.arena.cursors = []arenaCursor{{end: len(a.arena.words)}}
+		b := NewAllocatingBuffer(a)
+		payload := bytes.Repeat([]byte("abcd"), 3*spanBytes/4)
+		_, err := b.Write(payload)
+		require.NoError(t, err)
+		old := b.mem[0]
+		b.TrimPrefix(prefix)
+		require.Equal(t, len(payload)-prefix, b.Len())
+		require.Equal(t, len(payload)-prefix, b.Cap())
+		require.False(t, old.TryInc(), "trimmed handles must stay retired")
+		require.EqualValues(t, a.Capacity()-int64(b.Cap()), a.Available())
+		other := NewAllocatingBuffer(a)
+		require.NoError(t, other.Grow(int(a.Available())))
+		for _, m := range other.RawAllocations() {
+			clear(m.Bytes())
+		}
+		got, err := io.ReadAll(b)
+		require.NoError(t, err)
+		require.Equal(t, payload[prefix:], got)
+		b.Release()
+		other.Release()
+		a.requireEmpty(t)
+	}
+}
+
+func TestBufferTrimPrefixRejectsSharedOrUnalignedMemory(t *testing.T) {
+	a := newAllocator(t, spanBytes)
+	b := NewAllocatingBuffer(a)
+	defer b.Release()
+	_, err := b.Write(make([]byte, 2*chunk))
+	require.NoError(t, err)
+	require.Panics(t, func() { b.TrimPrefix(1) })
+	require.True(t, b.mem[0].TryInc())
+	require.Panics(t, func() { b.TrimPrefix(chunk) })
+	b.mem[0].Unpin()
+	b.TrimPrefix(chunk)
+	require.Equal(t, chunk, b.Len())
+}
+
+func TestBufferTakeAllocationsMovesOwnership(t *testing.T) {
+	a := newAllocator(t, 4*spanBytes)
+	b := NewAllocatingBuffer(a)
+	_, err := b.Write([]byte("transferred"))
+	require.NoError(t, err)
+	borrowed := b.RawAllocations()
+	moved := b.TakeAllocations()
+	require.Same(t, &borrowed[0], &moved[0])
+	require.Zero(t, b.Len())
+	require.Zero(t, b.Cap())
+	b.Release()
+	require.Equal(t, "transferred", string(moved[0].Bytes()[:11]))
+	_, err = b.Write([]byte("reused"))
+	require.NoError(t, err)
+	require.Equal(t, "transferred", string(moved[0].Bytes()[:11]))
+	for _, memory := range moved {
+		require.True(t, memory.Unpin(), "transfer does not add a reference")
+	}
+	b.Release()
+	require.Equal(t, a.Capacity(), a.Available())
+}
+
+func TestReadOnlyBufferViewsAndOwnership(t *testing.T) {
+	a := newAllocator(t, 4*spanBytes)
+	b := NewAllocatingBuffer(a)
+	_, err := b.Write(bytes.Repeat([]byte("a"), chunk))
+	require.NoError(t, err)
+	gap, err := a.TryAcquire(chunk)
+	require.NoError(t, err)
+	defer gap.Unpin()
+	_, err = b.Write(bytes.Repeat([]byte("b"), 3*chunk))
+	require.NoError(t, err)
+	require.Greater(t, len(b.RawAllocations()), 1)
+	frame := b.Freeze()
+	size := frame.Cap()
+	frame.Retain()
+	first := frame.View(chunk-3, 10)
+	second := first
+	want := []byte("aaabbbbbbb")
+	p, err := first.Next()
+	require.NoError(t, err)
+	require.Equal(t, []byte("aaa"), p)
+	require.Equal(t, len(p), cap(p), "borrowed slices cannot append into adjacent data")
+	require.Same(t, &b.RawAllocations()[0].Bytes()[chunk-3], &p[0])
+	require.Zero(t, frame.Release(), "the second owner keeps every allocation alive")
+	var got bytes.Buffer
+	_, err = first.WriteTo(&got)
+	require.NoError(t, err)
+	require.Equal(t, []byte("bbbbbbb"), got.Bytes())
+	got.Reset()
+	_, err = second.WriteTo(&got)
+	require.NoError(t, err)
+	require.Equal(t, want, got.Bytes(), "view cursors are independent")
+	require.Equal(t, []byte("aaa"), p, "consumption leaves borrowed bytes unchanged")
+	_, err = first.Next()
+	require.ErrorIs(t, err, io.EOF)
+	require.EqualValues(t, size, frame.Release())
+	require.EqualValues(t, chunk, a.Capacity()-a.Available())
 }

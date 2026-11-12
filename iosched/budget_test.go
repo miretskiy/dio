@@ -109,13 +109,13 @@ func TestDiskAdmissionLimit(t *testing.T) {
 	p := policy(WithoutIOBudget(), WithWriteBacklogLimit(12))
 	require.NoError(t, p.CanAdmit(OpWrite))
 	a, b, next := policyWrite(p, 7), policyWrite(p, 5), policyWrite(p, 1)
-	require.True(t, p.admit(a))
-	require.True(t, p.admit(b))
+	require.NoError(t, p.admit(a))
+	require.NoError(t, p.admit(b))
 	require.Equal(t, DiskStats{}, p.Stats(), "Submit acquires nothing")
 	p.account(a)
 	p.account(b)
 	p.updateAdmission()
-	require.False(t, p.admit(next))
+	require.Error(t, p.admit(next))
 	require.ErrorIs(t, p.CanAdmit(OpWrite), ErrRejected)
 	require.ErrorIs(t, p.CanAdmit(OpWritev|opVirtual), ErrRejected)
 	require.NoError(t, p.CanAdmit(OpRead))
@@ -123,7 +123,7 @@ func TestDiskAdmissionLimit(t *testing.T) {
 	require.Equal(t, DiskUsage{Backlog: 12}, p.Stats().Writes)
 	require.EqualValues(t, 1, next.writes.backlog, "rejection does not mutate request totals")
 	p.release(a, &testRing)
-	require.True(t, p.admit(next))
+	require.NoError(t, p.admit(next))
 	require.NoError(t, p.CanAdmit(OpWrite))
 	p.account(next)
 	p.release(b, &testRing)
@@ -137,7 +137,7 @@ func TestDiskAdmissionConcurrent(t *testing.T) {
 	works := make([]*submission, 64)
 	for i := range works {
 		works[i] = policyWrite(p, 1024)
-		require.True(t, p.admit(works[i]), "staged work can overshoot before a coordinator observes it")
+		require.NoError(t, p.admit(works[i]), "staged work can overshoot before a coordinator observes it")
 	}
 	require.Equal(t, DiskStats{}, p.Stats())
 	for _, work := range works {
@@ -145,13 +145,13 @@ func TestDiskAdmissionConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 	require.Equal(t, time.Duration(64*1024), p.Stats().Writes.Backlog)
-	require.False(t, p.admit(policyWrite(p, 1)))
+	require.Error(t, p.admit(policyWrite(p, 1)))
 	for _, work := range works {
 		wg.Go(func() { p.release(work, &testRing) })
 	}
 	wg.Wait()
 	require.Equal(t, DiskStats{}, p.Stats())
-	require.True(t, p.admit(policyWrite(p, 1)), "completion reopens the circuit")
+	require.NoError(t, p.admit(policyWrite(p, 1)), "completion reopens the circuit")
 }
 
 // eighthSecondPerByte models one write byte as 125 ms.
@@ -165,29 +165,29 @@ func TestWriteBacklogRecovery(t *testing.T) {
 		p.account(a)
 		p.account(b)
 		p.updateAdmission() // 2 s - 250 ms = 1.75 s.
-		require.False(t, p.admit(policyWrite(p, 1)))
+		require.Error(t, p.admit(policyWrite(p, 1)))
 		require.ErrorIs(t, p.CanAdmit(OpWrite), ErrRejected)
 		require.NoError(t, p.CanAdmit(OpRead))
 		p.release(a, &testRing)
 		p.release(b, &testRing)
 		require.Equal(t, DiskStats{}, p.Stats())
-		require.False(t, p.admit(policyWrite(p, 1)), "early completion does not cancel the recovery interval")
+		require.Error(t, p.admit(policyWrite(p, 1)), "early completion does not cancel the recovery interval")
 		read := &submission{reads: ioCharge{backlog: 4}}
-		require.True(t, p.admit(read), "reads continue during write recovery")
+		require.NoError(t, p.admit(read), "reads continue during write recovery")
 		p.account(read)
 		p.release(read, &testRing)
 		mandatory := policyWrite(p, 32)
 		mandatory.root.opFlags |= opMustAdmit
-		require.True(t, p.admit(mandatory))
+		require.NoError(t, p.admit(mandatory))
 		p.account(mandatory)
 		p.release(mandatory, &testRing)
 		require.Equal(t, DiskStats{}, p.Stats())
 		time.Sleep(1750*time.Millisecond - time.Nanosecond)
-		require.False(t, p.admit(policyWrite(p, 1)))
+		require.Error(t, p.admit(policyWrite(p, 1)))
 		p.updateAdmission() // An observation or rejected arrival cannot extend the pause.
 		time.Sleep(time.Nanosecond)
 		synctest.Wait()
-		require.True(t, p.admit(policyWrite(p, 1)), "the pause ends with no coordinator activity")
+		require.NoError(t, p.admit(policyWrite(p, 1)), "the pause ends with no coordinator activity")
 		require.NoError(t, p.CanAdmit(OpWrite))
 	})
 }
@@ -205,19 +205,19 @@ func TestCoordinatorRecoveryEstimate(t *testing.T) {
 					wg.Go(p.updateAdmission)
 				}
 				wg.Wait()
-				require.False(t, p.admit(policyWrite(p, 1)))
+				require.Error(t, p.admit(policyWrite(p, 1)))
 				drain := time.Duration(bytes-4) * time.Second / 8
 				time.Sleep(drain - time.Nanosecond)
-				require.False(t, p.admit(policyWrite(p, 1)))
+				require.Error(t, p.admit(policyWrite(p, 1)))
 				time.Sleep(time.Nanosecond)
 				synctest.Wait()
-				require.True(t, p.admit(policyWrite(p, 1)))
+				require.NoError(t, p.admit(policyWrite(p, 1)))
 				p.updateAdmission()
-				require.False(t, p.admit(policyWrite(p, 1)), "still-full backlog can start another interval")
+				require.Error(t, p.admit(policyWrite(p, 1)), "still-full backlog can start another interval")
 				p.release(work, &testRing)
 				time.Sleep(drain)
 				synctest.Wait()
-				require.True(t, p.admit(policyWrite(p, 1)))
+				require.NoError(t, p.admit(policyWrite(p, 1)))
 			})
 		})
 	}
@@ -228,7 +228,7 @@ func TestCoordinatorSkipsAlreadyDrainedBacklog(t *testing.T) {
 	work := policyWrite(p, 16)
 	p.account(work)
 	p.release(work, &testRing)
-	require.True(t, p.admit(policyWrite(p, 1)))
+	require.NoError(t, p.admit(policyWrite(p, 1)))
 }
 
 func TestDiskServiceTimeDispatch(t *testing.T) {
@@ -239,7 +239,7 @@ func TestDiskServiceTimeDispatch(t *testing.T) {
 	for i := range works {
 		work := policyWrite(p, 25)
 		works[i] = work
-		require.True(t, p.admit(work), "time allowance does not reject queued work")
+		require.NoError(t, p.admit(work), "time allowance does not reject queued work")
 		p.account(work)
 		if p.dispatch(work, &ring) {
 			work.state = workIssued
@@ -269,12 +269,12 @@ func TestDiskServiceTimeDispatch(t *testing.T) {
 	require.Zero(t, ring.writes)
 
 	oversized := policyWrite(p, 200)
-	require.True(t, p.admit(oversized))
+	require.NoError(t, p.admit(oversized))
 	p.account(oversized)
 	require.True(t, p.dispatch(oversized, &ring), "an oversized chain runs on an idle ring")
 	oversized.state = workIssued
 	next := policyWrite(p, 1)
-	require.True(t, p.admit(next))
+	require.NoError(t, p.admit(next))
 	p.account(next)
 	require.False(t, p.dispatch(next, &ring))
 	p.completeIO(oversized, &oversized.root, &ring)
@@ -315,10 +315,10 @@ func TestSharedDiskPolicy(t *testing.T) {
 	require.Equal(t, 3, a.coordinatorCPU)
 	require.EqualValues(t, 64, a.ringDepth)
 	work := policyWrite(p, 2048)
-	require.True(t, a.disk.admit(work))
+	require.NoError(t, a.disk.admit(work))
 	p.account(work)
 	p.updateAdmission()
-	require.False(t, b.disk.admit(policyWrite(p, 1)))
+	require.Error(t, b.disk.admit(policyWrite(p, 1)))
 	a.disk.release(work, &testRing)
 }
 
@@ -337,17 +337,76 @@ func TestRecoveryAndDispatchAreIndependent(t *testing.T) {
 		first.state = workIssued
 		require.False(t, p.dispatch(second, &ring))
 		require.Equal(t, time.Second, p.Stats().Writes.InFlight)
-		require.False(t, p.admit(policyWrite(p, 1)))
+		require.Error(t, p.admit(policyWrite(p, 1)))
 		p.completeIO(first, &first.root, &ring)
 		p.release(first, &ring)
-		require.False(t, p.admit(policyWrite(p, 1)))
+		require.Error(t, p.admit(policyWrite(p, 1)))
 		require.True(t, p.dispatch(second, &ring), "recovery must not stop admitted work draining")
 		second.state = workIssued
 		p.completeIO(second, &second.root, &ring)
 		p.release(second, &ring)
 		time.Sleep(1500 * time.Millisecond)
 		synctest.Wait()
-		require.True(t, p.admit(policyWrite(p, 1)))
+		require.NoError(t, p.admit(policyWrite(p, 1)))
 		require.Equal(t, DiskStats{}, p.Stats())
 	})
+}
+
+func TestRejectedErrorDelay(t *testing.T) {
+	p := policy(WithoutIOBudget(), WithWriteBacklogLimit(12))
+	blocker := policyWrite(p, 20)
+	p.account(blocker)
+	p.updateAdmission()
+	next := policyWrite(p, 4)
+	err := p.admit(next)
+	var rejection *RejectedError
+	require.ErrorIs(t, err, ErrRejected)
+	require.ErrorAs(t, err, &rejection)
+	require.Equal(t, 12*time.Nanosecond, rejection.RetryAfter)
+	require.EqualValues(t, 20, p.Stats().Writes.Backlog, "rejection acquires no charge")
+	p.release(blocker, &testRing)
+	require.NoError(t, p.admit(next))
+}
+
+func TestRejectedErrorRecoveryDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := NewDiskPolicy(WithoutIOBudget(), WithWriteBandwidth(8), WithWriteBacklogLimit(2*time.Second),
+			WithWriteBacklogRecovery(500*time.Millisecond))
+		blocker := policyWrite(p, 16)
+		p.account(blocker)
+		p.updateAdmission()
+		var rejection *RejectedError
+		require.ErrorAs(t, p.CanAdmit(OpWrite), &rejection)
+		require.Equal(t, 1500*time.Millisecond, rejection.RetryAfter)
+		time.Sleep(250 * time.Millisecond)
+		require.ErrorAs(t, p.admit(policyWrite(p, 1)), &rejection)
+		require.Equal(t, 1250*time.Millisecond, rejection.RetryAfter)
+		p.release(blocker, &testRing)
+		time.Sleep(rejection.RetryAfter)
+		require.NoError(t, p.CanAdmit(OpWrite))
+	})
+}
+
+func TestAllowBacklogRetainsAccountingAndDispatchLimit(t *testing.T) {
+	p := policy(WithLatencyGoal(8), WithWriteBacklogLimit(16))
+	blocker := policyWrite(p, 16)
+	p.account(blocker)
+	p.updateAdmission()
+	var ring ringInFlight
+	require.True(t, p.dispatch(blocker, &ring))
+	ordinary := policyWrite(p, 4)
+	require.ErrorIs(t, p.admit(ordinary), ErrRejected)
+	op := WriteOp(nil, make([]byte, 4), 0).AllowBacklog()
+	small := prepareForTest(op)
+	small.writes = ordinary.writes
+	require.NoError(t, p.admit(small))
+	p.account(small)
+	require.EqualValues(t, 20, p.Stats().Writes.Backlog, "allowed work still counts toward overload")
+	require.False(t, p.dispatch(small, &ring), "allowed work waits for the normal dispatch allowance")
+	p.completeIO(blocker, &blocker.root, &ring)
+	p.release(blocker, &ring)
+	require.True(t, p.dispatch(small, &ring))
+	p.completeIO(small, &small.root, &ring)
+	p.release(small, &ring)
+	require.Equal(t, DiskStats{}, p.Stats())
 }

@@ -130,7 +130,7 @@ func benchmarkAllocator(b *testing.B, cursorBudget int) {
 		workers := runtime.GOMAXPROCS(0)
 		a := makeAllocator(b, arenaBytes, WithoutZeroing())
 		for i := range a.arena.words {
-			a.arena.words[i].Store(uint64(fullSpan))
+			a.arena.setSpanForTest(i, uint64(fullSpan))
 		}
 		b.ReportAllocs()
 		benchmarkWorkers(b, workers, func(_, n int) {
@@ -180,7 +180,7 @@ func benchmarkAllocator(b *testing.B, cursorBudget int) {
 		a := makeAllocator(b, arenaBytes, WithoutZeroing())
 		word := uint64(refWord(0xaaaaaaaa))
 		for i := range a.arena.words {
-			a.arena.words[i].Store(word)
+			a.arena.setSpanForTest(i, word)
 		}
 		b.ReportAllocs()
 		benchmarkWorkers(b, workers, func(_, n int) {
