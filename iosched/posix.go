@@ -94,6 +94,9 @@ func (s *POSIXScheduler) prepareSubmission(op *Op) (*submission, error) {
 	}
 	for i := range work.opCount() {
 		current := work.op(i)
+		if current.isNVMe() || current.kind() == OpRawNVMeCmd {
+			return nil, syscall.EOPNOTSUPP
+		}
 		if !current.isVirtual() {
 			continue
 		}

@@ -46,6 +46,8 @@ const (
 	rawSetupCQSize       rawSetupFlags   = C.IORING_SETUP_CQSIZE
 	rawSetupClamp        rawSetupFlags   = C.IORING_SETUP_CLAMP
 	rawSetupSubmitAll    rawSetupFlags   = C.IORING_SETUP_SUBMIT_ALL
+	rawSetupSQE128       rawSetupFlags   = C.IORING_SETUP_SQE128
+	rawSetupCQE32        rawSetupFlags   = C.IORING_SETUP_CQE32
 	rawSetupCoopTaskrun  rawSetupFlags   = C.IORING_SETUP_COOP_TASKRUN
 	rawSetupTaskrunFlag  rawSetupFlags   = C.IORING_SETUP_TASKRUN_FLAG
 	rawSetupNoSQArray    rawSetupFlags   = C.IORING_SETUP_NO_SQARRAY
@@ -82,6 +84,7 @@ const (
 	rawOpFtruncate     rawOpcode = C.IORING_OP_FTRUNCATE
 	rawOpReadvFixed    rawOpcode = C.IORING_OP_READV_FIXED
 	rawOpWritevFixed   rawOpcode = C.IORING_OP_WRITEV_FIXED
+	rawOpUringCmd      rawOpcode = C.IORING_OP_URING_CMD
 	rawOpLast          rawOpcode = C.IORING_OP_LAST
 
 	rawFsyncDatasync uint32 = C.IORING_FSYNC_DATASYNC

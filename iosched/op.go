@@ -10,11 +10,12 @@ import (
 
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
+	"github.com/miretskiy/dio/v2/nvme"
 )
 
 // Opcode identifies the type of I/O operation. The low bits name the operation;
-// the opVirtual and opFixed high bits are addressing/buffer flags. kind() returns
-// the operation with those flags masked off.
+// the opNVMe, opVirtual, and opFixed high bits select device/buffer addressing.
+// kind() returns the operation with those flags masked off.
 const (
 	OpRead  uint8 = iota // pread - positioned read
 	OpReadv              // preadv - vectored positioned read
@@ -25,19 +26,22 @@ const (
 	OpOpenat // openat - installs into a vfd slot, or returns a fd
 	OpClose  // close a vfd slot, or drain operations on a regular file
 
-	OpFsync     // fsync - flush data and metadata
-	OpFdatasync // fdatasync - flush data
-	OpFallocate // fallocate - preallocate file space
-	OpUnlinkat  // unlinkat - remove a directory entry
+	OpFsync      // fsync - flush data and metadata
+	OpFdatasync  // fdatasync - flush data
+	OpFallocate  // fallocate - preallocate file space
+	OpUnlinkat   // unlinkat - remove a directory entry
+	OpRawNVMeCmd // caller-supplied NVMe command
 )
 
 // Opcode flags OR'd into an opcode. opVirtual selects virtual-file addressing
 // (the file is a registered-table index, not an *os.File); opFixed selects a
-// pre-registered fixed buffer (IORING_OP_*_FIXED). They compose; kind() masks
-// both off.
+// pre-registered fixed buffer (IORING_OP_*_FIXED). opNVMe selects a namespace
+// command with a bounded device target. kind() masks these mode bits off.
 const (
-	opFixed   uint8 = 1 << 6
-	opVirtual uint8 = 1 << 7
+	opNVMe     uint8 = 1 << 5 // NVMe namespace command addressing
+	opFixed    uint8 = 1 << 6
+	opVirtual  uint8 = 1 << 7
+	opModeMask       = opNVMe | opFixed | opVirtual
 )
 
 // AllocateVFD asks a root VOpenatOp to allocate a free virtual-file slot in the
@@ -63,6 +67,8 @@ const AllocateVFD uint32 = math.MaxUint32
 // Link and HardLink return independent values. Each call with followers
 // allocates one slice for the whole chain; the slice is never modified after
 // construction, so copies of an Op may share it.
+// A RawNVMeCmdOp transfers its caller-built request on accepted submission and is
+// single-use, including copies of the wrapper.
 type Op struct {
 	operation
 	linked   []operation            // followers, in chain order
@@ -87,6 +93,8 @@ type operation struct {
 	offset      int64
 	length      int64
 	opFlags     uint32
+	nvme        *nvme.Device  // Bounded NVMe target, when opNVMe is set
+	raw         *rawOperation // Caller-supplied operation and completion destination.
 }
 
 // SQE linking flag bits stored in Op.sqeFlags, marking how a linked follower is
@@ -127,9 +135,10 @@ func (o Op) AllowBacklog() Op {
 
 // Durable requests that a write's data be flushed to stable storage before its
 // Ticket completes. Call it on the write itself, before linking: on a chain it
-// marks the root. Durable has no effect on non-write operations.
+// marks the root. NVMe writes use Force Unit Access (FUA) on their write command.
+// Durable has no effect on non-write operations.
 //
-// A final durable write gets an fdatasync after it completes; the io_uring
+// A final durable file write gets an fdatasync after it completes; the io_uring
 // backend shares that sync among the durable writes on the same file that
 // completed before it was issued. A durable write followed by other operations
 // (write → Durable → close) gets its own fdatasync, linked the way the write
@@ -141,7 +150,7 @@ func (o Op) Durable() Op {
 }
 
 // durable reports whether o requests a post-write fdatasync.
-func (o *operation) durable() bool { return o.opFlags&opDurable != 0 }
+func (o *operation) durable() bool { return o.opFlags&opDurable != 0 && !o.isNVMe() }
 
 func (o operation) syncOp() operation {
 	if o.isVirtual() {
@@ -435,9 +444,11 @@ func (o *operation) isVirtual() bool { return o.opcode&opVirtual != 0 }
 // isFixed reports whether o uses a pre-registered fixed buffer — the opFixed bit.
 func (o *operation) isFixed() bool { return o.opcode&opFixed != 0 }
 
-// kind returns the operation with the opVirtual/opFixed flags masked off, so the
+func (o *operation) isNVMe() bool { return o.opcode&opNVMe != 0 }
+
+// kind returns the operation with its device/buffer mode flags masked off, so the
 // scheduler switches on the operation regardless of addressing or buffer mode.
-func (o *operation) kind() uint8 { return o.opcode &^ (opVirtual | opFixed) }
+func (o *operation) kind() uint8 { return o.opcode &^ opModeMask }
 
 // Result is one operation's byte count (or opened descriptor) and error.
 // A linked operation canceled by an earlier failure has its own cancellation error.
@@ -539,6 +550,7 @@ func (t Ticket) Done() <-chan struct{} {
 
 // Wait blocks until the Ticket completes and returns the root operation's byte
 // count (or opened file descriptor) and the first operation or scheduler error.
+// A raw root operation returns the driver's result in place of a byte count.
 func (t Ticket) Wait() (int, error) {
 	t.wait.Wait()
 	return t.n, t.err

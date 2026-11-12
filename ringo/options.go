@@ -38,6 +38,18 @@ type Option interface {
 
 type optionFunc func(*config) error
 
+// WithUringCmd enables 128-byte submission entries and 32-byte completion
+// entries for device commands such as NVMe passthrough. Use it on rings that
+// submit UringCmd operations; ordinary operations can share the same ring.
+// Each entry uses twice the storage of the default 64/16-byte layout.
+// Requires Linux 5.19 or later and a driver implementing uring_cmd.
+func WithUringCmd() Option {
+	return optionFunc(func(config *config) error {
+		config.flags |= rawSetupSQE128 | rawSetupCQE32
+		return nil
+	})
+}
+
 func (fn optionFunc) apply(config *config) error {
 	return fn(config)
 }

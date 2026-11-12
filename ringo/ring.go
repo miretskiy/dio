@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/miretskiy/dio/v2/collections"
 	"github.com/miretskiy/dio/v2/internal/buildutil"
@@ -92,6 +93,9 @@ type Completion struct {
 	Handle Handle
 	// Result is the nonnegative CQE result. It is zero when Err is non-nil.
 	Result int
+	// Extra contains the two driver-specific result words of a 32-byte CQE.
+	// It is zero on rings created without WithUringCmd.
+	Extra [2]uint64
 	// Flags contains the kernel CQE flags.
 	Flags CompletionFlags
 	// Err reports that the operation failed. It is the syscall.Errno encoded by
@@ -310,6 +314,11 @@ func (ring *Ring) PushLinked(
 }
 
 func (ring *Ring) prepareSQE(sqe *rawSQE, pending *pendingSlot) {
+	// Ordinary prepare methods clear 64 bytes. Clear the extension too when a
+	// slot previously used for a device command is reused by an ordinary Op.
+	if ring.backend.flags&rawSetupSQE128 != 0 {
+		clear(unsafe.Slice((*byte)(unsafe.Pointer(sqe)), 128))
+	}
 	pending.op.prepare(sqe)
 	sqe.User_data = uint64(pending.handle.slot)
 }
@@ -417,6 +426,9 @@ func (ring *Ring) Reap() iter.Seq[Completion] {
 			completion := Completion{
 				Handle: pending.handle,
 				Flags:  CompletionFlags(cqe.Flags),
+			}
+			if ring.backend.flags&rawSetupCQE32 != 0 {
+				completion.Extra = *(*[2]uint64)(unsafe.Add(unsafe.Pointer(cqe), 16))
 			}
 			if cqe.Res < 0 {
 				completion.Err = syscall.Errno(-cqe.Res)

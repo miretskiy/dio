@@ -11,7 +11,7 @@ const maxCoalescedWrites = 1024
 // coalescibleWrite reports whether o may be merged into a writev: a standalone
 // plain positioned write. Fixed-buffer and caller-linked writes stay intact.
 func (o *operation) coalescibleWrite() bool {
-	return o.kind() == OpWrite && !o.isFixed() && !o.isLinked()
+	return o.kind() == OpWrite && !o.isFixed() && !o.isNVMe() && !o.isLinked()
 }
 
 // sameFile reports whether a and b address the same file: the same virtual

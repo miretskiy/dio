@@ -33,11 +33,18 @@ type Scheduler interface {
 	// Writes are not retried; a short write reports io.ErrShortWrite together with its count.
 	//
 	// Operations in a Link or HardLink chain execute in order. Link cancels the
-	// remaining chain after a failure; HardLink continues it. A chain holds at
+	// remaining chain when the kernel marks a link failure; HardLink continues it. A chain holds at
 	// most eight operations. A final Durable write's sync may be shared with
 	// other durable writes on its file; a Durable write followed by other
 	// operations gets its own fdatasync before them, which counts as one of
 	// the eight.
+	// NVMeReadOp, NVMeWriteOp, and NVMeFlushOp use the same ticket lifecycle
+	// with WithNVMeCommands. Byte requests are split at the device command limit;
+	// NVMe writes use FUA for Durable. Positive NVMe error statuses permit soft
+	// successors, matching the kernel. Check tickets for status-dependent work.
+	// RawNVMeCmdOp submits a caller-built NVMe command intact and exposes its driver
+	// result, Linux error, and optional full completion. It uses the same ticket
+	// and file-lifetime handling; the caller interprets device-specific statuses.
 	//
 	// Separate submissions are unordered except for DrainOp:
 	//   - A submission containing DrainOp is held whole, every

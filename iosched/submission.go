@@ -16,7 +16,8 @@ type submission struct {
 	linked        []operation // private copies of Op.followers() and synthesized fdatasyncs
 	reads, writes ioCharge    // request totals until coordinator acceptance; accounted charges afterward
 	whenDone      func(int, error)
-	resultDone    uint8 // bit per results entry recorded
+	resultDone    uint8      // bit per results entry recorded
+	nvmeSplit     *nvmeSplit // Allocated for chains containing an oversized NVMe request.
 	// staged links the staging stack until acceptance, then a coalesced run's
 	// members from its leader until the run completes.
 	staged *submission
@@ -140,6 +141,9 @@ func (work *submission) finish() {
 }
 
 func (work *submission) recordResult(op *operation, n int, err error) {
+	if op.kind() == OpRawNVMeCmd {
+		recordRawResult(op, n, err)
+	}
 	if op.opFlags&opWriteSync != 0 {
 		// A synthesized fdatasync reports only its error, into its write's result.
 		if err != nil && work.results != nil && work.results[op.resultIndex].Err == nil {
@@ -164,6 +168,12 @@ func (work *submission) recordResult(op *operation, n int, err error) {
 func (work *submission) fail(err error) {
 	if work.err == nil {
 		work.err = err
+	}
+	for i := range work.opCount() {
+		op := work.op(i)
+		if op.kind() == OpRawNVMeCmd {
+			recordRawResult(op, 0, err)
+		}
 	}
 	durable := work.durable() != nil
 	for i := range work.results {

@@ -146,13 +146,13 @@
 //
 // Go cannot express that transfer the way a move-only type would, so the rule
 // is documented rather than enforced: Ringo does not track or diagnose reuse.
-// An operation constructed WithAlloc returns to that OpAlloc once the Ring has
-// released its final completion, so a retained alias can come to refer to an
+// A pooled operation constructed WithAlloc returns to that OpAlloc once the
+// Ring has released its final completion, so a retained alias can refer to an
 // unrelated operation. Using a pushed Op again is undefined.
 //
 // Ringo keeps no pool of its own. An OpAlloc is caller-owned and opted into per
-// operation, so recycling is a decision the caller makes rather than one the
-// library makes on its behalf. It is safe to share across goroutines, because
+// operation. It covers reads, writes, vectored I/O, device commands, fsyncs,
+// opens, and closes. It is safe to share across goroutines, because
 // Reap returns operations to it and reaping need not happen on the goroutine
 // that built them.
 //
@@ -199,7 +199,9 @@
 // Handle is an opaque, comparable, generation-safe identity local to one Ring;
 // it is not a future or waiter. Completion contains the nonnegative CQE result,
 // or the syscall error represented by a negative result, plus the kernel CQE
-// flags.
+// flags. WithUringCmd also preserves the two extended completion words.
+// Device-specific positive status codes remain in Result and must be checked
+// by the device layer (for example nvme.Status).
 //
 // Reap is nonblocking and visits a bounded snapshot of ready CQEs. It decodes
 // each kernel-owned CQE into an independent Completion value before yielding
@@ -277,11 +279,14 @@
 // # Scope
 //
 // Ringo covers common file I/O, timeouts, cancellation, polling, fixed-file
-// resources, and immutable fixed-buffer resources.
+// resources, immutable fixed-buffer resources, and device commands on rings
+// created WithUringCmd (128-byte SQEs and 32-byte CQEs). UringCmd copies its
+// inline payload and binds typed CommandBuffers during Push, retaining those
+// buffers through completion just like ordinary I/O.
 //
 // It deliberately does not expose networking operation families, provided
-// buffers, generic URING_CMD bytes, personalities, restrictions, message
-// rings, resource tags, zero-copy queues, or 128-byte and mixed SQE/CQE modes.
+// buffers, personalities, restrictions, message rings, resource tags, zero-copy
+// queues, or mixed SQE/CQE modes.
 // Networking can be reconsidered when a useful Go-native workload demonstrates
 // an API and performance benefit that justify its ownership complexity. The
 // other features likewise need additional pointer, completion, cross-ring, or

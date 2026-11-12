@@ -37,10 +37,14 @@ func alignedBytes(size uintptr) []byte {
 // the code under test reads them from rawParams exactly as io_uring_setup
 // reports them. entries and cqEntries must be powers of two.
 func newHeapRing(entries, cqEntries uint32) *rawRing {
+	return newHeapRingFlags(entries, cqEntries, 0)
+}
+
+func newHeapRingFlags(entries, cqEntries uint32, flags rawSetupFlags) *rawRing {
 	params := rawParams{
 		Sq_entries: entries,
 		Cq_entries: cqEntries,
-		Flags:      uint32(rawSetupNoSQArray),
+		Flags:      uint32(rawSetupNoSQArray | flags),
 		Sq_off: rawSQOffsets{
 			Head: 0, Tail: 4, Ring_mask: 8, Ring_entries: 12, Flags: 16,
 		},
@@ -49,12 +53,18 @@ func newHeapRing(entries, cqEntries uint32) *rawRing {
 		},
 	}
 	cqeSize := unsafe.Sizeof(rawCQE{})
+	if flags&rawSetupCQE32 != 0 {
+		cqeSize *= 2
+	}
 	ring := &rawRing{fd: -1, flags: rawSetupFlags(params.Flags)}
 	ring.sq.ringMemory = alignedBytes(
 		uintptr(params.Cq_off.Cqes) + uintptr(cqEntries)*cqeSize,
 	)
 	ring.cq.ringMemory = ring.sq.ringMemory
 	ring.sq.sqeSize = unsafe.Sizeof(rawSQE{})
+	if flags&rawSetupSQE128 != 0 {
+		ring.sq.sqeSize *= 2
+	}
 	ring.sq.sqeMemory = alignedBytes(uintptr(entries) * ring.sq.sqeSize)
 	ring.cq.cqeSize = cqeSize
 	ring.bindPointers(&params)

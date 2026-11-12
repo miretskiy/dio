@@ -31,6 +31,8 @@ type slotKind uint8
 const (
 	// slotOperation is one operation of a caller's chain, placed as submitted.
 	slotOperation slotKind = iota
+	// slotNVMePart contributes to one logical operation in a split submission.
+	slotNVMePart
 	// slotCoalescedWrite is the one write placed for a coalesced run of
 	// writes, split back into each member's result.
 	slotCoalescedWrite
@@ -46,11 +48,13 @@ const (
 // table entry, telling it from a stale completion for an earlier occupant; a
 // zero handle marks the entry free.
 type ringSlot struct {
-	handle ringo.Handle
-	kind   slotKind
-	work   *submission     // the work the operation belongs to, or a coalesced run's leader
-	op     *operation      // the operation, for slotOperation
-	batch  submissionQueue // the durable writes an fdatasync covers, for slotSync
+	handle     ringo.Handle
+	kind       slotKind
+	work       *submission     // the work the operation belongs to, or a coalesced run's leader
+	op         *operation      // the operation, for slotOperation
+	batch      submissionQueue // the durable writes an fdatasync covers, for slotSync
+	partOffset int             // Byte offset within a split logical operation.
+	partLength int             // Bytes transferred by this command.
 }
 
 var stagingClosed submission
@@ -135,6 +139,9 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	if cfg.sqPoll {
 		ringOptions = append(ringOptions, ringo.WithSQPoll())
 	}
+	if cfg.nvmeCommands {
+		ringOptions = append(ringOptions, ringo.WithUringCmd())
+	}
 	if cfg.vfiles > 0 {
 		ringOptions = append(ringOptions, ringo.WithFixedFiles(cfg.vfiles))
 	}
@@ -215,6 +222,19 @@ func (s *URingScheduler) prepareSubmission(op *Op) (*submission, error) {
 	}
 	for i := range work.opCount() {
 		current := work.op(i)
+		if current.kind() == OpRawNVMeCmd {
+			if current.raw == nil || current.raw.request == nil {
+				return nil, fmt.Errorf("iosched: RawNVMeCmdOp requires a ringo operation")
+			}
+		}
+		if current.isNVMe() {
+			if err := s.validateNVMe(current); err != nil {
+				return nil, err
+			}
+			if len(current.buf) > nvmeCommandLimit(current.nvme) && work.nvmeSplit == nil {
+				work.nvmeSplit = new(nvmeSplit)
+			}
+		}
 		if current.isVirtual() {
 			if s.config.vfiles == 0 {
 				return nil, syscall.EOPNOTSUPP
@@ -230,11 +250,11 @@ func (s *URingScheduler) prepareSubmission(op *Op) (*submission, error) {
 		}
 		switch current.kind() {
 		case OpRead, OpReadv:
-			t := s.config.disk.device.reads.serviceTime(int64(opBytes(current)))
+			t := s.config.disk.device.reads.operationTime(current)
 			work.reads.backlog += t
 			work.reads.inFlight += t
 		case OpWrite, OpWritev:
-			t := s.config.disk.device.writes.serviceTime(int64(opBytes(current)))
+			t := s.config.disk.device.writes.operationTime(current)
 			work.writes.backlog += t
 			work.writes.inFlight += t
 		}
@@ -647,18 +667,22 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 	readsBlocked, writesBlocked := false, false
 	for work := c.ready.head; work != nil; {
 		need := work.opCount()
-		if work.err != nil {
+		resuming := work.nvmeSplit != nil && work.nvmeSplit.started
+		if work.err != nil && !resuming {
 			need-- // The failed open completes without an SQE.
 			if work.root.sqeFlags&sqeHardLink == 0 {
 				need = 0
 			}
+		}
+		if work.nvmeSplit != nil && need > 1 {
+			need = 1 // A split chain starts with a bounded batch of one operation.
 		}
 		if need > free() {
 			return c.occupied - start, false
 		}
 		class := work.dispatchClass()
 		blocked := (readsBlocked && class&chargesReads != 0) || (writesBlocked && class&chargesWrites != 0)
-		if blocked || !c.sched.config.disk.dispatch(work, &c.inFlight) {
+		if blocked || (!resuming && !c.sched.config.disk.dispatch(work, &c.inFlight)) {
 			readsBlocked = readsBlocked || class&chargesReads != 0
 			writesBlocked = writesBlocked || class&chargesWrites != 0
 			if !c.readyCanDispatch(readsBlocked, writesBlocked) {
@@ -687,6 +711,9 @@ const (
 )
 
 func (work *submission) dispatchClass() int {
+	if work.nvmeSplit != nil && work.nvmeSplit.started {
+		return 0 // Continuations retain the original dispatch allowance.
+	}
 	class := 0
 	if work.reads.inFlight > 0 {
 		class |= chargesReads
@@ -759,11 +786,19 @@ func (c *coordinator) placeChain(work *submission) (next *submission) {
 	next = c.ready.next(work)
 	c.take(work)
 	start := 0
-	if work.err != nil {
+	if work.err != nil && (work.nvmeSplit == nil || !work.nvmeSplit.started) {
 		start = c.finishFailedOpen(work)
 		if start == work.opCount() {
 			return next
 		}
+	}
+	if work.nvmeSplit != nil {
+		if !work.nvmeSplit.started {
+			work.nvmeSplit.index = start
+			work.nvmeSplit.started = true
+		}
+		c.placeNVMeParts(work)
+		return next
 	}
 	first := c.translateOp(work.op(start))
 	if start+1 == work.opCount() {
@@ -864,7 +899,13 @@ func (c *coordinator) placeSync(state *fileState) {
 }
 
 func (c *coordinator) translateOp(op *operation) ringo.Op {
+	if op.kind() == OpRawNVMeCmd {
+		return op.raw.request
+	}
 	recycle := ringo.WithAlloc(&c.alloc)
+	if op.isNVMe() {
+		return translateNVMe(op, recycle)
+	}
 	var direct ringo.FixedFile
 	fd := ringo.FileFD(op.f)
 	if op.isVirtual() {
@@ -1025,6 +1066,9 @@ func (c *coordinator) drain(graceful bool) error {
 // place records scheduler state for a queued operation in the entry its handle
 // names. Ringo bounds live operations by the ring depth, which sizes c.slots.
 func (c *coordinator) place(handle ringo.Handle, slot ringSlot) {
+	if slot.op != nil && slot.op.kind() == OpRawNVMeCmd {
+		slot.op.raw.request = nil // Push transferred ownership to Ringo.
+	}
 	slot.handle = handle
 	c.slots[handle.Index()] = slot
 	c.occupied++
@@ -1039,6 +1083,12 @@ func (c *coordinator) reapOne(completion ringo.Completion) {
 			completion.Err,
 		))
 	}
+	if slot.op != nil && slot.op.kind() == OpRawNVMeCmd {
+		if completion.Flags.More() {
+			return // The ticket and file pin cover the final completion.
+		}
+		slot.op.raw.record(completion)
+	}
 	c.slots[index] = ringSlot{}
 	c.occupied--
 
@@ -1046,12 +1096,17 @@ func (c *coordinator) reapOne(completion ringo.Completion) {
 	// RWF_NOWAIT (fixed upstream by b08e02045002). finishOperation requeues
 	// standalone reads; linked operations retain their individual outcomes.
 	n, err := completion.Result, completion.Err
+	if slot.kind == slotOperation && slot.op.isNVMe() {
+		n, err = nvmeResult(slot.op, completion)
+	}
 	if errors.Is(err, syscall.ECANCELED) && c.sched.stopCause() == errSchedulerClosed {
 		err = errSchedulerClosed
 	}
 	switch slot.kind {
 	case slotOperation:
 		c.finishOperation(slot.work, slot.op, n, err)
+	case slotNVMePart:
+		c.finishNVMePart(slot, completion)
 	case slotCoalescedWrite:
 		c.finishWrite(slot.work, n, err)
 	case slotSync:
@@ -1087,7 +1142,7 @@ func (c *coordinator) finishWrite(leader *submission, n int, err error) {
 // durable write that succeeded then waits for its file's next fdatasync; one
 // that failed has nothing to make durable, so its fdatasync is retired with it.
 func (c *coordinator) finishOperation(work *submission, op *operation, n int, err error) {
-	if errors.Is(err, syscall.EAGAIN) && len(work.linked) == 0 &&
+	if errors.Is(err, syscall.EAGAIN) && !op.isNVMe() && work.nvmeSplit == nil && len(work.linked) == 0 &&
 		(op.kind() == OpRead || op.kind() == OpReadv) && c.sched.stopCause() == nil {
 		// Keep the ticket, buffer, backlog and file pin until the read finishes.
 		// Return this attempt's allowance; normal placement claims it again.

@@ -28,6 +28,14 @@ go get github.com/miretskiy/dio/v2
   selects io_uring when supported and otherwise falls back to synchronous POSIX
   I/O.
 
+For NVMe namespace passthrough, open an optionally bounded `nvme.Device`, then
+submit `iosched.NVMeReadOp`, `NVMeWriteOp`, and `NVMeFlushOp` through
+an io_uring scheduler created with `iosched.WithNVMeCommands()`. Direct ring callers
+can encode `nvme.Command` operations for `ringo.WithUringCmd()` rings.
+`iosched.RawNVMeCmdOp` submits caller-built I/O or Admin commands and exposes
+their full completion. See
+[Using io_uring_cmd](docs/io_uring_cmd.md).
+
 ## Upgrading from v1
 
 Version 2 adds `/v2` to every import path. It replaces the raw `giouring`
@@ -42,6 +50,7 @@ now `alloc`; its allocators return `alloc.Memory` lease handles.
 | --- | --- |
 | [`ringo`](https://pkg.go.dev/github.com/miretskiy/dio/v2/ringo) | Lifetime-safe low-level io_uring operations and resource ownership |
 | [`iosched`](https://pkg.go.dev/github.com/miretskiy/dio/v2/iosched) | A common operation/ticket API over POSIX and io_uring |
+| [`nvme`](https://pkg.go.dev/github.com/miretskiy/dio/v2/nvme) | Linux NVMe discovery, bounded namespace handles, and I/O and Admin command builders |
 | [`align`](https://pkg.go.dev/github.com/miretskiy/dio/v2/align) | Page-aligned allocation and range arithmetic |
 | [`alloc`](https://pkg.go.dev/github.com/miretskiy/dio/v2/alloc) | Owned aligned memory and a fixed-capacity, lock-free arena allocator |
 | [`collections`](https://pkg.go.dev/github.com/miretskiy/dio/v2/collections) | Lists with reusable handles and a concurrent sharded map with per-shard state |
@@ -89,6 +98,59 @@ callers must not modify memory the kernel may read or access memory the kernel
 may write while an operation is active. Callers also serialize calls on the
 same ring, avoid explicitly closing retained files, submit pushed work, reap
 completions, and handle short I/O.
+
+## NVMe namespace commands
+
+On Linux, `nvme.Open` discovers the namespace ID, active block format, capacity,
+and transfer limits. `WithRange` bounds the handle to an application-owned byte
+range; omitting it exposes the whole namespace. Reserve the range against other
+storage users before writing it.
+
+```go
+device, err := nvme.Open("/dev/ng1n1", nvme.WithRange(base, length))
+if err != nil {
+    return err
+}
+defer device.Close()
+
+scheduler, err := iosched.NewURingScheduler(iosched.WithNVMeCommands())
+if err != nil {
+    return err
+}
+defer scheduler.Close()
+
+buffer := make([]byte, device.Info().BlockSize)
+ticket, err := scheduler.Submit(iosched.NVMeReadOp(device, buffer, 0))
+if err != nil {
+    return err
+}
+_, err = ticket.Wait()
+return err
+```
+
+Read/write offsets are bytes relative to the handle's range. Offsets and buffer
+lengths must be block aligned. iosched validates the complete request, translates
+it to logical block addresses, and splits large transfers at the discovered
+`MaxTransferBytes` limit, even when a request needs more commands than fit in
+the ring. Each logical operation produces one result. `NVMeWriteOp(...).Durable()`
+sets Force Unit Access on every constituent write. `NVMeFlushOp` flushes the
+entire namespace.
+
+For vendor-specific commands or other NVMe command sets, build a `ringo.Op` with
+`nvme.Command.Op`, `nvme.Command.AdminOp`, or `ringo.UringCmd`, then wrap it with
+`iosched.RawNVMeCmdOp(file, request, &completion)`. Raw commands retain their
+driver result and extended completion fields and use caller-defined addressing
+and transfer sizes. After a successful Submit, discard all aliases of the raw
+request and its wrapper. Decode NVMe status with `nvme.Status` after waiting for
+the ticket. I/O commands target a namespace handle such as `/dev/ng1n1`; Admin
+commands target a controller handle such as `/dev/nvme1`.
+
+The byte-range helpers support ordinary NVM namespaces with a data-only block
+format. Raw commands can target other command sets through an `os.File` handle.
+Both paths require io_uring; the POSIX backend returns `EOPNOTSUPP`. Device
+permissions and command privileges depend on the driver. The
+[tutorial](docs/io_uring_cmd.md) covers discovery, permissions, command encoding,
+and a two-region index/data example.
 
 ## Aligned memory
 

@@ -120,6 +120,8 @@ const (
 	rawSetupCQSize       rawSetupFlags   = 0x8
 	rawSetupClamp        rawSetupFlags   = 0x10
 	rawSetupSubmitAll    rawSetupFlags   = 0x80
+	rawSetupSQE128       rawSetupFlags   = 0x400
+	rawSetupCQE32        rawSetupFlags   = 0x800
 	rawSetupCoopTaskrun  rawSetupFlags   = 0x100
 	rawSetupTaskrunFlag  rawSetupFlags   = 0x200
 	rawSetupNoSQArray    rawSetupFlags   = 0x10000
@@ -156,6 +158,7 @@ const (
 	rawOpFtruncate     rawOpcode = 0x37
 	rawOpReadvFixed    rawOpcode = 0x3c
 	rawOpWritevFixed   rawOpcode = 0x3d
+	rawOpUringCmd      rawOpcode = 0x2e
 	rawOpLast          rawOpcode = 0x41
 
 	rawFsyncDatasync uint32 = 0x1

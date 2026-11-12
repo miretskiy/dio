@@ -128,6 +128,9 @@ func (ring *rawRing) mapMemory(params *rawParams) error {
 	sqRingSize := uintptr(params.Sq_off.Array) +
 		uintptr(params.Sq_entries)*unsafe.Sizeof(uint32(0))
 	cqeSize := unsafe.Sizeof(rawCQE{})
+	if rawSetupFlags(params.Flags)&rawSetupCQE32 != 0 {
+		cqeSize *= 2
+	}
 	cqRingSize := uintptr(params.Cq_off.Cqes) +
 		uintptr(params.Cq_entries)*cqeSize
 
@@ -144,6 +147,9 @@ func (ring *rawRing) mapMemory(params *rawParams) error {
 	ring.cq.ringMemory = sqMemory
 
 	sqeSize := unsafe.Sizeof(rawSQE{})
+	if rawSetupFlags(params.Flags)&rawSetupSQE128 != 0 {
+		sqeSize *= 2
+	}
 	sqeMemory, err := mapRingMemory(
 		ring.fd,
 		rawSQEsOffset,

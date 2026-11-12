@@ -859,3 +859,104 @@ func TestCompletionEAGAINNotRetriedForWritesChainsOrShutdown(t *testing.T) {
 		})
 	}
 }
+
+func TestRawNVMeCmdOpFileChainAndDrain(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	file := testFile(t, 4096)
+	data := []byte("raw positioned I/O")
+	got := make([]byte, len(data))
+	var written, read ringo.Completion
+	chain := RawNVMeCmdOp(file, ringo.Write(ringo.FileFD(file), data, 0), &written).
+		Link(RawNVMeCmdOp(file, ringo.Read(ringo.FileFD(file), got, 0), &read))
+	tickets, _ := acceptOps(c, chain, DrainOp(file))
+	for c.accepted.len != 0 {
+		c.placeReady(false)
+		require.NoError(t, c.enter(1))
+		c.reap()
+	}
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	require.Equal(t, data, got)
+	require.Equal(t, len(data), written.Result)
+	require.Equal(t, len(data), read.Result)
+	require.Equal(t, []Result{{N: len(data)}, {N: len(data)}}, tickets[0].AllResults())
+}
+
+func TestRawNVMeCmdOpCompletionAndFailure(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	var result ringo.Completion
+	tickets, works := acceptOps(c, RawNVMeCmdOp(nil, ringo.Nop(), &result))
+	c.placeReady(false)
+	require.NoError(t, c.enter(1))
+	for completion := range c.ring.Reap() {
+		intermediate := completion
+		intermediate.Flags |= ringo.CompletionFlags(1 << 1) // IORING_CQE_F_MORE
+		c.reapOne(intermediate)
+		require.Equal(t, workIssued, works[0].state)
+		require.Equal(t, 1, c.occupied)
+		completion.Result = 0x281
+		completion.Extra = [2]uint64{0x123456789abcdef0, 0xfedcba9876543210}
+		c.reapOne(completion)
+		require.Equal(t, completion, result)
+	}
+	n, err := tickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, 0x281, n, "positive driver statuses are preserved")
+
+	for _, hard := range []bool{false, true} {
+		var first, next ringo.Completion
+		bad := RawNVMeCmdOp(nil, ringo.Read(ringo.BorrowedFD(-1), make([]byte, 1), 0), &first)
+		follower := RawNVMeCmdOp(nil, ringo.Nop(), &next)
+		chain := bad.Link(follower)
+		if hard {
+			chain = bad.HardLink(follower)
+		}
+		tickets, _ := acceptOps(c, chain)
+		c.placeReady(false)
+		submitAndReapUntil(t, c, func() bool { return c.accepted.len == 0 })
+		_, err := tickets[0].Wait()
+		require.ErrorIs(t, err, syscall.EBADF)
+		require.ErrorIs(t, first.Err, syscall.EBADF)
+		if hard {
+			require.NoError(t, next.Err)
+		} else {
+			require.ErrorIs(t, next.Err, syscall.ECANCELED)
+		}
+	}
+}
+
+func TestRawNVMeCmdOpSubmissionAndUnplacedFailure(t *testing.T) {
+	posix := NewPOSIXScheduler()
+	defer posix.Close()
+	var result ringo.Completion
+	var pool ringo.OpAlloc
+	request := ringo.Read(ringo.BorrowedFD(-1), make([]byte, 1), 0, ringo.WithAlloc(&pool))
+	op := RawNVMeCmdOp(nil, request, &result)
+	_, err := posix.Submit(op)
+	require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	require.Same(t, request, op.raw.request, "Submit rejection retains caller ownership")
+
+	work, err := copySubmission(&op, maxChainLength)
+	require.NoError(t, err)
+	work.fail(errSchedulerClosed)
+	_, err = (Ticket{&work.completion}).Wait()
+	require.ErrorIs(t, err, errSchedulerClosed)
+	require.ErrorIs(t, result.Err, errSchedulerClosed)
+	require.Nil(t, op.raw.request)
+	recycled := ringo.Read(ringo.BorrowedFD(-1), nil, 0, ringo.WithAlloc(&pool))
+	require.Same(t, request, recycled, "cancellation returns the unsubmitted request to its pool")
+	ringo.Discard(recycled)
+
+	c := newTestCoordinator(t, 8, 0)
+	invalid := ringo.UringCmd(ringo.BorrowedFD(-1), 0, make([]byte, 81), nil, ringo.WithAlloc(&pool))
+	tickets, _ := acceptOps(c, RawNVMeCmdOp(nil, invalid, &result))
+	c.placeReady(false) // Ringo rejects the oversized inline payload before Push.
+	_, err = tickets[0].Wait()
+	require.ErrorContains(t, err, "command exceeds 80 inline bytes")
+	require.Equal(t, err, result.Err)
+	reused := ringo.UringCmd(ringo.BorrowedFD(-1), 0, nil, nil, ringo.WithAlloc(&pool))
+	require.Same(t, invalid, reused, "Push rejection returns the unsubmitted request to its pool")
+	ringo.Discard(reused)
+}

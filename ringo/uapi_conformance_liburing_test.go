@@ -38,6 +38,8 @@ func TestRawConstantsMatchLiburing(t *testing.T) {
 		rawSetupCQSize,
 		rawSetupClamp,
 		rawSetupSubmitAll,
+		rawSetupSQE128,
+		rawSetupCQE32,
 		rawSetupCoopTaskrun,
 		rawSetupTaskrunFlag,
 		rawSetupNoSQArray,
@@ -112,7 +114,7 @@ func materializeOperation(op Op) rawSQE {
 	for index := range bytes {
 		bytes[index] = 0xa5
 	}
-	new(Ring).prepareSQE(&sqe, &pending)
+	(&Ring{backend: newRaw()}).prepareSQE(&sqe, &pending)
 	sqe.User_data = 0
 	return sqe
 }

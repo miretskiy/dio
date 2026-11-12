@@ -41,6 +41,22 @@ func (d *deviceIO) serviceTime(bytes int64) int64 {
 	return max(int64(float64(bytes)*1e9/float64(d.bytesPerSecond)), int64(time.Second)/d.iops)
 }
 
+// operationTime charges every physical command used by a logical NVMe transfer.
+func (d *deviceIO) operationTime(op *operation) int64 {
+	bytes := opBytes(op)
+	if op.isNVMe() {
+		limit := nvmeCommandLimit(op.nvme)
+		if limit > 0 && bytes > limit {
+			elapsed := int64(bytes/limit) * d.serviceTime(int64(limit))
+			if tail := bytes % limit; tail != 0 {
+				elapsed += d.serviceTime(int64(tail))
+			}
+			return elapsed
+		}
+	}
+	return d.serviceTime(int64(bytes))
+}
+
 // ioBudget is one class's shared accounting and rejection state.
 type ioBudget struct {
 	backlog  atomic.Int64 // modeled time of accepted, unfinished I/O
@@ -90,7 +106,7 @@ func monotonicNow() int64 { return int64(time.Since(monotonicBase)) }
 // LatencyGoal reports the configured in-flight service-time limit for opcode.
 // Zero means that class is unbudgeted.
 func (p *DiskPolicy) LatencyGoal(opcode uint8) time.Duration {
-	switch opcode &^ (opVirtual | opFixed) {
+	switch opcode &^ opModeMask {
 	case OpRead, OpReadv:
 		return p.device.reads.latency
 	case OpWrite, OpWritev:
@@ -105,7 +121,7 @@ func (p *DiskPolicy) LatencyGoal(opcode uint8) time.Duration {
 // reserves capacity nor guarantees a later Submit will succeed. Callers can use
 // it before acquiring buffers; Submit still checks the complete operation chain.
 func (p *DiskPolicy) CanAdmit(opcode uint8) error {
-	switch opcode &^ (opVirtual | opFixed) {
+	switch opcode &^ opModeMask {
 	case OpRead, OpReadv:
 		return p.readBudget.admissionError(p.device.reads.serviceTime(0))
 	case OpWrite, OpWritev:
@@ -217,14 +233,14 @@ func (p *DiskPolicy) completeIO(work *submission, op *operation, ring *ringInFli
 	switch op.kind() {
 	case OpRead, OpReadv:
 		if work.reads.inFlight > 0 {
-			elapsed := p.device.reads.serviceTime(int64(opBytes(op)))
+			elapsed := p.device.reads.operationTime(op)
 			work.reads.inFlight -= elapsed
 			ring.reads -= elapsed
 			p.readBudget.inFlight.Add(-elapsed)
 		}
 	case OpWrite, OpWritev:
 		if work.writes.inFlight > 0 {
-			elapsed := p.device.writes.serviceTime(int64(opBytes(op)))
+			elapsed := p.device.writes.operationTime(op)
 			work.writes.inFlight -= elapsed
 			ring.writes -= elapsed
 			p.writeBudget.inFlight.Add(-elapsed)

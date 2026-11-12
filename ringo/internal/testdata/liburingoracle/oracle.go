@@ -10,6 +10,13 @@ package liburingoracle
 #include <string.h>
 #include <liburing.h>
 
+static void oracle_command(void *out, int fd, uint32_t op, const void *payload) {
+ memset(out, 0, 128);
+ struct io_uring_sqe *sqe = out;
+ io_uring_prep_uring_cmd(sqe, op, fd);
+ memcpy(sqe->cmd, payload, 80);
+}
+
 static void clear_sqe(struct io_uring_sqe *sqe) {
 	memset(sqe, 0, sizeof(*sqe));
 }
@@ -116,7 +123,7 @@ static void oracle_prepare(struct io_uring_sqe *sqe, int kind,
 
 struct retained_abi_constants {
 	uint32_t sqe_flags[4];
-	uint32_t setup_flags[10];
+	uint32_t setup_flags[12];
 	uint32_t cqe_flags[1];
 	uint32_t features[3];
 	uint32_t sq_flags[3];
@@ -144,6 +151,8 @@ static struct retained_abi_constants retained_constants(void) {
 				IORING_SETUP_CQSIZE,
 				IORING_SETUP_CLAMP,
 				IORING_SETUP_SUBMIT_ALL,
+			IORING_SETUP_SQE128,
+			IORING_SETUP_CQE32,
 				IORING_SETUP_COOP_TASKRUN,
 				IORING_SETUP_TASKRUN_FLAG,
 				IORING_SETUP_NO_SQARRAY,
@@ -368,7 +377,7 @@ func Prepare(kind PrepareKind, arguments ...uint64) SQE {
 
 type RetainedConstants struct {
 	SQEFlags    [4]uint32
-	SetupFlags  [10]uint32
+	SetupFlags  [12]uint32
 	CQEFlags    [1]uint32
 	Features    [3]uint32
 	SQFlags     [3]uint32
@@ -440,4 +449,10 @@ func Sizes() ABISizes {
 		SyncCancel:       uintptr(C.abi_size_sync_cancel_reg()),
 		ProbeOperation:   uintptr(C.abi_size_probe_op()),
 	}
+}
+
+// Command returns a 128-byte submission prepared by liburing.
+func Command(fd int, op uint32, payload [80]byte) (sqe [128]byte) {
+	C.oracle_command(unsafe.Pointer(&sqe), C.int(fd), C.uint32_t(op), unsafe.Pointer(&payload))
+	return sqe
 }

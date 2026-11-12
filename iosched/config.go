@@ -18,6 +18,7 @@ type schedulerConfig struct {
 	coordinatorCPU int // negative leaves affinity unchanged
 	ringDepth      uint32
 	sqPoll         bool
+	nvmeCommands   bool
 	vfiles         uint32
 	files          []*os.File
 	coalescing     bool
@@ -101,6 +102,15 @@ func WithRingDepth(n uint32) Option {
 // submission queue.
 func WithSQPOLL() Option {
 	return optionFunc(func(c *schedulerConfig) { c.sqPoll = true })
+}
+
+// WithNVMeCommands enables NVMeReadOp, NVMeWriteOp, and NVMeFlushOp on the
+// io_uring scheduler. It requests 128-byte submission and 32-byte completion
+// entries. Ordinary file operations can share this scheduler.
+// RawNVMeCmdOp can submit I/O and Admin NVMe commands through the same extended ring.
+// The POSIX backend reports EOPNOTSUPP when an NVMe operation is submitted.
+func WithNVMeCommands() Option {
+	return optionFunc(func(c *schedulerConfig) { c.nvmeCommands = true })
 }
 
 // WithCoalescing controls whether contiguous same-file writes are merged into

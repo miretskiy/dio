@@ -513,12 +513,11 @@ type fallocateOp struct {
 }
 
 func newFallocateOp(
-	alloc *OpAlloc,
 	fd FD,
 	mode FallocateFlags,
 	offset, length int64,
 ) *fallocateOp {
-	op := alloc.newFallocateOp()
+	op := new(fallocateOp)
 	op.fd, op.mode = fd, mode
 	op.offset, op.length = uint64(offset), uint64(length)
 	if offset < 0 || length < 0 {
@@ -527,16 +526,7 @@ func newFallocateOp(
 	return op
 }
 
-func (op *fallocateOp) release() {
-	alloc := op.alloc
-	if alloc == nil {
-		return
-	}
-	op.reset()
-	alloc.fallocates.put(op, alloc)
-}
-
-func (op *fallocateOp) reset() { *op = fallocateOp{} }
+func (op *fallocateOp) release() {}
 
 func (op *fallocateOp) opcode() rawOpcode { return rawOpFallocate }
 func (op *fallocateOp) validate(ring *Ring) error {
@@ -565,7 +555,7 @@ func (op *fallocateOp) prepare(sqe *rawSQE) {
 // nonnegative.
 // liburing: io_uring_prep_fallocate - https://man7.org/linux/man-pages/man3/io_uring_prep_fallocate.3.html
 func Fallocate(fd FD, offset, length int64, options ...OpOption) Op {
-	return newFallocateOp(optionAlloc(options), fd, 0, offset, length)
+	return newFallocateOp(fd, 0, offset, length)
 }
 
 // FallocateMode constructs IORING_OP_FALLOCATE with an explicit fallocate
@@ -577,7 +567,7 @@ func FallocateMode(
 	offset, length int64,
 	options ...OpOption,
 ) Op {
-	return newFallocateOp(optionAlloc(options), fd, mode, offset, length)
+	return newFallocateOp(fd, mode, offset, length)
 }
 
 type openAtOp struct {
@@ -702,15 +692,7 @@ type unlinkAtOp struct {
 	path []byte
 }
 
-func (op *unlinkAtOp) release() {
-	alloc := op.alloc
-	if alloc == nil {
-		return
-	}
-	op.reset()
-	alloc.unlinkAts.put(op, alloc)
-}
-func (op *unlinkAtOp) reset()            { *op = unlinkAtOp{} }
+func (op *unlinkAtOp) release()          {}
 func (op *unlinkAtOp) opcode() rawOpcode { return rawOpUnlinkat }
 func (op *unlinkAtOp) validate(ring *Ring) error {
 	if err := op.opBase.validate(); err != nil {
@@ -733,7 +715,7 @@ func (op *unlinkAtOp) prepare(sqe *rawSQE) {
 // It copies path and refuses fixed-file directory descriptors.
 func UnlinkAt(dir FD, path string, options ...OpOption) Op {
 	copied, err := copyCString(path)
-	op := optionAlloc(options).newUnlinkAtOp()
+	op := new(unlinkAtOp)
 	op.dir, op.path = dir, copied
 	op.fail(err)
 	return op
@@ -838,16 +820,7 @@ type statxOp struct {
 	result *unix.Statx_t
 }
 
-func (op *statxOp) release() {
-	alloc := op.alloc
-	if alloc == nil {
-		return
-	}
-	op.reset()
-	alloc.statxes.put(op, alloc)
-}
-
-func (op *statxOp) reset() { *op = statxOp{} }
+func (op *statxOp) release() {}
 
 func (op *statxOp) opcode() rawOpcode { return rawOpStatx }
 func (op *statxOp) validate(ring *Ring) error {
@@ -891,8 +864,7 @@ func StatxAt(
 	options ...OpOption,
 ) Op {
 	copied, err := copyCStringAllowEmpty(path, flags&unix.AT_EMPTY_PATH != 0)
-	alloc := optionAlloc(options)
-	op := alloc.newStatxOp()
+	op := new(statxOp)
 	op.dir, op.path, op.flags = dir, copied, flags
 	op.mask, op.result = mask, result
 	op.fail(err)
@@ -908,16 +880,7 @@ type ftruncateOp struct {
 	length int64
 }
 
-func (op *ftruncateOp) release() {
-	alloc := op.alloc
-	if alloc == nil {
-		return
-	}
-	op.reset()
-	alloc.ftruncates.put(op, alloc)
-}
-
-func (op *ftruncateOp) reset() { *op = ftruncateOp{} }
+func (op *ftruncateOp) release() {}
 
 func (op *ftruncateOp) opcode() rawOpcode { return rawOpFtruncate }
 func (op *ftruncateOp) validate(ring *Ring) error {
@@ -942,8 +905,7 @@ func (op *ftruncateOp) prepare(sqe *rawSQE) {
 // in its completion; Ring.Probe reports support up front.
 // liburing: io_uring_prep_ftruncate - https://man7.org/linux/man-pages/man3/io_uring_prep_ftruncate.3.html
 func Ftruncate(fd FD, length int64, options ...OpOption) Op {
-	alloc := optionAlloc(options)
-	op := alloc.newFtruncateOp()
+	op := new(ftruncateOp)
 	op.fd, op.length = fd, length
 	if length < 0 {
 		op.fail(errors.New("ftruncate length must be nonnegative"))
