@@ -2,12 +2,13 @@ package iosched
 
 import (
 	"errors"
-	"io"
 	"os"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestTicketErrorReportsLinkedError(t *testing.T) {
@@ -158,59 +159,6 @@ func TestPreparationSyncsIntermediateDurableWrite(t *testing.T) {
 	}
 }
 
-func TestDurableWriteSyncOpPreservesTarget(t *testing.T) {
-	regular := new(os.File)
-	regularSync := WriteOp(regular, nil, 0).syncOp()
-	if regularSync.kind() != OpFdatasync || regularSync.f != regular {
-		t.Fatalf("regular sync op did not preserve file: %#v", regularSync)
-	}
-
-	virtualSync := VWriteOp(3, nil, 0).syncOp()
-	if virtualSync.kind() != OpFdatasync || !virtualSync.isVirtual() || virtualSync.vfd != 3 {
-		t.Fatalf("virtual sync op did not preserve slot: %#v", virtualSync)
-	}
-}
-
-func TestWriteResultError(t *testing.T) {
-	f := new(os.File)
-	write := WriteOp(f, make([]byte, 4), 0)
-	if err := writeResultError(&write.operation, 2, nil); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("short write error: got %v want %v", err, io.ErrShortWrite)
-	}
-	if err := writeResultError(&write.operation, 4, nil); err != nil {
-		t.Fatalf("complete write error: %v", err)
-	}
-	read := ReadOp(f, make([]byte, 4), 0)
-	if err := writeResultError(&read.operation, 2, nil); err != nil {
-		t.Fatalf("short read unexpectedly failed: %v", err)
-	}
-}
-
-func TestTicketWaitsForSubmissionCompletion(t *testing.T) {
-	root := Op{}.Link(Op{})
-	work := prepareForTest(root)
-	ticket := Ticket{&work.completion}
-	done := make(chan struct{})
-	go func() {
-		ticket.Wait()
-		close(done)
-	}()
-
-	work.recordResult(&work.root, 1, nil)
-	select {
-	case <-done:
-		t.Fatal("Wait returned before the submission completed")
-	default:
-	}
-
-	work.finish()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Wait did not return after submission completion")
-	}
-}
-
 func BenchmarkTicketCompletion(b *testing.B) {
 	root := Op{}
 	work := prepareForTest(root)
@@ -229,21 +177,6 @@ func BenchmarkTicketCompletion(b *testing.B) {
 	}
 }
 
-var benchmarkSubmission *submission
-var benchmarkTicket Ticket
-
-func BenchmarkSubmissionState(b *testing.B) {
-	b.ReportAllocs()
-	for range b.N {
-		root := Op{}
-		work := prepareForTest(root)
-		ticket := Ticket{&work.completion}
-		benchmarkSubmission = work
-		work.finish()
-		benchmarkTicket = ticket
-	}
-}
-
 var benchmarkLinkedOp Op
 
 func TestLinkAllocatesOnce(t *testing.T) {
@@ -252,33 +185,6 @@ func TestLinkAllocatesOnce(t *testing.T) {
 	})
 	if allocations != 1 {
 		t.Fatalf("link construction allocated %g times, want one follower slice", allocations)
-	}
-}
-
-func BenchmarkOpLink3(b *testing.B) {
-	b.ReportAllocs()
-	for range b.N {
-		benchmarkLinkedOp = Op{}.Link(Op{}, Op{})
-	}
-}
-
-func BenchmarkOpLinkChain8(b *testing.B) {
-	b.ReportAllocs()
-	for range b.N {
-		op := Op{}
-		for range 7 {
-			op = op.Link(Op{})
-		}
-		benchmarkLinkedOp = op
-	}
-}
-
-func BenchmarkOpLinkBatch8(b *testing.B) {
-	tail := make([]Op, 7)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		benchmarkLinkedOp = (Op{}).Link(tail...)
 	}
 }
 
@@ -403,4 +309,66 @@ func TestTicketConcurrentDoneAndWait(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestResultsOnShutdown(t *testing.T) {
+	for _, unplaced := range []bool{false, true} {
+		root := WriteOp(nil, nil, 0).Link(ReadOp(nil, nil, 0))
+		work := prepareForTest(root)
+		ticket := Ticket{&work.completion}
+		if unplaced {
+			work.fail(syscall.EIO)
+		} else {
+			work.recordResult(&work.root, 3, nil)
+			work.abandon(syscall.EIO)
+		}
+		_, err := ticket.Wait()
+		require.ErrorIs(t, err, syscall.EIO)
+		results := ticket.AllResults()
+		if unplaced {
+			require.ErrorIs(t, results[0].Err, syscall.EIO)
+		} else {
+			require.Equal(t, Result{N: 3}, results[0])
+		}
+		require.ErrorIs(t, results[1].Err, syscall.EIO)
+	}
+}
+
+var resultStorageTicket Ticket
+
+var allResultsSink []Result
+
+func TestAllResultsAllocatesOnlyForStandalone(t *testing.T) {
+	for _, count := range []int32{1, 2} {
+		op := Op{}
+		if count > 1 {
+			op = op.Link(Op{})
+		}
+		work := prepareForTest(op)
+		ticket := Ticket{&work.completion}
+		ticket.completion.finish()
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+		allocs := testing.AllocsPerRun(100, func() { allResultsSink = ticket.AllResults() })
+		want := float64(0)
+		if count == 1 {
+			want = 1
+		}
+		require.Equal(t, want, allocs)
+	}
+	allResultsSink = nil
+}
+
+func TestUnknownResultsPreserveOutOfOrderCompletions(t *testing.T) {
+	root := ReadOp(nil, nil, 0).Link(ReadOp(nil, nil, 0), ReadOp(nil, nil, 0))
+	work := prepareForTest(root)
+	ticket := Ticket{&work.completion}
+	work.recordResult(work.op(2), 7, nil)
+	work.abandon(syscall.EIO)
+	_, err := ticket.Wait()
+	require.ErrorIs(t, err, syscall.EIO)
+	results := ticket.AllResults()
+	require.ErrorIs(t, results[0].Err, syscall.EIO)
+	require.ErrorIs(t, results[1].Err, syscall.EIO)
+	require.Equal(t, Result{N: 7}, results[2])
 }

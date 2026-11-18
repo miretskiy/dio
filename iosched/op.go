@@ -59,6 +59,10 @@ const (
 // in that private copy. The caller keeps buffers valid through completion.
 const AllocateVFD uint32 = math.MaxUint32
 
+// Linux permits at most 1024 iovecs for one readv/writev. This caps the
+// vectors of one buffer operation and of a coalesced run of writes.
+const maxCoalescedWrites = 1024
+
 // Op is the caller-facing description of an I/O operation and its followers.
 // Submit copies the operation records into a private submission; it does not
 // retain the Op. Referenced buffers and files remain caller-owned and must stay

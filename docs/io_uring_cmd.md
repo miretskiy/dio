@@ -148,7 +148,7 @@ sharing with a filesystem, reserve the raw range outside its backing extents.
 ```go
 scheduler, err := iosched.NewURingScheduler(
     iosched.WithRingDepth(64),
-    iosched.WithNVMeCommands(),
+    iosched.WithNVMeCommands(device),
 )
 if err != nil { return err }
 defer scheduler.Close()
@@ -288,6 +288,18 @@ reaping and retrying; pushed operations remain owned by the ring until completio
 **CQEs** (Completion Queue Entries). Use this option on schedulers or rings that
 submit device commands. File-only rings keep the default 64/16-byte entries;
 ordinary file operations can share an extended ring with device commands.
+
+Pass the devices the scheduler addresses to `WithNVMeCommands`; the ring then
+keeps no more commands in flight than `Info.QueueDepth`, the namespace's
+per-hardware-queue request limit (`/sys/block/<ns>/queue/nr_requests`).
+io_uring issues each command inline without blocking; when the submitting
+CPU's queue has no free request, the driver returns EAGAIN inside the kernel
+and io_uring hands the command to an io-wq worker thread, which blocks until a
+request frees. The command still completes normally, but each handoff costs a
+thread wakeup, and idle workers exit after five seconds, so a ring deeper than
+the queue churns kernel threads. The queue's requests are shared with other
+users of the namespace and with other rings, so the bound avoids, rather than
+forbids, these handoffs.
 At the command level there are three selectors:
 
 | Field | Value | Purpose |

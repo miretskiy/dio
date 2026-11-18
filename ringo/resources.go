@@ -3,11 +3,13 @@
 package ringo
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"runtime"
+	"slices"
+	"sort"
 	"syscall"
 	"unsafe"
 )
@@ -160,6 +162,23 @@ func (file FixedFile) validate(ring *Ring) error {
 	return nil
 }
 
+// Linux's fixed-buffer registration ABI limits each entry to 1 GiB. The
+// registration path splits caller regions at this constant; the ABI supplies
+// no query for a larger per-entry limit.
+const (
+	maxRegisteredBufferBytes = 1 << 30
+	maxRegisteredBuffers     = 1 << 14 // Supported kernel baseline's registration-table limit.
+	// MaxRegisteredMemory is the total memory one Ring can register: 32 GiB.
+	MaxRegisteredMemory = 32 << 30
+)
+
+// bufferRegion locates one caller region's consecutive registration entries.
+type bufferRegion struct {
+	base  uintptr
+	size  uintptr
+	first uint32 // Index of the region's first entry.
+}
+
 // FixedBuffers is one immutable fixed-buffer table owned by a Ring. It stays
 // registered with the kernel until Ring.Close and retains its backing buffers
 // for as long as the table itself is reachable. Because it is never mutated,
@@ -167,9 +186,10 @@ func (file FixedFile) validate(ring *Ring) error {
 type FixedBuffers struct {
 	ring    *Ring
 	buffers [][]byte
+	regions []bufferRegion
 }
 
-// Len returns the number of buffers in the table.
+// Len returns the number of kernel registration entries in the table.
 func (set *FixedBuffers) Len() int {
 	if set == nil || set.ring == nil {
 		return 0
@@ -177,7 +197,7 @@ func (set *FixedBuffers) Len() int {
 	return len(set.buffers)
 }
 
-// Buffer returns the entire fixed buffer at index.
+// Buffer returns the entire kernel registration entry at index.
 func (set *FixedBuffers) Buffer(index uint32) (FixedBuffer, error) {
 	if set == nil || set.ring == nil {
 		return FixedBuffer{}, errors.New("ringo: invalid fixed-buffer table")
@@ -195,42 +215,52 @@ func (set *FixedBuffers) Buffer(index uint32) (FixedBuffer, error) {
 	}, nil
 }
 
+var errNotRegistered = errors.New("ringo: buffer is not inside one fixed-buffer entry")
+
 // Bind returns a typed fixed buffer for data, which must be a nonempty
-// subslice of exactly one registered buffer.
+// subslice of exactly one registration entry. The lookup is a binary search of
+// the regions by address, then arithmetic within the region.
 func (set *FixedBuffers) Bind(data []byte) (FixedBuffer, error) {
 	if set == nil || set.ring == nil {
 		return FixedBuffer{}, errors.New("ringo: invalid fixed-buffer table")
 	}
-	if len(data) == 0 {
-		return FixedBuffer{}, errors.New("ringo: cannot bind an empty fixed buffer")
+	start := slicePtr(data)
+	// The last region starting at or before data is the only one that can hold it.
+	i := sort.Search(len(set.regions), func(i int) bool { return set.regions[i].base > start }) - 1
+	if i < 0 || len(data) == 0 {
+		return FixedBuffer{}, errNotRegistered
 	}
-	start := uintptr(unsafe.Pointer(unsafe.SliceData(data)))
-	end := start + uintptr(len(data))
-	if end < start {
-		return FixedBuffer{}, errors.New("ringo: buffer address overflow")
+	region := set.regions[i]
+	offset := start - region.base
+	if offset >= region.size {
+		return FixedBuffer{}, errNotRegistered
 	}
-	for index, buffer := range set.buffers {
-		base := uintptr(unsafe.Pointer(unsafe.SliceData(buffer)))
-		limit := base + uintptr(len(buffer))
-		if limit < base {
-			return FixedBuffer{}, errors.New("ringo: fixed buffer address overflow")
-		}
-		if start >= base && end <= limit {
-			return FixedBuffer{
-				set:   set,
-				index: uint16(index),
-				data:  data,
-			}, nil
-		}
+	index := region.first + uint32(offset/maxRegisteredBufferBytes)
+	within := offset % maxRegisteredBufferBytes
+	if uintptr(len(data)) > uintptr(len(set.buffers[index]))-within {
+		return FixedBuffer{}, errNotRegistered
 	}
-	return FixedBuffer{}, errors.New("ringo: buffer is not inside this fixed-buffer table")
+	return FixedBuffer{set: set, index: uint16(index), data: data}, nil
 }
 
-// FixedBuffer is a typed slice of a ring-owned fixed buffer.
+// FixedBuffer is a typed slice of a ring-owned registration entry.
 type FixedBuffer struct {
 	set   *FixedBuffers
 	index uint16
 	data  []byte
+}
+
+// Len reports the bytes selected by Buffer or Bind.
+func (buffer FixedBuffer) Len() int { return len(buffer.data) }
+
+// EntryRemaining reports the bytes from the start of the selected range to
+// the end of its registration entry.
+func (buffer FixedBuffer) EntryRemaining() int {
+	if buffer.set == nil || int(buffer.index) >= len(buffer.set.buffers) {
+		return 0
+	}
+	entry := buffer.set.buffers[buffer.index]
+	return len(entry) - int(slicePtr(buffer.data)-slicePtr(entry))
 }
 
 // containsIovec reports whether one vector of a fixed vectored operation falls
@@ -249,6 +279,14 @@ func (buffer FixedBuffer) containsIovec(iovec syscall.Iovec) bool {
 	return end >= start && limit >= base && start >= base && end <= limit
 }
 
+// contains reports whether data lies inside this registered buffer's entry.
+func (buffer FixedBuffer) contains(data []byte) bool {
+	var iovec syscall.Iovec
+	iovec.Base = unsafe.SliceData(data)
+	iovec.SetLen(len(data))
+	return buffer.containsIovec(iovec)
+}
+
 func (buffer FixedBuffer) validate(ring *Ring) error {
 	if buffer.set == nil || buffer.set.ring == nil {
 		return errors.New("ringo: invalid fixed buffer")
@@ -263,7 +301,10 @@ func (buffer FixedBuffer) validate(ring *Ring) error {
 }
 
 // RegisterBuffers registers one immutable fixed-buffer table. A Ring supports
-// one table, and the table remains registered until Ring.Close.
+// one table, and the table remains registered until Ring.Close. Each caller
+// region is split into entries of at most 1 GiB, so a 16 GiB region uses
+// sixteen entries. A bound range must lie within one entry. Regions total at
+// most MaxRegisteredMemory (32 GiB).
 // liburing: io_uring_register_buffers - https://man7.org/linux/man-pages/man3/io_uring_register_buffers.3.html
 func (ring *Ring) RegisterBuffers(buffers ...[]byte) (*FixedBuffers, error) {
 	if err := ring.ready(); err != nil {
@@ -275,26 +316,39 @@ func (ring *Ring) RegisterBuffers(buffers ...[]byte) (*FixedBuffers, error) {
 	if len(buffers) == 0 {
 		return nil, errors.New("ringo: cannot register an empty buffer set")
 	}
-	if len(buffers) > math.MaxUint16+1 {
-		return nil, errors.New("ringo: too many fixed buffers")
-	}
-
-	retained := append([][]byte(nil), buffers...)
-	iovecs := make([]syscall.Iovec, len(retained))
-	for i, buffer := range retained {
+	entries := 0
+	var total uint64
+	for i, buffer := range buffers {
 		if len(buffer) == 0 {
 			return nil, fmt.Errorf("ringo: fixed buffer %d is empty", i)
 		}
-		if uint64(len(buffer)) > 1<<30 {
-			return nil, fmt.Errorf("ringo: fixed buffer %d exceeds 1 GiB", i)
+		if uint64(len(buffer)) > MaxRegisteredMemory-total {
+			return nil, errors.New("ringo: registered memory exceeds 32 GiB per ring")
 		}
-		iovecs[i].Base = unsafe.SliceData(buffer)
-		iovecs[i].SetLen(len(buffer))
+		total += uint64(len(buffer))
+		entries += 1 + (len(buffer)-1)/maxRegisteredBufferBytes
+		if entries > maxRegisteredBuffers {
+			return nil, errors.New("ringo: regions require more than 16384 fixed-buffer entries")
+		}
 	}
-	set := &FixedBuffers{ring: ring, buffers: retained}
+	set := &FixedBuffers{ring: ring, buffers: make([][]byte, 0, entries), regions: make([]bufferRegion, 0, len(buffers))}
+	iovecs := make([]syscall.Iovec, 0, entries)
+	for _, buffer := range buffers {
+		set.regions = append(set.regions, bufferRegion{base: slicePtr(buffer), size: uintptr(len(buffer)), first: uint32(len(set.buffers))})
+		for len(buffer) != 0 {
+			n := min(len(buffer), maxRegisteredBufferBytes)
+			entry := buffer[:n:n]
+			set.buffers = append(set.buffers, entry)
+			iovec := syscall.Iovec{Base: unsafe.SliceData(entry)}
+			iovec.SetLen(len(entry))
+			iovecs = append(iovecs, iovec)
+			buffer = buffer[len(entry):]
+		}
+	}
 	if _, err := ring.backend.registerBuffers(iovecs); err != nil {
 		return nil, err
 	}
+	slices.SortFunc(set.regions, func(a, b bufferRegion) int { return cmp.Compare(a.base, b.base) })
 	ring.buffers = set
 	return set, nil
 }

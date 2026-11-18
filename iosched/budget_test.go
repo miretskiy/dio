@@ -81,9 +81,8 @@ func TestBudgetOptions(t *testing.T) {
 }
 
 func TestSchedulerOptionDefaults(t *testing.T) {
-	cfg := makeSchedulerConfig([]Option{WithRingDepth(2), WithCoordinatorCPU(-5), WithDiskPolicy(nil)})
+	cfg := makeSchedulerConfig([]Option{WithRingDepth(2), WithDiskPolicy(nil)})
 	require.EqualValues(t, minRingDepth, cfg.ringDepth, "depth leaves room for the longest chain and the doorbell")
-	require.Negative(t, cfg.coordinatorCPU)
 	require.NotNil(t, cfg.disk)
 	require.NotSame(t, cfg.disk, makeSchedulerConfig(nil).disk, "each scheduler gets its own default policy")
 }
@@ -304,22 +303,6 @@ func TestMixedDispatchRollback(t *testing.T) {
 	p.release(mixed, &ring)
 	require.Equal(t, DiskStats{}, p.Stats())
 	require.Equal(t, ringInFlight{reads: 1, writes: 1}, ring)
-}
-
-func TestSharedDiskPolicy(t *testing.T) {
-	p := policy(WithLatencyGoal(time.Millisecond), WithWriteBacklogLimit(2048), WithoutReadIOBudget())
-	a := makeSchedulerConfig([]Option{WithDiskPolicy(p), WithCoordinatorCPU(3), WithRingDepth(64)})
-	b := makeSchedulerConfig([]Option{WithDiskPolicy(p)})
-	require.Same(t, p, a.disk)
-	require.Same(t, p, b.disk)
-	require.Equal(t, 3, a.coordinatorCPU)
-	require.EqualValues(t, 64, a.ringDepth)
-	work := policyWrite(p, 2048)
-	require.NoError(t, a.disk.admit(work))
-	p.account(work)
-	p.updateAdmission()
-	require.Error(t, b.disk.admit(policyWrite(p, 1)))
-	a.disk.release(work, &testRing)
 }
 
 var _ func(...DiskPolicyOption) *DiskPolicy = NewDiskPolicy

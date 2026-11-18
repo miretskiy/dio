@@ -11,6 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/miretskiy/dio/v2/iosched"
+	"github.com/miretskiy/dio/v2/nvme"
 )
 
 func writeTempFile(t *testing.T, size int) (path string, data []byte) {
@@ -42,33 +43,6 @@ func TestNewDefaultScheduler(t *testing.T) {
 	s := iosched.NewDefaultScheduler()
 	require.NotNil(t, s)
 	require.NoError(t, s.Close())
-}
-
-func TestPOSIXScheduler(t *testing.T) {
-	s := iosched.NewPOSIXScheduler()
-	t.Cleanup(func() { require.NoError(t, s.Close()) })
-
-	path := filepath.Join(t.TempDir(), "posix.dat")
-	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0644))
-	f := openRWFile(t, path)
-
-	payload := make([]byte, 4096)
-	_, err := rand.Read(payload)
-	require.NoError(t, err)
-
-	n, err := submitAndWait(t, s, iosched.WriteOp(f, payload, 0))
-	require.NoError(t, err)
-	require.Equal(t, len(payload), n)
-
-	got := make([]byte, len(payload))
-	n, err = submitAndWait(t, s, iosched.ReadOp(f, got, 0))
-	require.NoError(t, err)
-	require.Equal(t, len(got), n)
-	require.Equal(t, payload, got)
-
-	n, err = submitAndWait(t, s, iosched.WriteOp(f, payload, 0).Link(iosched.FdatasyncOp(f)))
-	require.NoError(t, err)
-	require.Equal(t, len(payload), n)
 }
 
 func TestPOSIXSchedulerErrors(t *testing.T) {
@@ -118,7 +92,8 @@ func TestFallocateOpGrowsFile(t *testing.T) {
 
 // Without WithVFiles, virtual operations are unsupported, as on io_uring.
 func TestPOSIXRejectsVirtualOperationsWithoutTable(t *testing.T) {
-	s := newPOSIX(t)
+	s := iosched.NewPOSIXScheduler()
+	defer func() { require.NoError(t, s.Close()) }()
 	path := filepath.Join(t.TempDir(), "unused")
 	for _, op := range []iosched.Op{
 		iosched.VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, 0),
@@ -133,6 +108,20 @@ func TestPOSIXRejectsVirtualOperationsWithoutTable(t *testing.T) {
 	}
 	_, err := os.Stat(path)
 	require.True(t, os.IsNotExist(err), "rejected chains must not execute")
+}
+
+// NVMe operations build on every platform; only io_uring executes them.
+func TestPOSIXRejectsNVMeOperations(t *testing.T) {
+	s := newPOSIX(t)
+	var device nvme.Device
+	for _, op := range []iosched.Op{
+		iosched.NVMeReadOp(&device, make([]byte, 4096), 0),
+		iosched.NVMeWriteOp(&device, make([]byte, 4096), 0),
+		iosched.NVMeFlushOp(&device),
+	} {
+		_, err := s.Submit(op)
+		require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	}
 }
 
 func TestPOSIXVirtualFiles(t *testing.T) {

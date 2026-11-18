@@ -74,6 +74,7 @@ func TestRawConstantsMatchLiburing(t *testing.T) {
 		rawRegisterSyncCancel,
 	))
 	require.Equal(t, want.RsrcSparse, rawRsrcRegisterSparse)
+	require.Equal(t, want.UringCmdFixed, rawUringCmdFixed)
 	require.Equal(t, want.CancelFlags[:], rawValues(
 		rawAsyncCancelAll,
 		rawAsyncCancelFD,

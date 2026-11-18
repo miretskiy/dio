@@ -317,7 +317,7 @@ func (ring *Ring) prepareSQE(sqe *rawSQE, pending *pendingSlot) {
 	// Ordinary prepare methods clear 64 bytes. Clear the extension too when a
 	// slot previously used for a device command is reused by an ordinary Op.
 	if ring.backend.flags&rawSetupSQE128 != 0 {
-		clear(unsafe.Slice((*byte)(unsafe.Pointer(sqe)), 128))
+		clear(unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(sqe), unsafe.Sizeof(*sqe))), unsafe.Sizeof(*sqe)))
 	}
 	pending.op.prepare(sqe)
 	sqe.User_data = uint64(pending.handle.slot)

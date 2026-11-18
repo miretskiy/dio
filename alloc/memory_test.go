@@ -5,12 +5,30 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/internal/buildutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+func TestMemoryRegionPositions(t *testing.T) {
+	pool := NewAllocator(128 << 10)
+	defer pool.Close()
+	first, err := pool.TryAcquire(4096)
+	require.NoError(t, err)
+	defer first.Unpin()
+	second, err := pool.TryAcquire(4096)
+	require.NoError(t, err)
+	defer second.Unpin()
+	region := pool.Region()
+	base := uintptr(unsafe.Pointer(&region[0]))
+	for _, m := range []Memory{first, second} {
+		offset := uintptr(unsafe.Pointer(&m.Bytes()[0])) - base
+		require.Less(t, offset, uintptr(len(region)), "Region covers every allocation")
+	}
+}
 
 func TestMemoryLastReferenceReleasesExactlyOnce(t *testing.T) {
 	a := newAllocator(t, spanBytes)

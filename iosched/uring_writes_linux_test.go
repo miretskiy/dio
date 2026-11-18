@@ -1,9 +1,8 @@
-//go:build linux
-
 package iosched
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +14,128 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 )
+
+func TestCoalescedRun(t *testing.T) {
+	fa := os.NewFile(100, "a")
+	fb := os.NewFile(101, "b")
+	w := func(f *os.File, off int64, n int) Op {
+		return WriteOp(f, make([]byte, n), off)
+	}
+	vw := func(vfd uint32, off int64, n int) Op {
+		return VWriteOp(vfd, make([]byte, n), off)
+	}
+	rd := func(f *os.File, off int64, n int) Op {
+		return ReadOp(f, make([]byte, n), off)
+	}
+
+	tests := []struct {
+		name string
+		ops  []Op
+		want int
+	}{
+		{"contiguous run", []Op{w(fa, 0, 4), w(fa, 4, 6), w(fa, 10, 2)}, 3},
+		{"gap", []Op{w(fa, 0, 4), w(fa, 100, 4)}, 1},
+		{"overlap", []Op{w(fa, 0, 4), w(fa, 0, 4)}, 1},
+		{"different file", []Op{w(fa, 0, 4), w(fb, 4, 4)}, 1},
+		{"read breaks run", []Op{w(fa, 0, 4), rd(fa, 4, 4), w(fa, 4, 4)}, 1},
+		{"regular and virtual differ", []Op{w(fa, 0, 4), vw(0, 4, 4)}, 1},
+		{"virtual contiguous", []Op{vw(1, 0, 4), vw(1, 4, 4)}, 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestCoordinator(t, 8, 2)
+			acceptOps(c, tc.ops...)
+			first := c.ready.head
+			require.NotNil(t, first)
+			require.Equal(t, tc.want, c.coalescedRun(first))
+		})
+	}
+}
+
+func TestCoalescibleWrite(t *testing.T) {
+	fa := os.NewFile(100, "a")
+	buf := make([]byte, 4)
+	tests := []struct {
+		name string
+		op   Op
+		want bool
+	}{
+		{"regular write", WriteOp(fa, buf, 0), true},
+		{"virtual write", VWriteOp(0, buf, 0), true},
+		{"read", ReadOp(fa, buf, 0), false},
+		{"fixed write", WriteFixedOp(fa, buf, 0), false},
+		{"fsync", FsyncOp(fa), false},
+		{"linked write", WriteOp(fa, buf, 0).Link(FsyncOp(fa)), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, tc.op.coalescibleWrite())
+		})
+	}
+}
+
+func TestPlaceReadyCoalescesWrites(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	f := testFile(t, 12)
+	tickets, handles := acceptOps(c,
+		WriteOp(f, make([]byte, 4), 0),
+		WriteOp(f, make([]byte, 6), 4),
+		WriteOp(f, make([]byte, 2), 10),
+	)
+
+	c.placeReady(true)
+	require.Equal(t, 1, c.occupied, "the run was not placed as one write")
+	require.Equal(t, handles, coalescedRunForTest(handles[0]), "the leader does not link the run in writev order")
+
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	for i, want := range []int{4, 6, 2} {
+		n, err := tickets[i].Wait()
+		require.NoError(t, err)
+		require.Equal(t, want, n)
+	}
+	for _, member := range handles {
+		require.Nil(t, member.staged, "a completed member still links its run")
+	}
+}
+
+func TestCoalescedShortWriteCompletion(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	f := os.NewFile(100, "a")
+	tickets, handles := acceptOps(c,
+		WriteOp(f, make([]byte, 4), 0),
+		WriteOp(f, make([]byte, 4), 4),
+	)
+	issueWriteGroupForTest(c, handles...)
+
+	c.finishWrite(handles[0], 6, nil)
+	n, err := tickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	n, err = tickets[1].Wait()
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Equal(t, 2, n)
+}
+
+func TestSingleShortWriteCompletion(t *testing.T) {
+	c := newTestCoordinator(t, 1, 0)
+	f := os.NewFile(100, "a")
+	tickets, handles := acceptOps(c, WriteOp(f, make([]byte, 4), 0))
+	issueWriteGroupForTest(c, handles...)
+
+	c.finishWrite(handles[0], 2, nil)
+	n, err := tickets[0].Wait()
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Equal(t, 2, n)
+}
+
+// coalescedRunForTest lists a placed run's members, linked from its leader.
+func coalescedRunForTest(leader *submission) []*submission {
+	var run []*submission
+	for member := leader; member != nil; member = member.staged {
+		run = append(run, member)
+	}
+	return run
+}
 
 func TestAcceptMarksDurableWrites(t *testing.T) {
 	regular := os.NewFile(100, "regular")
@@ -62,34 +183,6 @@ func TestDurableWriteSyncsAfterItsWrite(t *testing.T) {
 	require.Positive(t, slat)
 	require.Equal(t, slat, tickets[0].Slat, "the sync must not replace the original ring-placement time")
 	require.GreaterOrEqual(t, tickets[0].Clat, writesDone.Sub(work[0].completion.started)-slat, "clat includes the sync")
-}
-
-// TestDurableWritesShareOneSyncPerFile places durable writes on two files that
-// all complete before the next placement: the file with three writes gets one
-// fdatasync for all of them, and the other file its own. The writes are not
-// contiguous, so this is group commit without coalescing.
-func TestDurableWritesShareOneSyncPerFile(t *testing.T) {
-	c := newTestCoordinator(t, 8, 0)
-	shared := testFile(t, 3*4096)
-	other := testFile(t, 4096)
-	tickets, _ := acceptOps(c,
-		WriteOp(shared, make([]byte, 8), 0).Durable(),
-		WriteOp(shared, make([]byte, 8), 8192).Durable(),
-		WriteOp(other, make([]byte, 8), 0).Durable(),
-		WriteOp(shared, make([]byte, 8), 4096).Durable(),
-	)
-	c.placeReady(false)
-	require.Equal(t, 4, c.occupied)
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-
-	c.placeReady(false)
-	require.Equal(t, 2, c.occupied, "want one fdatasync per file")
-	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
-	for i, ticket := range tickets {
-		n, err := ticket.Wait()
-		require.NoErrorf(t, err, "ticket %d", i)
-		require.Equalf(t, 8, n, "ticket %d", i)
-	}
 }
 
 // Durable tails share a sync with standalone writes to the same file, even
@@ -207,6 +300,10 @@ func TestLinkedDurableTailSyncError(t *testing.T) {
 	n, err := tickets[0].Wait()
 	require.Equal(t, 4, n)
 	require.ErrorIs(t, err, syscall.EBADF)
+	results := tickets[0].AllResults()
+	require.Equal(t, Result{N: 4}, results[0])
+	require.Equal(t, 8, results[1].N, "the tail's sync failure is reported with its write")
+	require.ErrorIs(t, results[1].Err, syscall.EBADF)
 	require.Zero(t, c.files.virtual[0].active)
 }
 
@@ -354,4 +451,137 @@ func TestIntermediateDurableWriteThenClose(t *testing.T) {
 	got, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, data, got)
+}
+
+func TestFileDependenciesCloseDrainsOlderRead(t *testing.T) {
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 4)
+	_, handles := acceptOps(c,
+		ReadOp(f, make([]byte, 1), 0),
+		DrainOp(f),
+	)
+
+	if handles[1].waitCount != 1 {
+		t.Fatal("close did not wait for older read")
+	}
+	completeForTest(c, handles[0], 0, 1, nil)
+	if handles[1].state != workReady {
+		t.Fatal("close did not become ready after read")
+	}
+	completeForTest(c, handles[1], 0, 0, nil)
+}
+
+func TestFileDependenciesCloseAtEndOfChainDrainsOnlyOlderWork(t *testing.T) {
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 4)
+	_, handles := acceptOps(c,
+		ReadOp(f, make([]byte, 1), 0),
+		WriteOp(f, make([]byte, 1), 1).Link(
+			WriteOp(f, make([]byte, 1), 2),
+			DrainOp(f),
+		),
+	)
+
+	chain := handles[1]
+	if chain.waitCount != 1 || chain.state == workReady {
+		t.Fatal("close chain did not wait exactly for older work")
+	}
+	if got := c.files.regular[f].closeRemaining; got != 1 {
+		t.Fatalf("close drain counted its own chain: got %d older operations want 1", got)
+	}
+
+	lateRoot := ReadOp(f, make([]byte, 1), 3)
+	late, err := c.sched.Submit(lateRoot)
+	require.NoError(t, err)
+	c.accept(c.sched.takeStaged())
+	_, err = late.Wait()
+	if err == nil {
+		t.Fatal("work submitted behind a close at the end of a chain was accepted")
+	}
+
+	completeForTest(c, handles[0], 0, 1, nil)
+	if handles[1].state != workReady {
+		t.Fatal("close chain did not become ready after older work completed")
+	}
+	completeForTest(c, handles[1], 0, 1, nil)
+	completeForTest(c, handles[1], 1, 1, nil)
+	completeForTest(c, handles[1], 2, 0, nil)
+}
+
+func TestFileDependenciesRejectWorkBehindClose(t *testing.T) {
+	c := newTestCoordinator(t, 4, 0)
+	f := testFile(t, 4)
+	tickets, handles := acceptOps(c,
+		DrainOp(f),
+		ReadOp(f, make([]byte, 1), 0),
+	)
+
+	if len(handles) != 1 {
+		t.Fatalf("accepted work: got %d want 1", len(handles))
+	}
+	_, err := tickets[1].Wait()
+	if err == nil {
+		t.Fatal("work submitted behind close was accepted")
+	}
+	completeForTest(c, handles[0], 0, 0, nil)
+}
+
+// TestCoalescedDurableWritesShareSyncError coalesces two durable writes. Each
+// keeps its own byte count, and both report the error of the one fdatasync
+// they share. The writes are delivered by hand; the fdatasync is real and
+// fails because virtual slot 0 holds no file.
+func TestCoalescedDurableWritesShareSyncError(t *testing.T) {
+	c := newTestCoordinator(t, 4, 1)
+	tickets, handles := acceptOps(c,
+		VWriteOp(0, make([]byte, 4), 0).Durable(),
+		VWriteOp(0, make([]byte, 4), 4).Durable(),
+	)
+	issueWriteGroupForTest(c, handles...)
+	c.finishWrite(handles[0], 8, nil)
+
+	c.placeReady(false)
+	require.Equal(t, 1, c.occupied, "the two writes should share one fdatasync")
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	for _, ticket := range tickets {
+		n, err := ticket.Wait()
+		require.ErrorIs(t, err, syscall.EBADF)
+		require.Equal(t, 4, n)
+	}
+}
+
+// TestDurableWritePreservesCountsOnRingFailureAfterWrite fails a durable write
+// whose write completed while it waited for its fdatasync. The ticket keeps
+// the byte count the write reported.
+func TestDurableWritePreservesCountsOnRingFailureAfterWrite(t *testing.T) {
+	ringErr := errors.New("ring failed")
+	c := newTestCoordinator(t, 2, 0)
+	f := testFile(t, 4)
+	tickets, _ := acceptOps(c, WriteOp(f, make([]byte, 4), 0).Durable())
+	c.placeReady(false)
+	submitAndReapUntil(t, c, func() bool { return c.occupied == 0 })
+	require.Len(t, c.syncPending, 1, "the write should be waiting for its fdatasync")
+
+	c.failRemaining(nil, ringErr, ringErr)
+	n, err := tickets[0].Wait()
+	if n != 4 || !errors.Is(err, ringErr) {
+		t.Fatalf("result: got N=%d error=%v, want N=4 error=%v", n, err, ringErr)
+	}
+}
+
+func TestVirtualOperationsHaveNoLifecycleBarriers(t *testing.T) {
+	c := newTestCoordinator(t, 8, 1)
+	tickets, works := acceptOps(c,
+		VOpenatOp(0, "unused", 0, 0, 0),
+		VReadOp(0, make([]byte, 1), 0),
+		VCloseOp(0),
+		VOpenatOp(0, "another", 0, 0, 0),
+	)
+	require.Len(t, works, len(tickets))
+	for _, work := range works {
+		require.Equal(t, workReady, work.state)
+		require.Zero(t, work.waitCount)
+	}
+	for _, work := range works {
+		completeForTest(c, work, 0, 0, nil)
+	}
 }

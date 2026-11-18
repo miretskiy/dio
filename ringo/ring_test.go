@@ -796,6 +796,80 @@ func TestRegisteredResourcesAreRingScopedAndRetained(t *testing.T) {
 	require.False(t, len(set.buffers) != 1, "Close mutated the caller's buffer table")
 }
 
+func TestLargeRegisteredRegions(t *testing.T) {
+	// Reserve virtual address space; the fake backend never pins or touches it.
+	mapping, err := unix.Mmap(-1, 0, MaxRegisteredMemory+8192, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, unix.Munmap(mapping)) }()
+	ring, fake := newFakeRing(4)
+	defer func() { require.NoError(t, ring.Close()) }()
+	_, err = ring.RegisterBuffers(mapping)
+	require.ErrorContains(t, err, "32 GiB")
+	_, err = ring.RegisterBuffers(mapping[:MaxRegisteredMemory], mapping[MaxRegisteredMemory:])
+	require.ErrorContains(t, err, "32 GiB")
+	require.Empty(t, fake.registeredBuffers, "over-limit registration fails before the syscall")
+	region, small := mapping[:MaxRegisteredMemory-4096], mapping[MaxRegisteredMemory:MaxRegisteredMemory+4096]
+	set, err := ring.RegisterBuffers(region, small)
+	require.NoError(t, err)
+	require.Equal(t, 33, set.Len())
+	for i, iovec := range fake.registeredBuffers[:32] {
+		require.Same(t, &region[i*maxRegisteredBufferBytes], iovec.Base)
+		require.EqualValues(t, min(maxRegisteredBufferBytes, len(region)-i*maxRegisteredBufferBytes), iovec.Len)
+	}
+	// Each side of an entry boundary binds; a range crossing it does not.
+	boundary := maxRegisteredBufferBytes
+	first, err := set.Bind(region[boundary-4096 : boundary])
+	require.NoError(t, err)
+	require.Zero(t, first.index)
+	second, err := set.Bind(region[boundary : boundary+4096])
+	require.NoError(t, err)
+	require.EqualValues(t, 1, second.index)
+	_, err = set.Bind(region[boundary-4096 : boundary+4096])
+	require.ErrorIs(t, err, errNotRegistered)
+	last, err := set.Bind(small)
+	require.NoError(t, err)
+	require.EqualValues(t, 32, last.index)
+	_, err = set.Bind(mapping[MaxRegisteredMemory-4096 : MaxRegisteredMemory])
+	require.ErrorIs(t, err, errNotRegistered)
+	h, err := ring.Push(ReadFixed(BorrowedFD(17), second, 0))
+	require.NoError(t, err)
+	require.Equal(t, uint64(slicePtr(region)+maxRegisteredBufferBytes), fake.sqe(0).Addr)
+	require.Equal(t, uint32(4096), fake.sqe(0).Len)
+	require.EqualValues(t, 1, fake.sqe(0).Buf_index)
+	_, err = ring.Submit()
+	require.NoError(t, err)
+	fake.complete(h, 4096, 0)
+	for range ring.Reap() {
+	}
+}
+
+// Many regions registered out of address order each bind to their own entry.
+func TestBindManyRegions(t *testing.T) {
+	mapping, err := unix.Mmap(-1, 0, 64*4096, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, unix.Munmap(mapping)) }()
+	ring, _ := newFakeRing(4)
+	defer func() { require.NoError(t, ring.Close()) }()
+	regions := make([][]byte, 64)
+	for i := range regions {
+		// Reverse address order: registration index 0 is the highest page.
+		start := (len(regions) - 1 - i) * 4096
+		regions[i] = mapping[start : start+4096]
+	}
+	set, err := ring.RegisterBuffers(regions...)
+	require.NoError(t, err)
+	for i, region := range regions {
+		buffer, err := set.Bind(region[100:200])
+		require.NoError(t, err)
+		require.EqualValues(t, i, buffer.index)
+		require.Equal(t, 4096-100, buffer.EntryRemaining())
+	}
+	_, err = set.Bind(mapping[4096-8 : 4096+8])
+	require.ErrorIs(t, err, errNotRegistered, "a range spanning two regions")
+	_, err = set.Bind(make([]byte, 8))
+	require.ErrorIs(t, err, errNotRegistered)
+}
+
 func TestFixedFilesUpdate(t *testing.T) {
 	ring, fake := newFakeRing(2)
 	files, err := ring.RegisterSparseFiles(3)

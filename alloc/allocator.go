@@ -112,6 +112,11 @@ func (a *Allocator) Acquire(ctx context.Context, size int64) (Memory, error) {
 // It must not race Close.
 func (a *Allocator) Capacity() int64 { return int64(len(a.arena.region)) }
 
+// Region returns the whole backing mapping for ring-lifetime registration.
+// Memory leases continue to govern access to individual allocations. Keep the
+// allocator open until every ring using this mapping has closed successfully.
+func (a *Allocator) Region() []byte { return a.arena.region }
+
 // MaxSize reports the largest TryAcquire or Acquire result: 128 KiB.
 func (a *Allocator) MaxSize() int64 { return MaxAllocationSize }
 

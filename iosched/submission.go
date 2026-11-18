@@ -16,8 +16,9 @@ type submission struct {
 	linked        []operation // private copies of Op.followers() and synthesized fdatasyncs
 	reads, writes ioCharge    // request totals until coordinator acceptance; accounted charges afterward
 	whenDone      func(int, error)
-	resultDone    uint8      // bit per results entry recorded
-	nvmeSplit     *nvmeSplit // Allocated for chains containing an oversized NVMe request.
+	resultDone    uint8 // bit per results entry recorded
+	pending       int32 // placeNVMe commands awaiting completion
+	sent          int   // bytes placeNVMe has issued
 	// staged links the staging stack until acceptance, then a coalesced run's
 	// members from its leader until the run completes.
 	staged *submission
@@ -218,17 +219,14 @@ type queueLinks struct {
 	prev, next *submission
 }
 
-// Which of a submission's links a submissionQueue uses.
-const (
-	// placementLinks link work waiting to be placed: the ready queue, or a
-	// file's sync batch waiting for its fdatasync. Work is on at most one.
-	placementLinks = iota
-	// acceptedLinks link the accepted queue, which holds all accepted work.
-	acceptedLinks
-)
+// Which of a submission's links a submissionQueue uses. Links 0 link work
+// waiting to be placed: a ready queue, or a file's sync batch waiting for its
+// fdatasync; work is on at most one. acceptedLinks link the accepted queue,
+// which holds all accepted work.
+const acceptedLinks = 1
 
 // submissionQueue is a FIFO of submissions, linked through their links[links].
-// Its zero value is an empty queue on placementLinks.
+// Its zero value is an empty queue on the placement links.
 type submissionQueue struct {
 	head, tail *submission
 	len        int

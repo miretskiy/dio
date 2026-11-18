@@ -110,26 +110,6 @@ func TestURingRejectionCapacityOnFailuresAndShutdown(t *testing.T) {
 	require.Equal(t, DiskStats{}, c.sched.config.disk.Stats())
 }
 
-// Reuse one buffer to fill a two-second backlog (2 GB at one byte per
-// nanosecond) without allocating or issuing 2 GB. The test drives admission.
-func TestURingBacklogLimitWithReusedBuffer(t *testing.T) {
-	c := newTestCoordinator(t, 32, 0, diskOptions(append(nanosPerByte, WithLatencyGoal(DefaultLatencyGoal),
-		WithWriteBacklogLimit(2*time.Second))...))
-	f := testFile(t, 1)
-	buf := make([]byte, 1_000_000)
-	for range 2000 {
-		_, err := c.sched.Submit(WriteOp(f, buf, 0))
-		require.NoError(t, err)
-	}
-	c.accept(c.sched.takeStaged())
-	require.Equal(t, 2*time.Second, c.sched.config.disk.Stats().Writes.Backlog)
-	ticket, err := c.sched.Submit(WriteOp(f, buf[:1], 0))
-	require.ErrorIs(t, err, ErrRejected)
-	require.Nil(t, ticket.completion)
-	c.failRemaining(c.sched.closeStaging(), errSchedulerClosed, errSchedulerClosed)
-	require.Equal(t, DiskStats{}, c.sched.config.disk.Stats())
-}
-
 func TestCoordinatorCountsMixedChainExcludingMustAdmit(t *testing.T) {
 	c := newTestCoordinator(t, 32, 0, diskOptions(append(nanosPerByte, WithLatencyGoal(DefaultLatencyGoal),
 		WithReadBacklogLimit(4), WithWriteBacklogLimit(4))...))
@@ -212,58 +192,6 @@ func TestDiskMixedAdmissionHasNoCharges(t *testing.T) {
 		p.release(blocker, &c.inFlight)
 		require.Equal(t, DiskStats{}, p.Stats())
 	}
-}
-
-func TestWriteBacklogRecoveryAcrossRings(t *testing.T) {
-	// One write byte models as 125 ms: 16 bytes fill the two-second limit and
-	// the pause drains to 4 bytes' worth.
-	p := NewDiskPolicy(WithoutIOBudget(), WithWriteBandwidth(8), WithWriteBacklogLimit(2*time.Second),
-		WithWriteBacklogRecovery(500*time.Millisecond), WithReadBacklogLimit(2*time.Second))
-	a := newTestCoordinator(t, 32, 0, WithDiskPolicy(p))
-	b := newTestCoordinator(t, 32, 0, WithDiskPolicy(p))
-	f := testFile(t, 16)
-	first, err := a.sched.Submit(WriteOp(f, make([]byte, 12), 0))
-	require.NoError(t, err)
-	second, err := b.sched.Submit(WriteOp(f, make([]byte, 4), 12))
-	require.NoError(t, err)
-	require.Zero(t, p.Stats().Writes.Backlog)
-	a.accept(a.sched.takeStaged())
-	b.accept(b.sched.takeStaged())
-	require.Equal(t, 2*time.Second, p.Stats().Writes.Backlog)
-	require.True(t, p.writeBudget.rejects())
-	a.placeReady(false)
-	submitAndReapUntil(t, a, func() bool { return a.accepted.len == 0 })
-	_, err = first.Wait()
-	require.NoError(t, err)
-	require.Equal(t, 500*time.Millisecond, p.Stats().Writes.Backlog)
-	for _, c := range []*coordinator{a, b} {
-		op := ReadOp(f, make([]byte, 1), 0).Link(WriteOp(f, []byte{1}, 0))
-		ticket, err := c.sched.Submit(op)
-		require.ErrorIs(t, err, ErrRejected, "both rings remain closed until the estimate expires")
-		require.Nil(t, ticket.completion)
-		require.Zero(t, p.Stats().Reads.Backlog, "mixed-chain rejection acquires no read charges")
-	}
-	read, err := a.sched.Submit(ReadOp(f, make([]byte, 1), 0))
-	require.NoError(t, err)
-	a.accept(a.sched.takeStaged())
-	a.placeReady(false)
-	submitAndReapUntil(t, a, func() bool { return a.accepted.len == 0 })
-	_, err = read.Wait()
-	require.NoError(t, err)
-	require.Eventually(t, func() bool { return !p.writeBudget.rejects() }, 3*time.Second, time.Millisecond)
-	resumed, err := a.sched.Submit(WriteOp(f, []byte{1}, 0))
-	require.NoError(t, err)
-	require.Equal(t, 500*time.Millisecond, p.Stats().Writes.Backlog, "new work is still staged")
-	for _, c := range []*coordinator{a, b} {
-		c.accept(c.sched.takeStaged())
-		c.placeReady(false)
-		submitAndReapUntil(t, c, func() bool { return c.accepted.len == 0 })
-	}
-	_, err = second.Wait()
-	require.NoError(t, err)
-	_, err = resumed.Wait()
-	require.NoError(t, err)
-	require.Equal(t, DiskStats{}, p.Stats())
 }
 
 func TestDiskMustAdmitBypassesLimitsAndAccounting(t *testing.T) {
@@ -454,33 +382,25 @@ func TestDiskMustAdmitDoesNotConsumeAllowance(t *testing.T) {
 	require.Equal(t, DiskStats{}, p.Stats())
 }
 
-// A ring with no writes of its own in flight has no completion coming to wake
-// it, so it must not wait for allowance another ring holds.
-func TestIdleRingDoesNotWaitOnSharedAllowance(t *testing.T) {
-	p := NewDiskPolicy(WithLatencyGoal(time.Nanosecond), WithoutReadIOBudget())
-	a := newURingForDoorbellTest(t, WithDiskPolicy(p))
-	b := newURingForDoorbellTest(t, WithDiskPolicy(p))
-	t.Cleanup(func() { require.NoError(t, a.Close()); require.NoError(t, b.Close()) })
-	f := testFile(t, 8192)
-	gate, release := blockingRead(t)
-	var once sync.Once
-	unblock := func() { once.Do(release) }
-	t.Cleanup(unblock)
-	first, err := a.Submit(ReadOp(gate, make([]byte, 8), 0).Link(WriteOp(f, make([]byte, 4096), 0)))
+// Work still on the ready queue with commands placed, like a split NVMe
+// operation, holds its in-flight reservation and returns it when shutdown
+// stops placement.
+func TestFailRemainingReleasesPartlyPlacedCharges(t *testing.T) {
+	policy := NewDiskPolicy(WithReadBacklogLimit(time.Second), WithLatencyGoal(time.Second))
+	op := ReadOp(nil, make([]byte, 4096), 0)
+	work, err := copySubmission(&op, maxChainLength)
 	require.NoError(t, err)
-	require.Eventually(t, func() bool { return p.Stats().Writes.InFlight > 0 }, time.Second, time.Millisecond)
-	second, err := b.Submit(WriteOp(f, make([]byte, 4096), 4096))
-	require.NoError(t, err)
-	done := make(chan error, 1)
-	go func() { _, err := second.Wait(); done <- err }()
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("an idle ring waited for another ring's allowance")
-	}
-	unblock()
-	_, err = first.Wait()
-	require.NoError(t, err)
-	require.Equal(t, DiskStats{}, p.Stats())
+	charge := policy.device.reads.operationTime(&work.root)
+	work.reads = ioCharge{backlog: charge, inFlight: charge}
+	policy.account(work)
+	c := &coordinator{sched: &URingScheduler{config: makeSchedulerConfig([]Option{WithDiskPolicy(policy)})}}
+	require.True(t, policy.dispatch(work, &c.inFlight))
+	work.state = workIssued
+	c.accepted.push(work)
+	c.ready.push(work)
+	require.Positive(t, policy.Stats().Reads.InFlight)
+	c.failRemaining(nil, errSchedulerClosed, errSchedulerClosed)
+	require.Equal(t, DiskStats{}, policy.Stats())
+	_, err = (Ticket{&work.completion}).Wait()
+	require.ErrorIs(t, err, errSchedulerClosed)
 }

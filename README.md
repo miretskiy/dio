@@ -113,7 +113,7 @@ if err != nil {
 }
 defer device.Close()
 
-scheduler, err := iosched.NewURingScheduler(iosched.WithNVMeCommands())
+scheduler, err := iosched.NewURingScheduler(iosched.WithNVMeCommands(device))
 if err != nil {
     return err
 }
@@ -140,6 +140,20 @@ entire namespace.
 They submit its underlying allocations without copying the whole value into a
 contiguous staging buffer, splitting at allocation boundaries and the device
 limit. The complete transfer still has one ticket and one admission decision.
+Commands enter the ring as slots become free.
+
+Register an allocator's backing memory with
+`iosched.WithDMABuffers(allocator.Region())`. Registration splits regions larger
+than the kernel ABI's 1 GiB per-entry limit, up to 32 GiB total per ring.
+`ReadFixedOp` and `WriteFixedOp` require a buffer inside one entry. Keep the
+allocator open until the scheduler closes successfully.
+
+NVMe commands use ordinary data addresses. Registered NVMe I/O needs kernel fix
+[be0e822](https://github.com/torvalds/linux/commit/be0e822bb3f5259c7f9424ba97e8175211288813);
+without it, Linux rejects a fixed-buffer command when the pages from its start
+to the end of its registration entry exceed the device's `max_segments`. Linux 6.8
+on AWS instance storage accepts only commands within the last 33 pages of an
+entry.
 
 For vendor-specific commands or other NVMe command sets, build a `ringo.Op` with
 `nvme.Command.Op`, `nvme.Command.AdminOp`, or `ringo.UringCmd`, then wrap it with
@@ -342,14 +356,14 @@ sched, err := iosched.NewURingScheduler(
 )
 ```
 
+Each io_uring coordinator is an ordinary goroutine. `WithCoordinatorCPU(n)` runs
+it on a dedicated OS thread with affinity to CPU `n`, best effort. Every wakeup
+of an idle pinned coordinator is a thread handoff: on the measured host it
+doubled CPU per I/O at queue depth one and changed nothing at depths 32 and 128.
+Pinning does not reserve the CPU or set kernel-worker or interrupt affinity.
+
 `WithSQPOLL` enables kernel submission-queue polling. It can require additional
 privileges and dedicates a kernel thread, so it should be an explicit choice.
-
-Each io_uring coordinator runs on a dedicated OS thread. `WithCoordinatorCPU(n)`
-requests affinity to CPU `n`; the default leaves affinity unchanged. Affinity
-setup is best effort: failures are logged and the loop continues. Pinning does
-not reserve a CPU or set kernel-worker or interrupt affinity. The thread exits
-with the coordinator so restricted affinity cannot leak into unrelated Go work.
 
 `Submit` validates the whole chain and checks the shared rejection state before
 enqueueing. When a coordinator has closed admission, Submit returns `ErrRejected`

@@ -1,5 +1,3 @@
-//go:build linux
-
 package iosched
 
 import (
@@ -10,9 +8,9 @@ import (
 	"strconv"
 	"syscall"
 	"testing"
-	"time"
 	"unsafe"
 
+	"github.com/miretskiy/dio/v2/align"
 	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/nvme"
 	"github.com/miretskiy/dio/v2/ringo"
@@ -81,6 +79,11 @@ func TestNVMeHardware(t *testing.T) {
 	defer device.Close()
 	info := device.Info()
 	t.Logf("device: %+v", info)
+	require.NotZero(t, info.QueueDepth)
+	bounded, err := NewURingScheduler(WithRingDepth(4*info.QueueDepth), WithNVMeCommands(device))
+	require.NoError(t, err)
+	require.Equal(t, max(info.QueueDepth, minRingDepth), bounded.config.ringDepth, "slots fit one hardware queue")
+	require.NoError(t, bounded.Close())
 	scheduler, err := NewURingScheduler(WithRingDepth(16), WithNVMeCommands())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, scheduler.Close()) }()
@@ -163,7 +166,8 @@ func TestNVMeHardware(t *testing.T) {
 	require.Equal(t, contents, got)
 	rawBuffer := make([]byte, len(contents))
 	request = ringo.Read(ringo.FileFD(file), rawBuffer, 0)
-	run(NVMeReadOp(device, make([]byte, int(info.MaxTransferBytes)*40), 0).Link(RawNVMeCmdOp(file, request, &raw)), int(info.MaxTransferBytes)*40)
+	run(NVMeReadOp(device, make([]byte, int(info.MaxTransferBytes)*40), 0), int(info.MaxTransferBytes)*40)
+	run(RawNVMeCmdOp(file, request, &raw), len(contents))
 	require.Equal(t, contents, rawBuffer)
 	require.Equal(t, len(contents), raw.Result)
 
@@ -266,36 +270,17 @@ func TestNVMeHardware(t *testing.T) {
 		}
 		require.Equal(t, expected, actual)
 	}
-	// A multi-batch logical transfer preserves chain order and ordinary file I/O.
+	// A transfer of many ring-depths of commands keeps one result. It needs
+	// several commands, so it cannot be linked.
 	large := bytes.Repeat([]byte{0xe7}, int(info.MaxTransferBytes)*40+int(info.BlockSize))
 	gotLarge := make([]byte, len(large))
-	for _, hard := range []bool{false, true} {
-		first := NVMeWriteOp(scratch, large, 0).Durable()
-		next := NVMeReadOp(scratch, gotLarge, 0)
-		chain := first.Link(next).Link(WriteOp(file, contents, 0).Durable())
-		if hard {
-			chain = first.HardLink(next).HardLink(WriteOp(file, contents, 0).Durable())
-		}
-		ticket, err := scheduler.Submit(chain)
-		require.NoError(t, err)
-		n, err := ticket.Wait()
-		require.NoError(t, err)
-		require.Equal(t, len(large), n)
-		require.Equal(t, large, gotLarge)
-		require.Len(t, ticket.AllResults(), 3)
-		for i, result := range ticket.AllResults() {
-			require.NoError(t, result.Err)
-			want := len(large)
-			if i == 2 {
-				want = len(contents)
-			}
-			require.Equal(t, want, result.N)
-		}
-	}
+	run(NVMeWriteOp(scratch, large, 0).Durable(), len(large))
+	run(NVMeReadOp(scratch, gotLarge, 0), len(large))
+	require.Equal(t, large, gotLarge)
+	_, err = scheduler.Submit(WriteOp(file, contents, 0).Link(NVMeReadOp(scratch, gotLarge, 0)))
+	require.ErrorContains(t, err, "cannot be linked")
 
-	// A non-final ordinary Durable write gets its synthesized fdatasync before
-	// the split transfer. Draining this handle also waits for every chunk.
-	run(WriteOp(file, contents, 0).Durable().Link(NVMeWriteOp(scratch, large, 0)).Link(DrainOp(scratch.File())), len(contents))
+	// Draining this handle waits for every command of each transfer.
 	var reads [4]Ticket
 	for i := range reads {
 		reads[i], err = scheduler.Submit(NVMeReadOp(scratch, make([]byte, len(large)), 0))
@@ -316,87 +301,216 @@ func TestNVMeHardware(t *testing.T) {
 	run(NVMeFlushOp(scratch), 0)
 }
 
-// A split transfer keeps its in-flight reservation between batches and returns
-// it when shutdown stops placement, even though it is back on the ready queue.
-func TestNVMeSplitShutdownAccounting(t *testing.T) {
-	policy := NewDiskPolicy(WithReadBacklogLimit(time.Second), WithLatencyGoal(time.Second))
-	op := ReadOp(nil, make([]byte, 4096), 0)
-	work, err := copySubmission(&op, maxChainLength)
-	require.NoError(t, err)
-	charge := policy.device.reads.operationTime(&work.root)
-	work.reads = ioCharge{backlog: charge, inFlight: charge}
-	policy.account(work)
-	c := &coordinator{sched: &URingScheduler{config: makeSchedulerConfig([]Option{WithDiskPolicy(policy)})}}
-	require.True(t, policy.dispatch(work, &c.inFlight))
-	work.state = workIssued
-	work.nvmeSplit = &nvmeSplit{started: true}
-	c.accepted.push(work)
-	c.resumeNVMe(work)
-	require.Positive(t, policy.Stats().Reads.InFlight)
-	c.failRemaining(nil, errSchedulerClosed, errSchedulerClosed)
-	require.Equal(t, DiskStats{}, policy.Stats())
-	_, err = (Ticket{&work.completion}).Wait()
-	require.ErrorIs(t, err, errSchedulerClosed)
-}
-
-// Feed out-of-order completions to exercise partial results and native link
-// failure rules without relying on the device to produce a particular error.
+// Feed out-of-order completions without relying on the device to produce a
+// particular error. Four of six commands are outstanding; two wait queued.
 func TestNVMeSplitCompletions(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		hard       bool
-		linuxError bool
+		name    string
+		failure ringo.Completion
+		wantErr error
 	}{
-		{"positive-soft", false, false},
-		{"negative-soft", false, true},
-		{"negative-hard", true, true},
+		{"status", ringo.Completion{Result: 0x280}, nvme.StatusError(0x280)},
+		{"linux-error", ringo.Completion{Err: syscall.EIO}, syscall.EIO},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			first := NVMeReadOp(nil, make([]byte, 4096*6), 0)
-			next := NVMeReadOp(nil, nil, 0)
-			chain := first.Link(next)
-			if tc.hard {
-				chain = first.HardLink(next)
-			}
-			work, err := copySubmission(&chain, maxChainLength)
+			op := NVMeReadOp(nil, make([]byte, 4096*6), 0)
+			work, err := copySubmission(&op, maxChainLength)
 			require.NoError(t, err)
 			work.state = workIssued
-			work.nvmeSplit = &nvmeSplit{started: true, cursor: 4096 * 4, prefix: len(first.buf), pending: 4}
+			work.root.advance(4096 * 4)
+			work.sent, work.pending = 4096*4, 4
 			c := &coordinator{sched: &URingScheduler{config: makeSchedulerConfig(nil)}}
 			c.accepted.push(work)
+			c.ready.push(work)
 			for _, i := range []int{3, 0, 2, 1} {
 				completion := ringo.Completion{}
 				if i == 3 {
 					completion.Result = 0x281
 				}
 				if i == 1 {
-					completion.Result = 0x280
-					if tc.linuxError {
-						completion.Err = syscall.EIO
-					}
+					completion = tc.failure
 				}
-				c.finishNVMePart(ringSlot{work: work, op: &work.root, partOffset: i * 4096, partLength: 4096}, completion)
+				c.finishNVMePart(ringSlot{work: work, op: &work.root, partOffset: i * 4096}, completion)
+				require.Zero(t, c.ready.len, "the first failure drops the unplaced commands")
 			}
-			require.Equal(t, 4096, work.n)
-			if tc.linuxError {
-				require.ErrorIs(t, work.err, syscall.EIO)
-			} else {
-				require.ErrorIs(t, work.err, nvme.StatusError(0x280))
-			}
-			if tc.linuxError && !tc.hard {
-				require.Equal(t, workDone, work.state)
-				require.ErrorIs(t, work.results[1].Err, syscall.ECANCELED)
-				require.Zero(t, c.ready.len)
-			} else {
-				require.Equal(t, 1, c.ready.len)
-				require.Equal(t, 0, work.dispatchClass())
-				require.Equal(t, 1, work.nvmeSplit.index)
-				c.take(work)
-				work.nvmeSplit.pending = 1
-				c.finishNVMePart(ringSlot{work: work, op: work.op(1)}, ringo.Completion{})
-				require.Equal(t, workDone, work.state)
-				require.NoError(t, work.results[1].Err)
-			}
+			n, err := (Ticket{&work.completion}).Wait()
+			require.Equal(t, 4096, n, "the result is the prefix before the earliest failure")
+			require.ErrorIs(t, err, tc.wantErr)
 		})
 	}
+	op := NVMeReadOp(nil, make([]byte, 4096*2), 0)
+	work, err := copySubmission(&op, maxChainLength)
+	require.NoError(t, err)
+	work.state = workIssued
+	work.root.advance(4096 * 2)
+	work.sent, work.pending = 4096*2, 2
+	c := &coordinator{sched: &URingScheduler{config: makeSchedulerConfig(nil)}}
+	c.accepted.push(work)
+	for _, i := range []int{1, 0} {
+		c.finishNVMePart(ringSlot{work: work, op: &work.root, partOffset: i * 4096}, ringo.Completion{})
+	}
+	n, err := (Ticket{&work.completion}).Wait()
+	require.NoError(t, err)
+	require.Equal(t, 4096*2, n)
+}
+
+func TestRawNVMeCmdOpFileChainAndDrain(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	file := testFile(t, 4096)
+	data := []byte("raw positioned I/O")
+	got := make([]byte, len(data))
+	var written, read ringo.Completion
+	chain := RawNVMeCmdOp(file, ringo.Write(ringo.FileFD(file), data, 0), &written).
+		Link(RawNVMeCmdOp(file, ringo.Read(ringo.FileFD(file), got, 0), &read))
+	tickets, _ := acceptOps(c, chain, DrainOp(file))
+	for c.accepted.len != 0 {
+		c.placeReady(false)
+		require.NoError(t, c.enter(1))
+		c.reap()
+	}
+	for _, ticket := range tickets {
+		_, err := ticket.Wait()
+		require.NoError(t, err)
+	}
+	require.Equal(t, data, got)
+	require.Equal(t, len(data), written.Result)
+	require.Equal(t, len(data), read.Result)
+	require.Equal(t, []Result{{N: len(data)}, {N: len(data)}}, tickets[0].AllResults())
+}
+
+func TestRawNVMeCmdOpCompletionAndFailure(t *testing.T) {
+	c := newTestCoordinator(t, 8, 0)
+	var result ringo.Completion
+	tickets, works := acceptOps(c, RawNVMeCmdOp(nil, ringo.Nop(), &result))
+	c.placeReady(false)
+	require.NoError(t, c.enter(1))
+	for completion := range c.ring.Reap() {
+		intermediate := completion
+		intermediate.Flags |= ringo.CompletionFlags(1 << 1) // IORING_CQE_F_MORE
+		c.reapOne(intermediate)
+		require.Equal(t, workIssued, works[0].state)
+		require.Equal(t, 1, c.occupied)
+		completion.Result = 0x281
+		completion.Extra = [2]uint64{0x123456789abcdef0, 0xfedcba9876543210}
+		c.reapOne(completion)
+		require.Equal(t, completion, result)
+	}
+	n, err := tickets[0].Wait()
+	require.NoError(t, err)
+	require.Equal(t, 0x281, n, "positive driver statuses are preserved")
+
+	for _, hard := range []bool{false, true} {
+		var first, next ringo.Completion
+		bad := RawNVMeCmdOp(nil, ringo.Read(ringo.BorrowedFD(-1), make([]byte, 1), 0), &first)
+		follower := RawNVMeCmdOp(nil, ringo.Nop(), &next)
+		chain := bad.Link(follower)
+		if hard {
+			chain = bad.HardLink(follower)
+		}
+		tickets, _ := acceptOps(c, chain)
+		c.placeReady(false)
+		submitAndReapUntil(t, c, func() bool { return c.accepted.len == 0 })
+		_, err := tickets[0].Wait()
+		require.ErrorIs(t, err, syscall.EBADF)
+		require.ErrorIs(t, first.Err, syscall.EBADF)
+		if hard {
+			require.NoError(t, next.Err)
+		} else {
+			require.ErrorIs(t, next.Err, syscall.ECANCELED)
+		}
+	}
+}
+
+func TestRawNVMeCmdOpSubmissionAndUnplacedFailure(t *testing.T) {
+	posix := NewPOSIXScheduler()
+	defer posix.Close()
+	var result ringo.Completion
+	var pool ringo.OpAlloc
+	request := ringo.Read(ringo.BorrowedFD(-1), make([]byte, 1), 0, ringo.WithAlloc(&pool))
+	op := RawNVMeCmdOp(nil, request, &result)
+	_, err := posix.Submit(op)
+	require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	require.Same(t, request, op.raw.request, "Submit rejection retains caller ownership")
+
+	work, err := copySubmission(&op, maxChainLength)
+	require.NoError(t, err)
+	work.fail(errSchedulerClosed)
+	_, err = (Ticket{&work.completion}).Wait()
+	require.ErrorIs(t, err, errSchedulerClosed)
+	require.ErrorIs(t, result.Err, errSchedulerClosed)
+	require.Nil(t, op.raw.request)
+	recycled := ringo.Read(ringo.BorrowedFD(-1), nil, 0, ringo.WithAlloc(&pool))
+	require.Same(t, request, recycled, "cancellation returns the unsubmitted request to its pool")
+	ringo.Discard(recycled)
+
+	c := newTestCoordinator(t, 8, 0)
+	invalid := ringo.UringCmd(ringo.BorrowedFD(-1), 0, make([]byte, 81), nil, ringo.WithAlloc(&pool))
+	tickets, _ := acceptOps(c, RawNVMeCmdOp(nil, invalid, &result))
+	c.placeReady(false) // Ringo rejects the oversized inline payload before Push.
+	_, err = tickets[0].Wait()
+	require.ErrorContains(t, err, "command exceeds 80 inline bytes")
+	require.Equal(t, err, result.Err)
+	reused := ringo.UringCmd(ringo.BorrowedFD(-1), 0, nil, nil, ringo.WithAlloc(&pool))
+	require.Same(t, invalid, reused, "Push rejection returns the unsubmitted request to its pool")
+	ringo.Discard(reused)
+}
+
+// Commands whose data lies in a registered buffer use the registered-buffer
+// path; data outside every registration still uses ordinary addresses. Entries
+// are 128 KiB: before Linux 6.15, io_import_fixed counts every page to the end
+// of the entry, and the block layer rejects more pages than the queue's
+// segment limit (33 on EC2 instance storage) with EINVAL.
+func TestNVMeRegisteredBuffers(t *testing.T) {
+	path := os.Getenv("DIO_NVME_DEVICE")
+	if path == "" || os.Getenv("DIO_NVME_WRITE") != "1" {
+		t.Skip("set DIO_NVME_DEVICE, DIO_NVME_WRITE=1, DIO_NVME_OFFSET, and DIO_NVME_SIZE")
+	}
+	offset, err := strconv.ParseUint(os.Getenv("DIO_NVME_OFFSET"), 10, 64)
+	require.NoError(t, err)
+	scratch, err := nvme.Open(path, nvme.WithRange(offset, 8<<20))
+	require.NoError(t, err)
+	defer scratch.Close()
+	region := align.AllocAligned(2 << 20)
+	defer align.FreeAligned(region)
+	var entries [][]byte
+	for e := 0; e < len(region); e += 128 << 10 {
+		entries = append(entries, region[e:e+128<<10])
+	}
+	scheduler, err := NewURingScheduler(WithRingDepth(16), WithNVMeCommands(scratch), WithDMABuffers(entries...))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, scheduler.Close()) }()
+	run := func(op Op) {
+		t.Helper()
+		ticket, err := scheduler.Submit(op)
+		require.NoError(t, err)
+		_, err = ticket.Wait()
+		require.NoError(t, err)
+	}
+	// 1 MiB is eight commands, one per entry; 64 KiB covers part of an entry.
+	written, readback := region[:1<<20], region[1<<20:]
+	for i := range written {
+		written[i] = byte(i*7 + i>>12)
+	}
+	run(NVMeWriteOp(scratch, written, 0))
+	run(NVMeReadOp(scratch, readback, 0))
+	require.Equal(t, written, readback)
+	run(NVMeReadOp(scratch, readback[64<<10:128<<10], 0))
+	require.Equal(t, written[:64<<10], readback[64<<10:128<<10])
+
+	outside := align.AllocAligned(1 << 20)
+	defer align.FreeAligned(outside)
+	run(NVMeReadOp(scratch, outside, 0))
+	require.Equal(t, written, outside, "unregistered data uses ordinary addresses")
+
+	// One large entry: before 6.15 its commands keep ordinary addresses rather
+	// than failing.
+	large, err := NewURingScheduler(WithRingDepth(16), WithNVMeCommands(scratch), WithDMABuffers(region))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, large.Close()) }()
+	clear(readback)
+	ticket, err := large.Submit(NVMeReadOp(scratch, readback, 0))
+	require.NoError(t, err)
+	_, err = ticket.Wait()
+	require.NoError(t, err)
+	require.Equal(t, written, readback)
 }

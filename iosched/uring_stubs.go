@@ -14,8 +14,7 @@ const IOUringAvailable = false
 // URingScheduler is declared so code referencing the type compiles on non-Linux.
 type URingScheduler struct{}
 
-type nvmeSplit struct{}
-
+//lint:ignore U1000 operation.raw names it on every platform.
 type rawOperation struct{}
 
 func recordRawResult(*operation, int, error) {}

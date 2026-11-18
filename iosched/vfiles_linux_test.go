@@ -117,17 +117,6 @@ func TestAllocatedVFDSamePathUsesDistinctSlots(t *testing.T) {
 	waitVFDOp(t, s, open().Link(VCloseOp(AllocateVFD)))
 }
 
-func TestAllocatedVFDFailedOpenReturnsSlot(t *testing.T) {
-	s := newAllocatingScheduler(t, 1)
-	path := filepath.Join(t.TempDir(), "missing")
-	ticket, err := s.Submit(VOpenatOp(unix.AT_FDCWD, path, unix.O_RDONLY, 0, AllocateVFD).Link(
-		VWriteOp(AllocateVFD, []byte("canceled"), 0), VCloseOp(AllocateVFD)))
-	require.NoError(t, err)
-	_, err = ticket.Wait()
-	require.ErrorIs(t, err, syscall.ENOENT)
-	waitVFDOp(t, s, VOpenatOp(unix.AT_FDCWD, path, unix.O_CREAT|unix.O_RDWR, 0o600, AllocateVFD).Link(VCloseOp(AllocateVFD)))
-}
-
 func TestAllocatedVFDFailedFollowerKeepsOpenSlot(t *testing.T) {
 	s := newAllocatingScheduler(t, 1)
 	path := filepath.Join(t.TempDir(), "readonly")
@@ -372,4 +361,31 @@ func TestAllocatedVFDExhaustionReturnsAdmission(t *testing.T) {
 	n, err := tickets[0].Wait()
 	require.Zero(t, n)
 	require.ErrorIs(t, err, syscall.ENFILE)
+}
+
+func TestAllocatedVFDResults(t *testing.T) {
+	s := newAllocatingScheduler(t, 1)
+	path := filepath.Join(t.TempDir(), "data")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0600))
+	for _, name := range []string{path, path + "missing"} {
+		read := make([]byte, 8)
+		op := VOpenatOp(unix.AT_FDCWD, name, unix.O_RDONLY, 0, AllocateVFD).Link(
+			VReadOp(AllocateVFD, read, 0).HardLink(VCloseOp(AllocateVFD)))
+		ticket, err := s.Submit(op)
+		require.NoError(t, err)
+		_, err = ticket.Wait()
+		results := ticket.AllResults()
+		require.Len(t, results, 3)
+		if name == path {
+			require.NoError(t, err)
+			require.Equal(t, []Result{{N: 0}, {N: 4}, {}}, results)
+			require.Equal(t, "data", string(read[:4]))
+		} else {
+			require.ErrorIs(t, err, syscall.ENOENT)
+			require.ErrorIs(t, results[0].Err, syscall.ENOENT)
+			require.ErrorIs(t, results[1].Err, syscall.ECANCELED)
+			require.ErrorIs(t, results[2].Err, syscall.ECANCELED)
+		}
+	}
+	waitVFDOp(t, s, VOpenatOp(unix.AT_FDCWD, path, unix.O_RDONLY, 0, AllocateVFD).Link(VCloseOp(AllocateVFD)))
 }

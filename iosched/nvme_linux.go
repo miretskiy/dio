@@ -9,74 +9,10 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/miretskiy/dio/v2/alloc"
 	"github.com/miretskiy/dio/v2/nvme"
 	"github.com/miretskiy/dio/v2/ringo"
+	"golang.org/x/sys/unix"
 )
-
-// NVMeReadOp reads buf at a device-relative byte offset. Submit validates block
-// alignment and the Device's range, then splits transfers at its command limit.
-// A successful ticket reports len(buf); an error reports the successful prefix.
-// Keep the Device open and buf valid until completion. WithNVMeCommands is required.
-func NVMeReadOp(device *nvme.Device, buf []byte, offset int64) Op {
-	return nvmeDataOp(OpRead, device, buf, offset)
-}
-
-// NVMeWriteOp writes buf at a device-relative byte offset, with the same bounds
-// and splitting as NVMeReadOp. Durable requests FUA on every constituent write.
-// After an error, writes beyond the reported prefix may also have reached storage.
-func NVMeWriteOp(device *nvme.Device, buf []byte, offset int64) Op {
-	return nvmeDataOp(OpWrite, device, buf, offset)
-}
-
-// NVMeReadBufferOp reads length bytes into buffer's allocations. The scheduler
-// splits at allocation boundaries and the device command limit, retaining one
-// logical result. length must fit within Cap(), and allocations and transfer
-// lengths must be block aligned. Keep buffer alive and unchanged through completion.
-func NVMeReadBufferOp(device *nvme.Device, buffer *alloc.Buffer, length int, offset int64) Op {
-	return nvmeBufferOp(OpReadv, device, buffer, length, offset)
-}
-
-// NVMeWriteBufferOp writes length bytes from buffer's allocations with the same
-// splitting as NVMeReadBufferOp. Durable applies FUA to each constituent write.
-func NVMeWriteBufferOp(device *nvme.Device, buffer *alloc.Buffer, length int, offset int64) Op {
-	return nvmeBufferOp(OpWritev, device, buffer, length, offset)
-}
-
-func nvmeBufferOp(kind uint8, device *nvme.Device, buffer *alloc.Buffer, length int, offset int64) Op {
-	op := nvmeDataOp(kind, device, nil, offset)
-	op.length = int64(length)
-	if length < 0 || length > buffer.Cap() {
-		panic("iosched: NVMe buffer length outside capacity")
-	}
-	if length != 0 {
-		parts := buffer.RawAllocations()
-		op.buf = parts[0].Bytes()[:min(length, len(parts[0].Bytes()))]
-		op.allocations = parts[1:]
-	}
-	return op
-}
-
-func nvmeDataOp(kind uint8, device *nvme.Device, buf []byte, offset int64) Op {
-	var file *os.File
-	if device != nil {
-		file = device.File()
-	}
-	return Op{operation: operation{
-		opcode: kind | opNVMe,
-		f:      file,
-		buf:    buf,
-		offset: offset,
-		nvme:   device,
-	}}
-}
-
-// NVMeFlushOp makes the namespace's prior completed writes durable, covering
-// every Device range on that namespace. Its successful ticket result is zero.
-// WithNVMeCommands is required.
-func NVMeFlushOp(device *nvme.Device) Op {
-	return nvmeDataOp(OpFdatasync, device, nil, 0)
-}
 
 func nvmeCommand(op *operation) (nvme.Command, error) {
 	switch op.kind() {
@@ -132,7 +68,52 @@ func nvmeCommandLimit(device *nvme.Device) int {
 	return int(device.Info().MaxTransferBytes)
 }
 
-func translateNVMe(op *operation, recycle ringo.OpOption) ringo.Op {
+// nvmeQueueDepth bounds a ring depth by each device's request queue depth,
+// keeping room for the longest chain.
+func nvmeQueueDepth(depth uint32, devices []*nvme.Device) uint32 {
+	for _, device := range devices {
+		depth = min(depth, max(device.Info().QueueDepth, minRingDepth))
+	}
+	return depth
+}
+
+// registered binds an NVMe command's data to the scheduler's registered
+// buffers, when it lies inside one entry the kernel can map. Before Linux 6.15,
+// io_import_fixed counts every page to the end of the entry, and the block
+// layer fails the command with EINVAL when that exceeds the queue's segment
+// limit; such commands keep ordinary addresses. The device's transfer limit
+// stays within that segment limit.
+func (c *coordinator) registered(op *operation) (ringo.FixedBuffer, bool) {
+	if c.sched.registeredBuffers == nil {
+		return ringo.FixedBuffer{}, false
+	}
+	registered, err := c.sched.registeredBuffers.Bind(op.buf)
+	if err != nil {
+		return ringo.FixedBuffer{}, false
+	}
+	if fixedNVMeCountsWholeEntry && registered.EntryRemaining() > nvmeCommandLimit(op.nvme) {
+		return ringo.FixedBuffer{}, false
+	}
+	return registered, true
+}
+
+// fixedNVMeCountsWholeEntry reports a kernel older than 6.15.
+var fixedNVMeCountsWholeEntry = func() bool {
+	var name unix.Utsname
+	if unix.Uname(&name) != nil {
+		return true
+	}
+	var major, minor int
+	if _, err := fmt.Sscanf(unix.ByteSliceToString(name.Release[:]), "%d.%d", &major, &minor); err != nil {
+		return true
+	}
+	return major < 6 || major == 6 && minor < 15
+}()
+
+// translateNVMe builds one command. Data inside a registered buffer uses it,
+// which spares the driver pinning the pages of every command.
+func (c *coordinator) translateNVMe(op *operation) ringo.Op {
+	recycle := ringo.WithAlloc(&c.alloc)
 	if op.kind() != OpFdatasync && len(op.buf) == 0 {
 		return ringo.Nop(recycle)
 	}
@@ -140,7 +121,12 @@ func translateNVMe(op *operation, recycle ringo.OpOption) ringo.Op {
 	if err != nil {
 		panic(fmt.Sprintf("iosched: validated NVMe operands changed: %v", err))
 	}
-	request, err := cmd.Op(ringo.FileFD(op.f), recycle)
+	var request ringo.Op
+	if registered, ok := c.registered(op); ok {
+		request, err = cmd.FixedOp(ringo.FileFD(op.f), registered, recycle)
+	} else {
+		request, err = cmd.Op(ringo.FileFD(op.f), recycle)
+	}
 	if err != nil {
 		panic(fmt.Sprintf("iosched: validated NVMe command changed: %v", err))
 	}
@@ -157,134 +143,151 @@ func nvmeResult(op *operation, completion ringo.Completion) (int, error) {
 	return 0, nil
 }
 
-// nvmeSplit tracks one logical operation at a time. A batch occupies at most
-// the ring's free slots; all its completions are reaped before another batch.
-// This bounds state independently of request size and keeps linked successors
-// behind the entire logical transfer.
-type nvmeSplit struct {
-	started         bool  // The submission already holds its dispatch allowance.
-	index           int   // Current logical operation in the caller's chain.
-	cursor          int   // Bytes placed for the current operation.
-	pending         int   // Commands still awaiting completion in this batch.
-	prefix          int   // First failed byte offset, or the complete operation length.
-	err             error // Error at the earliest failing byte offset.
-	failed          bool  // Kernel link failure: Linux error or ordinary short I/O.
-	allocation      int   // Allocation containing cursor; zero selects op.buf.
-	allocationStart int   // Logical offset of the current allocation.
+// splitNVMe reports whether op needs more than one command. Such operations
+// are submitted unlinked and placed by placeNVMe.
+func splitNVMe(op *operation) bool {
+	return op.isNVMe() && opBytes(op) > min(len(op.buf), nvmeCommandLimit(op.nvme))
 }
 
-func (c *coordinator) placeNVMeParts(work *submission) {
-	state := work.nvmeSplit
-	op := work.op(state.index)
-	if state.cursor == 0 {
-		state.prefix = opBytes(op)
-	}
-	for c.occupied < int(c.sched.config.ringDepth) {
+// placeNVMe issues commands from the front of the submission's private op
+// while the ring has room, advancing buf and offset past each one. The work
+// keeps its place at the head of the ready queue, and its dispatch allowance,
+// until its last command is placed; completions free the slots its next pass
+// fills.
+func (c *coordinator) placeNVMe(work *submission) {
+	work.state = workIssued
+	op := &work.root
+	for opBytes(op) != 0 && c.occupied < int(c.sched.config.ringDepth) {
 		part := *op
-		start, length := 0, opBytes(op)
-		if op.isNVMe() && op.kind() != OpFdatasync {
-			start = state.cursor
-			chunk := op.buf
-			if state.allocation > 0 {
-				chunk = op.allocations[state.allocation-1].Bytes()
-			}
-			for start >= state.allocationStart+len(chunk) && start < opBytes(op) {
-				state.allocationStart += len(chunk)
-				state.allocation++
-				chunk = op.allocations[state.allocation-1].Bytes()
-			}
-			within := start - state.allocationStart
-			length = min(opBytes(op)-start, len(chunk)-within, nvmeCommandLimit(op.nvme))
-			part.buf = chunk[within : within+length]
-			part.offset += int64(start)
-		}
-		handle, err := c.ring.Push(c.translateOp(&part))
+		part.buf = op.buf[:min(len(op.buf), opBytes(op), nvmeCommandLimit(op.nvme))]
+		handle, err := c.ring.Push(c.translateNVMe(&part))
 		if err != nil {
-			state.record(start, 0, err, true)
-			if state.pending == 0 {
-				c.advanceNVMe(work, state.prefix, err)
-			}
-			return
-		}
-		work.markIssued()
-		c.place(handle, ringSlot{kind: slotNVMePart, work: work, op: op, partOffset: start, partLength: length})
-		state.pending++
-		state.cursor += length
-		if !op.isNVMe() || state.cursor == opBytes(op) {
+			c.stopNVMe(work, work.sent, err)
 			break
 		}
+		work.markIssued()
+		c.place(handle, ringSlot{kind: slotNVMePart, work: work, op: op, partOffset: work.sent})
+		work.pending++
+		work.sent += len(part.buf)
+		op.advance(len(part.buf))
+	}
+	if opBytes(op) != 0 {
+		return
+	}
+	c.take(work)
+	if work.pending == 0 {
+		c.finishNVMe(work)
 	}
 }
 
-// record retains the contiguous successful prefix even when commands complete
-// out of order. Outstanding commands beyond that prefix are drained too.
-func (state *nvmeSplit) record(offset, n int, err error, failed bool) {
-	state.failed = state.failed || failed
-	if err != nil && (state.err == nil || offset+n < state.prefix) {
-		state.prefix, state.err = offset+n, err
+// advance consumes n leading bytes, moving to the next allocation when the
+// current one is used up.
+func (op *operation) advance(n int) {
+	op.buf, op.offset = op.buf[n:], op.offset+int64(n)
+	if op.kind() == OpReadv || op.kind() == OpWritev {
+		op.length -= int64(n)
+	}
+	if len(op.buf) == 0 && len(op.allocations) != 0 {
+		op.buf, op.allocations = op.allocations[0].Bytes(), op.allocations[1:]
 	}
 }
 
 func (c *coordinator) finishNVMePart(slot ringSlot, completion ringo.Completion) {
-	work, op := slot.work, slot.op
-	state := work.nvmeSplit
-	n, err := completion.Result, completion.Err
-	failed := completion.Err != nil
-	if op.isNVMe() {
-		err = nvme.Status(completion)
-		n = 0
-		if err == nil {
-			n = slot.partLength
+	work := slot.work
+	work.pending--
+	if err := nvme.Status(completion); err != nil {
+		if opBytes(&work.root) != 0 {
+			c.take(work) // Its unplaced commands are dropped.
 		}
-	} else {
-		// Linux breaks ordinary read/write soft links on a short transfer too.
-		if op.kind() == OpRead || op.kind() == OpReadv || op.isWrite() {
-			failed = failed || n != opBytes(op)
-		}
-		err = writeResultError(op, n, err)
+		c.stopNVMe(work, slot.partOffset, err)
 	}
+	if work.pending == 0 && opBytes(&work.root) == 0 {
+		c.finishNVMe(work)
+	}
+}
+
+// stopNVMe records a failure at a logical byte offset and drops the unissued
+// remainder. The earliest failure sets the result, in any completion order.
+func (c *coordinator) stopNVMe(work *submission, offset int, err error) {
 	if errors.Is(err, syscall.ECANCELED) && c.sched.stopCause() == errSchedulerClosed {
 		err = errSchedulerClosed
 	}
-	state.record(slot.partOffset, n, err, failed)
-	state.pending--
-	if state.pending != 0 {
-		return
+	if work.err == nil || offset < work.n {
+		work.n, work.err = offset, err
 	}
-	if op.isNVMe() {
-		if state.err == nil && state.cursor < opBytes(op) {
-			c.resumeNVMe(work)
-			return
-		}
-		n, err = state.prefix, state.err
-	}
-	c.advanceNVMe(work, n, err)
+	op := &work.root
+	op.buf, op.allocations, op.length = nil, nil, 0
 }
 
-// advanceNVMe applies native link failure rules between logical operations.
-// Positive NVMe statuses are reported to the caller and allow a soft successor,
-// matching io_uring_cmd. Negative Linux errors break a soft chain.
-func (c *coordinator) advanceNVMe(work *submission, n int, err error) {
-	state := work.nvmeSplit
-	op := work.op(state.index)
-	cancel := state.failed && op.sqeFlags&sqeHardLink == 0
-	c.finishOperation(work, op, n, err)
-	next := state.index + 1
-	if cancel {
-		for i := next; i < work.opCount(); i++ {
-			c.finishOperation(work, work.op(i), 0, syscall.ECANCELED)
-		}
-		return
+// finishNVMe reports the bytes issued, or the prefix before the first failure.
+func (c *coordinator) finishNVMe(work *submission) {
+	n := work.sent
+	if work.err != nil {
+		n = work.n
 	}
-	if next < work.opCount() {
-		*state = nvmeSplit{started: true, index: next}
-		c.resumeNVMe(work)
-	}
+	c.finishOperation(work, &work.root, n, work.err)
 }
 
-// resumeNVMe queues placement after Reap releases its borrow of the ring. Work
-// stays issued and retains its dispatch allowance until its logical I/O finishes.
-func (c *coordinator) resumeNVMe(work *submission) {
-	c.readyClasses[0]++
-	c.ready.push(work)
+// RawNVMeCmdOp schedules a caller-built NVMe command as a ringo operation.
+// Construct request with nvme.Command.Op, nvme.Command.AdminOp, or ringo.UringCmd.
+// For example, submit a namespace command and interpret its NVMe status:
+//
+//	request, err := command.Op(ringo.FileFD(device.File()))
+//	if err != nil { return err }
+//	var completion ringo.Completion
+//	ticket, err := scheduler.Submit(iosched.RawNVMeCmdOp(device.File(), request, &completion))
+//	if err != nil { return err }
+//	if _, err = ticket.Wait(); err != nil { return err }
+//	return nvme.Status(completion)
+//
+// file is the controller or namespace character-device handle targeted by
+// request. It participates in DrainOp bookkeeping and remains retained through
+// completion. Keep it open and referenced buffers mapped until the ticket completes.
+//
+// A successful Submit transfers request to the scheduler permanently. Discard
+// all copies of both request and this Op afterward. A Submit error leaves
+// request with the caller, who may retry it. Each accepted RawNVMeCmdOp is single-use.
+//
+// Wait reports the driver's Result and Linux error, along with the usual
+// scheduler errors. completion may be nil; otherwise it receives the final CQE,
+// including Flags and Extra, before the ticket completes. Failures before a CQE
+// populate its Err field. The ring consumes earlier multishot completions.
+// Decode NVMe statuses after Wait with nvme.Status.
+//
+// Raw commands are submitted intact, with caller-defined addressing, transfer
+// sizes, and ordering. DiskPolicy charges typed read/write ops; RawNVMeCmdOp uses ring
+// capacity and file barriers. NVMe commands require WithNVMeCommands to configure
+// extended ring entries. The POSIX scheduler returns EOPNOTSUPP for RawNVMeCmdOp.
+func RawNVMeCmdOp(file *os.File, request ringo.Op, completion *ringo.Completion) Op {
+	return Op{operation: operation{
+		opcode: OpRawNVMeCmd,
+		f:      file,
+		raw:    &rawOperation{request: request, destination: completion},
+	}}
+}
+
+type rawOperation struct {
+	request     ringo.Op          // Operation transferred to the coordinator on accepted submission.
+	destination *ringo.Completion // Optional caller-owned final completion destination.
+	recorded    bool              // The destination already contains its final outcome.
+}
+
+func (raw *rawOperation) record(completion ringo.Completion) {
+	if raw.recorded {
+		return
+	}
+	if raw.destination != nil {
+		*raw.destination = completion
+	}
+	raw.recorded = true
+	ringo.Discard(raw.request) // Unplaced requests are still owned by the scheduler.
+	raw.request = nil
+}
+
+// recordRawResult covers placement errors and cancellation before an SQE runs.
+// A completion already reported by the kernel retains its original CQE fields.
+func recordRawResult(op *operation, n int, err error) {
+	if op.raw != nil {
+		op.raw.record(ringo.Completion{Result: n, Err: err})
+	}
 }

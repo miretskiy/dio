@@ -130,6 +130,7 @@ struct retained_abi_constants {
 	uint32_t enter_flags[2];
 	uint32_t register_ops[9];
 	uint32_t rsrc_register_sparse;
+	uint32_t uring_cmd_fixed;
 	uint32_t cancel_flags[4];
 	uint64_t off_sq_ring;
 	uint64_t off_cq_ring;
@@ -187,6 +188,7 @@ static struct retained_abi_constants retained_constants(void) {
 				IORING_REGISTER_SYNC_CANCEL,
 			},
 		.rsrc_register_sparse = IORING_RSRC_REGISTER_SPARSE,
+		.uring_cmd_fixed = IORING_URING_CMD_FIXED,
 		.cancel_flags = {
 			IORING_ASYNC_CANCEL_ALL,
 			IORING_ASYNC_CANCEL_FD,
@@ -376,22 +378,24 @@ func Prepare(kind PrepareKind, arguments ...uint64) SQE {
 }
 
 type RetainedConstants struct {
-	SQEFlags    [4]uint32
-	SetupFlags  [12]uint32
-	CQEFlags    [1]uint32
-	Features    [3]uint32
-	SQFlags     [3]uint32
-	EnterFlags  [2]uint32
-	RegisterOps [9]uint32
-	RsrcSparse  uint32
-	CancelFlags [4]uint32
-	MmapOffsets [3]uint64
+	SQEFlags      [4]uint32
+	SetupFlags    [12]uint32
+	CQEFlags      [1]uint32
+	Features      [3]uint32
+	SQFlags       [3]uint32
+	EnterFlags    [2]uint32
+	RegisterOps   [9]uint32
+	RsrcSparse    uint32
+	UringCmdFixed uint32
+	CancelFlags   [4]uint32
+	MmapOffsets   [3]uint64
 }
 
 func Constants() RetainedConstants {
 	constants := C.retained_constants()
 	result := RetainedConstants{
-		RsrcSparse: uint32(constants.rsrc_register_sparse),
+		RsrcSparse:    uint32(constants.rsrc_register_sparse),
+		UringCmdFixed: uint32(constants.uring_cmd_fixed),
 		MmapOffsets: [3]uint64{
 			uint64(constants.off_sq_ring),
 			uint64(constants.off_cq_ring),

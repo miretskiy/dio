@@ -113,6 +113,109 @@ type DiskPolicy struct {
 	writeBudget ioBudget
 }
 
+// DiskPolicyOption configures a DiskPolicy's device model or admission limits.
+type DiskPolicyOption func(*DiskPolicy)
+
+// NewDiskPolicy creates a device model and the admission accounting shared by
+// the schedulers it is passed to.
+func NewDiskPolicy(opts ...DiskPolicyOption) *DiskPolicy {
+	p := &DiskPolicy{
+		readBudget:  ioBudget{recovery: -1},
+		writeBudget: ioBudget{recovery: -1},
+		device: deviceConfig{
+			reads:  deviceIO{bytesPerSecond: DefaultReadBandwidth, iops: DefaultReadIOPS, latency: DefaultLatencyGoal},
+			writes: deviceIO{bytesPerSecond: DefaultWriteBandwidth, iops: DefaultWriteIOPS, latency: DefaultLatencyGoal},
+		},
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// The options below set the device model and admission limits. Service time
+// is computed per data operation as max(bytes/bytesPerSecond, 1/iops), then
+// summed for linked chains. Coordinators decide dispatch and rejection; Submit
+// only observes the rejection state and never queues a rejected request.
+// A non-positive rate keeps its default; a non-positive limit or latency goal
+// disables it. MustAdmit submissions bypass all of them. POSIX ignores them.
+
+// WithReadBandwidth sets the device's read bandwidth in bytes per second.
+func WithReadBandwidth(bytesPerSecond int64) DiskPolicyOption {
+	return func(p *DiskPolicy) { setRate(&p.device.reads.bytesPerSecond, bytesPerSecond) }
+}
+
+// WithReadIOPS sets the device's read operations per second at small sizes.
+func WithReadIOPS(iops int64) DiskPolicyOption {
+	return func(p *DiskPolicy) { setRate(&p.device.reads.iops, iops) }
+}
+
+// WithWriteBandwidth sets the device's write bandwidth in bytes per second.
+func WithWriteBandwidth(bytesPerSecond int64) DiskPolicyOption {
+	return func(p *DiskPolicy) { setRate(&p.device.writes.bytesPerSecond, bytesPerSecond) }
+}
+
+// WithWriteIOPS sets the device's write operations per second at small sizes.
+func WithWriteIOPS(iops int64) DiskPolicyOption {
+	return func(p *DiskPolicy) { setRate(&p.device.writes.iops, iops) }
+}
+
+func setRate(rate *int64, value int64) {
+	if value > 0 {
+		*rate = value
+	}
+}
+
+// WithLatencyGoal caps the modeled service time of dispatched reads and of
+// dispatched writes, each class separately, across all rings sharing the
+// policy. A coordinator queues work that does not fit, except that it always
+// dispatches when it has none of that class in flight itself. A blocked ring
+// therefore always has its own completion to wake it, its wait is bounded by
+// its own I/O, and the cap is exceeded by at most one chain per ring. A ring
+// places work in acceptance order, so work behind a waiting request waits too;
+// give reads and writes separate schedulers to keep them independent.
+// Default: DefaultLatencyGoal.
+func WithLatencyGoal(goal time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) {
+		p.device.reads.latency = max(0, goal)
+		p.device.writes.latency = max(0, goal)
+	}
+}
+
+// WithoutReadIOBudget admits reads without charging the I/O budget. Writes
+// retain their configured budget. Ring capacity and operation ordering still apply.
+func WithoutReadIOBudget() DiskPolicyOption {
+	return func(p *DiskPolicy) { p.device.reads.latency = 0 }
+}
+
+// WithoutIOBudget disables in-flight service-time limits.
+func WithoutIOBudget() DiskPolicyOption {
+	return WithLatencyGoal(0)
+}
+
+// WithWriteBacklogLimit closes write admission while the modeled service
+// time of accepted, unfinished writes is at least limit. It bounds how long an
+// admitted write can queue: about limit at the modeled bandwidth. Each write in
+// a chain counts through ticket completion, including Durable sync. Staged work
+// can overshoot before a coordinator observes it. Default: disabled.
+func WithWriteBacklogLimit(limit time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) { p.writeBudget.limit = int64(max(0, limit)) }
+}
+
+// WithWriteBacklogRecovery makes reaching the write backlog limit close write
+// admission for a timed pause, backlog minus target: the modeled time to drain
+// to target. Zero targets a full drain; a negative target (the default)
+// disables timed recovery, and the circuit reopens as soon as the backlog falls
+// below the limit. It requires a write backlog limit.
+func WithWriteBacklogRecovery(target time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) { p.writeBudget.recovery = int64(max(-1, target)) }
+}
+
+// WithReadBacklogLimit is the read counterpart of WithWriteBacklogLimit.
+func WithReadBacklogLimit(limit time.Duration) DiskPolicyOption {
+	return func(p *DiskPolicy) { p.readBudget.limit = int64(max(0, limit)) }
+}
+
 // ringInFlight is one coordinator's dispatched, unfinished service time per
 // class. Only that coordinator touches it.
 type ringInFlight struct {
@@ -253,14 +356,20 @@ func (p *DiskPolicy) completeIO(work *submission, op *operation, ring *ringInFli
 	switch op.kind() {
 	case OpRead, OpReadv:
 		if work.reads.inFlight > 0 {
-			elapsed := p.device.reads.operationTime(op)
+			elapsed := work.reads.inFlight // placeNVMe consumes its op's buffer.
+			if len(work.linked) != 0 {
+				elapsed = p.device.reads.operationTime(op)
+			}
 			work.reads.inFlight -= elapsed
 			ring.reads -= elapsed
 			p.readBudget.inFlight.Add(-elapsed)
 		}
 	case OpWrite, OpWritev:
 		if work.writes.inFlight > 0 {
-			elapsed := p.device.writes.operationTime(op)
+			elapsed := work.writes.inFlight
+			if len(work.linked) != 0 {
+				elapsed = p.device.writes.operationTime(op)
+			}
 			work.writes.inFlight -= elapsed
 			ring.writes -= elapsed
 			p.writeBudget.inFlight.Add(-elapsed)

@@ -132,6 +132,7 @@ const (
 	rawSQNeedWakeup      rawSQFlags      = 0x1
 	rawSQCQOverflow      rawSQFlags      = 0x2
 	rawSQTaskrun         rawSQFlags      = 0x4
+	rawUringCmdFixed     uint32          = 0x1
 	rawEnterGetEvents    rawEnterFlags   = 0x1
 	rawEnterSQWakeup     rawEnterFlags   = 0x2
 

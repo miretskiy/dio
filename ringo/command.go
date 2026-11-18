@@ -43,6 +43,8 @@ type uringCmdOp struct {
 	payload       [80]byte
 	buffers       []CommandBuffer
 	inlineBuffers [2]CommandBuffer
+	registered    FixedBuffer
+	fixed         bool
 }
 
 // UringCmd prepares a device request for a Ring created WithUringCmd.
@@ -56,7 +58,21 @@ type uringCmdOp struct {
 // Completion.Result preserves driver-specific positive results; negative Linux
 // errors populate Completion.Err.
 func UringCmd(fd FD, driverOp uint32, payload []byte, buffers []CommandBuffer, options ...OpOption) Op {
-	op := optionAlloc(options).newUringCmdOp()
+	return newUringCmdOp(optionAlloc(options), fd, driverOp, payload, buffers, FixedBuffer{}, false)
+}
+
+// UringCmdFixed is UringCmd for a command whose data lies in a registered
+// buffer: the driver maps registered's entry instead of pinning user pages for
+// each command. Every nonempty buffer must lie within registered's entry, and
+// the driver must support IORING_URING_CMD_FIXED, as NVMe does for its data
+// buffer.
+func UringCmdFixed(fd FD, driverOp uint32, payload []byte, buffers []CommandBuffer, registered FixedBuffer, options ...OpOption) Op {
+	return newUringCmdOp(optionAlloc(options), fd, driverOp, payload, buffers, registered, true)
+}
+
+func newUringCmdOp(alloc *OpAlloc, fd FD, driverOp uint32, payload []byte, buffers []CommandBuffer, registered FixedBuffer, fixed bool) Op {
+	op := alloc.newUringCmdOp()
+	op.registered, op.fixed = registered, fixed
 	op.fd, op.driverOp = fd, driverOp
 	copy(op.payload[:], payload)
 	if len(payload) > len(op.payload) {
@@ -93,11 +109,25 @@ func (op *uringCmdOp) validate(ring *Ring) error {
 	if ring.backend.flags&(rawSetupSQE128|rawSetupCQE32) != rawSetupSQE128|rawSetupCQE32 {
 		return errors.New("ringo: UringCmd requires WithUringCmd")
 	}
+	if op.fixed {
+		if err := op.registered.validate(ring); err != nil {
+			return err
+		}
+		for _, b := range op.buffers {
+			if len(b.Buffer) != 0 && !op.registered.contains(b.Buffer) {
+				return errNotRegistered
+			}
+		}
+	}
 	return op.fd.validate(ring)
 }
 func (op *uringCmdOp) prepare(sqe *rawSQE) {
 	fd, flags := op.fd.sqe()
 	*sqe = rawSQE{Opcode: uint8(rawOpUringCmd), Fd: fd, Flags: uint8(flags | op.sqeFlags)}
+	if op.fixed {
+		sqe.Rw_flags = int32(rawUringCmdFixed) // The SQE's uring_cmd_flags.
+		sqe.Buf_index = op.registered.index
+	}
 	binary.NativeEndian.PutUint32(unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(sqe), 8)), 4), op.driverOp)
 	payload := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(sqe), 48)), 80)
 	copy(payload, op.payload[:])

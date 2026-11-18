@@ -11,10 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/miretskiy/dio/v2/internal/buildutil"
 	"github.com/miretskiy/dio/v2/ringo"
+	"golang.org/x/sys/unix"
 )
 
 // IOUringAvailable reports whether the running kernel provides the io_uring
@@ -31,7 +30,7 @@ type slotKind uint8
 const (
 	// slotOperation is one operation of a caller's chain, placed as submitted.
 	slotOperation slotKind = iota
-	// slotNVMePart contributes to one logical operation in a split submission.
+	// slotNVMePart is one command of an NVMe operation placed by placeNVMe.
 	slotNVMePart
 	// slotCoalescedWrite is the one write placed for a coalesced run of
 	// writes, split back into each member's result.
@@ -53,8 +52,7 @@ type ringSlot struct {
 	work       *submission     // the work the operation belongs to, or a coalesced run's leader
 	op         *operation      // the operation, for slotOperation
 	batch      submissionQueue // the durable writes an fdatasync covers, for slotSync
-	partOffset int             // Byte offset within a split logical operation.
-	partLength int             // Bytes transferred by this command.
+	partOffset int             // Logical byte offset of a slotNVMePart command.
 }
 
 var stagingClosed submission
@@ -135,7 +133,7 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	data := cfg.dmaBuffers
 	cfg.dmaBuffers = nil
 
-	ringOptions := []ringo.Option{ringo.WithDepth(cfg.ringDepth)}
+	ringOptions := []ringo.Option{ringo.WithDepth(nvmeQueueDepth(cfg.ringDepth, cfg.nvmeDevices))}
 	if cfg.sqPoll {
 		ringOptions = append(ringOptions, ringo.WithSQPoll())
 	}
@@ -153,7 +151,8 @@ func NewURingScheduler(opts ...Option) (*URingScheduler, error) {
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("iosched: io_uring_setup: %w", err), unix.Close(doorbellFD))
 	}
-	cfg.ringDepth = uint32(ring.Capacity())
+	// The kernel rounds the ring up to a power of two; slots stay within the queue.
+	cfg.ringDepth = nvmeQueueDepth(uint32(ring.Capacity()), cfg.nvmeDevices)
 	// The setup failures below have their own error to report; a failure to
 	// release the half-built ring or doorbell is joined to it.
 	abandon := func(err error) error {
@@ -231,8 +230,8 @@ func (s *URingScheduler) prepareSubmission(op *Op) (*submission, error) {
 			if err := s.validateNVMe(current); err != nil {
 				return nil, err
 			}
-			if (opBytes(current) > nvmeCommandLimit(current.nvme) || len(current.allocations) != 0) && work.nvmeSplit == nil {
-				work.nvmeSplit = new(nvmeSplit)
+			if splitNVMe(current) && work.opCount() > 1 {
+				return nil, fmt.Errorf("iosched: an NVMe operation needing several commands cannot be linked")
 			}
 		}
 		if current.isVirtual() {
@@ -394,17 +393,13 @@ type coordinator struct {
 	// accepted holds every accepted submission until its ticket completes.
 	accepted submissionQueue
 	// ready holds the accepted work eligible for placement, oldest first. Work
-	// waiting for a barrier stays out of it until the barrier releases it.
+	// waiting for a barrier stays out of it until the barrier releases it. An
+	// NVMe operation stays at its head until its last command is placed.
 	ready submissionQueue
 	// inFlight is this ring's dispatched service time per class. A class with
 	// none in flight always dispatches, so blocked work always has an own
 	// completion coming that ends the coordinator's wait.
-	inFlight ringInFlight
-	// readyClasses counts ready work by the classes it charges at dispatch,
-	// indexed by dispatchClass, so placement stops scanning once nothing left
-	// in the ready queue can dispatch.
-	readyClasses [4]int
-
+	inFlight       ringInFlight
 	vfiles         []uint64 // bitmap of slots reserved through AllocateVFD
 	nextVFile      int      // first bitmap word to search
 	reservedVFiles uint32   // initial WithFiles prefix, excluded from allocation
@@ -433,7 +428,6 @@ func newCoordinator(s *URingScheduler) *coordinator {
 		ring:     s.ring,
 		slots:    make([]ringSlot, s.config.ringDepth),
 		accepted: submissionQueue{links: acceptedLinks},
-		ready:    submissionQueue{links: placementLinks},
 		files:    newFileTable(s.config.vfiles),
 	}
 	c.initVFiles(s.config.vfiles)
@@ -445,9 +439,10 @@ func newCoordinator(s *URingScheduler) *coordinator {
 }
 
 func (s *URingScheduler) loop(c *coordinator) {
-	runtime.LockOSThread()
-	// Exit locked so the runtime cannot reuse a thread with restricted affinity.
 	if cpu := s.config.coordinatorCPU; cpu >= 0 {
+		// Affinity belongs to a thread. Exit locked so the runtime cannot reuse
+		// a thread with restricted affinity.
+		runtime.LockOSThread()
 		var set unix.CPUSet
 		set.Set(cpu)
 		if err := unix.SchedSetaffinity(0, &set); err != nil {
@@ -664,80 +659,39 @@ func (c *coordinator) placeReady(coalesce bool) (placed int, room bool) {
 		return c.occupied - start, false
 	}
 
-	readsBlocked, writesBlocked := false, false
-	for work := c.ready.head; work != nil; {
+	// Work dispatches in acceptance order: a head that does not fit the ring
+	// or its class's in-flight allowance ends the pass. Rings that segregate
+	// reads from writes keep a write waiting for allowance from holding up reads.
+	for work := c.ready.head; work != nil; work = c.ready.head {
 		need := work.opCount()
-		resuming := work.nvmeSplit != nil && work.nvmeSplit.started
+		resuming := work.state == workIssued // An NVMe operation with commands placed.
 		if work.err != nil && !resuming {
 			need-- // The failed open completes without an SQE.
 			if work.root.sqeFlags&sqeHardLink == 0 {
 				need = 0
 			}
 		}
-		if work.nvmeSplit != nil && need > 1 {
-			need = 1 // A split chain starts with a bounded batch of one operation.
-		}
 		if need > free() {
 			return c.occupied - start, false
 		}
-		class := work.dispatchClass()
-		blocked := (readsBlocked && class&chargesReads != 0) || (writesBlocked && class&chargesWrites != 0)
-		if blocked || (!resuming && !c.sched.config.disk.dispatch(work, &c.inFlight)) {
-			readsBlocked = readsBlocked || class&chargesReads != 0
-			writesBlocked = writesBlocked || class&chargesWrites != 0
-			if !c.readyCanDispatch(readsBlocked, writesBlocked) {
-				break
-			}
-			work = c.ready.next(work)
-			continue
+		if !resuming && !c.sched.config.disk.dispatch(work, &c.inFlight) {
+			break
 		}
 		run := 1
 		if coalesce {
 			run = c.coalescedRun(work)
 		}
 		if run > 1 {
-			work = c.placeCoalescedRun(work, run)
+			c.placeCoalescedRun(work, run)
 		} else {
-			work = c.placeChain(work)
+			c.placeChain(work)
 		}
 	}
 	return c.occupied - start, free() > 0
 }
 
-// dispatchClass bits say which classes a submission charges at dispatch.
-const (
-	chargesReads  = 1 << 0
-	chargesWrites = 1 << 1
-)
-
-func (work *submission) dispatchClass() int {
-	if work.nvmeSplit != nil && work.nvmeSplit.started {
-		return 0 // Continuations retain the original dispatch allowance.
-	}
-	class := 0
-	if work.reads.inFlight > 0 {
-		class |= chargesReads
-	}
-	if work.writes.inFlight > 0 {
-		class |= chargesWrites
-	}
-	return class
-}
-
-// readyCanDispatch reports whether any ready work charges only unblocked
-// classes. Blocked classes stay blocked for the rest of a pass, so once this
-// is false no later ready work can dispatch in it either.
-func (c *coordinator) readyCanDispatch(readsBlocked, writesBlocked bool) bool {
-	n := &c.readyClasses
-	return n[0] > 0 ||
-		(n[chargesReads] > 0 && !readsBlocked) ||
-		(n[chargesWrites] > 0 && !writesBlocked) ||
-		(n[chargesReads|chargesWrites] > 0 && !readsBlocked && !writesBlocked)
-}
-
 // take removes work from the ready queue and marks it issued.
 func (c *coordinator) take(work *submission) {
-	c.readyClasses[work.dispatchClass()]--
 	c.ready.remove(work)
 	work.state = workIssued
 }
@@ -782,34 +736,29 @@ func ringoLinkType(op *operation) ringo.LinkType {
 }
 
 // placeChain places a whole chain, preserving its soft/hard link boundaries.
-func (c *coordinator) placeChain(work *submission) (next *submission) {
-	next = c.ready.next(work)
+func (c *coordinator) placeChain(work *submission) {
+	if work.state == workIssued || splitNVMe(&work.root) {
+		c.placeNVMe(work)
+		return
+	}
 	c.take(work)
 	start := 0
-	if work.err != nil && (work.nvmeSplit == nil || !work.nvmeSplit.started) {
+	if work.err != nil {
 		start = c.finishFailedOpen(work)
 		if start == work.opCount() {
-			return next
+			return
 		}
-	}
-	if work.nvmeSplit != nil {
-		if !work.nvmeSplit.started {
-			work.nvmeSplit.index = start
-			work.nvmeSplit.started = true
-		}
-		c.placeNVMeParts(work)
-		return next
 	}
 	first := c.translateOp(work.op(start))
 	if start+1 == work.opCount() {
 		handle, err := c.ring.Push(first)
 		if err != nil {
 			c.failPlacement(work, start, err)
-			return next
+			return
 		}
 		work.markIssued()
 		c.place(handle, ringSlot{kind: slotOperation, work: work, op: work.op(start)})
-		return next
+		return
 	}
 	var storage [maxChainLength - 1]ringo.Link
 	links := storage[:0]
@@ -819,13 +768,12 @@ func (c *coordinator) placeChain(work *submission) (next *submission) {
 	handles, err := c.ring.PushLinked(first, links[0], links[1:]...)
 	if err != nil {
 		c.failPlacement(work, start, err)
-		return next
+		return
 	}
 	work.markIssued()
 	for i, handle := range handles {
 		c.place(handle, ringSlot{kind: slotOperation, work: work, op: work.op(start + i)})
 	}
-	return next
 }
 
 func (c *coordinator) failPlacement(work *submission, first int, err error) {
@@ -846,18 +794,17 @@ func (c *coordinator) finishFailedOpen(work *submission) int {
 }
 
 // placeCoalescedRun places the run ready entries starting at first, adjacent
-// writes to contiguous ranges of one file, as one writev of their buffers, and
-// returns the ready work after them. The members stay linked from the leader
-// through staged, in writev order, so the one completion can be split back
-// into each member's result.
-func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submission) {
+// writes to contiguous ranges of one file, as one writev of their buffers. The
+// members stay linked from the leader through staged, in writev order, so the
+// one completion can be split back into each member's result.
+func (c *coordinator) placeCoalescedRun(first *submission, run int) {
 	if c.coalesceBuffers == nil {
 		c.coalesceBuffers = make([][]byte, maxCoalescedWrites)
 	}
 	bufs := c.coalesceBuffers[:run]
 	leader := first
 	var last *submission
-	next = first
+	next := first
 	for i := range bufs {
 		member := next
 		next = c.ready.next(member)
@@ -875,13 +822,12 @@ func (c *coordinator) placeCoalescedRun(first *submission, run int) (next *submi
 	clear(bufs) // Ringo copied the list; do not retain the callers' buffers.
 	if err != nil {
 		c.finishWrite(leader, 0, err)
-		return next
+		return
 	}
 	for member := leader; member != nil; member = member.staged {
 		member.completion.markIssued()
 	}
 	c.place(ringHandle, ringSlot{kind: slotCoalescedWrite, work: leader})
-	return next
 }
 
 // placeSync places one fdatasync for the durable writes waiting on state's
@@ -904,7 +850,7 @@ func (c *coordinator) translateOp(op *operation) ringo.Op {
 	}
 	recycle := ringo.WithAlloc(&c.alloc)
 	if op.isNVMe() {
-		return translateNVMe(op, recycle)
+		return c.translateNVMe(op)
 	}
 	var direct ringo.FixedFile
 	fd := ringo.FileFD(op.f)
@@ -1142,7 +1088,7 @@ func (c *coordinator) finishWrite(leader *submission, n int, err error) {
 // durable write that succeeded then waits for its file's next fdatasync; one
 // that failed has nothing to make durable, so its fdatasync is retired with it.
 func (c *coordinator) finishOperation(work *submission, op *operation, n int, err error) {
-	if errors.Is(err, syscall.EAGAIN) && !op.isNVMe() && work.nvmeSplit == nil && len(work.linked) == 0 &&
+	if errors.Is(err, syscall.EAGAIN) && !op.isNVMe() && len(work.linked) == 0 &&
 		(op.kind() == OpRead || op.kind() == OpReadv) && c.sched.stopCause() == nil {
 		// Keep the ticket, buffer, backlog and file pin until the read finishes.
 		// Return this attempt's allowance; normal placement claims it again.
@@ -1232,10 +1178,7 @@ func (c *coordinator) operationDone(work *submission, op *operation) {
 // treat as an unknown outcome rather than a clean failure. Only a drain that
 // gave up leaves placed work behind.
 func (c *coordinator) failRemaining(staged *submission, unplaced, placed error) {
-	for c.ready.len != 0 {
-		c.ready.pop()
-	}
-	c.readyClasses = [4]int{}
+	c.ready = submissionQueue{}
 	for c.accepted.len != 0 {
 		work := c.accepted.pop()
 		// Work in a file's sync batch is still linked there; the table goes
@@ -1264,6 +1207,23 @@ func (c *coordinator) makeReady(work *submission) {
 		buildutil.Assert(work.state == workWaiting)
 	}
 	work.state = workReady
-	c.readyClasses[work.dispatchClass()]++
 	c.ready.push(work)
+}
+
+// coalescibleWrite reports whether o may be merged into a writev: a standalone
+// plain positioned write. Fixed-buffer and caller-linked writes stay intact.
+func (o *operation) coalescibleWrite() bool {
+	return o.kind() == OpWrite && !o.isFixed() && !o.isNVMe() && !o.isLinked()
+}
+
+// sameFile reports whether a and b address the same file: the same virtual
+// slot, or the same *os.File.
+func sameFile(a, b *operation) bool {
+	if a.isVirtual() != b.isVirtual() {
+		return false
+	}
+	if a.isVirtual() {
+		return a.vfd == b.vfd
+	}
+	return a.f == b.f
 }

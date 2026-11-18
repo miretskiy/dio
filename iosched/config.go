@@ -3,7 +3,8 @@ package iosched
 import (
 	"os"
 	"slices"
-	"time"
+
+	"github.com/miretskiy/dio/v2/nvme"
 )
 
 const defaultRingDepth uint32 = 256
@@ -15,10 +16,11 @@ const doorbellSlots = 1
 const minRingDepth = maxChainLength + doorbellSlots
 
 type schedulerConfig struct {
-	coordinatorCPU int // negative leaves affinity unchanged
+	coordinatorCPU int // negative: an ordinary goroutine
 	ringDepth      uint32
 	sqPoll         bool
 	nvmeCommands   bool
+	nvmeDevices    []*nvme.Device // bound the ring depth by their queue depth
 	vfiles         uint32
 	files          []*os.File
 	coalescing     bool
@@ -82,11 +84,13 @@ func WithFiles(files ...*os.File) Option {
 	return optionFunc(func(c *schedulerConfig) { c.files = files })
 }
 
-// WithCoordinatorCPU requests best-effort affinity for the io_uring coordinator.
-// A negative CPU (the default) leaves affinity unchanged. Affinity failures are logged; I/O
-// continues on the dedicated OS thread without the requested affinity.
-// This pins the userspace coordinator, not kernel workers or device IRQs.
-// The POSIX backend ignores this option.
+// WithCoordinatorCPU runs the io_uring coordinator on a dedicated OS thread
+// with best-effort affinity to cpu. A negative CPU (the default) leaves it an
+// ordinary goroutine. The dedicated thread costs a thread handoff each time an
+// idle coordinator wakes: about twice the CPU per I/O at queue depth one, with
+// no throughput gain at depths 32 and 128 on the measured host. Affinity
+// failures are logged and I/O continues. This pins the userspace coordinator,
+// not kernel workers or device IRQs. The POSIX backend ignores this option.
 func WithCoordinatorCPU(cpu int) Option {
 	return optionFunc(func(c *schedulerConfig) { c.coordinatorCPU = cpu })
 }
@@ -109,8 +113,16 @@ func WithSQPOLL() Option {
 // entries. Ordinary file operations can share this scheduler.
 // RawNVMeCmdOp can submit I/O and Admin NVMe commands through the same extended ring.
 // The POSIX backend reports EOPNOTSUPP when an NVMe operation is submitted.
-func WithNVMeCommands() Option {
-	return optionFunc(func(c *schedulerConfig) { c.nvmeCommands = true })
+//
+// The ring depth stays within the QueueDepth of each device listed, so the
+// commands in flight fit one hardware queue and are issued inline. Commands
+// beyond a full queue still complete, but each waits in an io_uring worker
+// thread. Rings sharing a device share its queues.
+func WithNVMeCommands(devices ...*nvme.Device) Option {
+	return optionFunc(func(c *schedulerConfig) {
+		c.nvmeCommands = true
+		c.nvmeDevices = append(c.nvmeDevices, devices...)
+	})
 }
 
 // WithCoalescing controls whether contiguous same-file writes are merged into
@@ -119,10 +131,16 @@ func WithCoalescing(enabled bool) Option {
 	return optionFunc(func(c *schedulerConfig) { c.coalescing = enabled })
 }
 
-// WithDMABuffers registers each supplied region as one fixed buffer before the
-// io_uring coordinator starts, such as the Bytes of an alloc.Memory. The caller
-// keeps every region mapped and unchanged in place until the scheduler has
-// closed successfully, including between I/O operations.
+// WithDMABuffers registers supplied regions before the io_uring coordinator
+// starts, such as allocator.Region() or the Bytes of an alloc.Memory. Regions
+// larger than 1 GiB are split into registration entries automatically. Total
+// registered memory is limited to 32 GiB per ring.
+// ReadFixedOp and WriteFixedOp require a buffer inside one registration entry.
+// NVMe commands whose data lies inside one registration entry use it, which
+// spares the driver pinning their pages for each command; others use ordinary
+// data addresses.
+// The caller keeps every region mapped and unchanged in place until the
+// scheduler has closed successfully, including between I/O operations.
 //
 // The region list is copied. Repeated options replace the list; an empty list
 // disables registration.
@@ -132,105 +150,4 @@ func WithDMABuffers(buffers ...[]byte) Option {
 	return optionFunc(func(c *schedulerConfig) {
 		c.dmaBuffers = buffers
 	})
-}
-
-// DiskPolicyOption configures a DiskPolicy's device model or admission limits.
-type DiskPolicyOption func(*DiskPolicy)
-
-// NewDiskPolicy creates a device model and the admission accounting shared by
-// the schedulers it is passed to.
-func NewDiskPolicy(opts ...DiskPolicyOption) *DiskPolicy {
-	p := &DiskPolicy{
-		readBudget:  ioBudget{recovery: -1},
-		writeBudget: ioBudget{recovery: -1},
-		device: deviceConfig{
-			reads:  deviceIO{bytesPerSecond: DefaultReadBandwidth, iops: DefaultReadIOPS, latency: DefaultLatencyGoal},
-			writes: deviceIO{bytesPerSecond: DefaultWriteBandwidth, iops: DefaultWriteIOPS, latency: DefaultLatencyGoal},
-		},
-	}
-	for _, opt := range opts {
-		opt(p)
-	}
-	return p
-}
-
-// The options below set the device model and admission limits. Service time
-// is computed per data operation as max(bytes/bytesPerSecond, 1/iops), then
-// summed for linked chains. Coordinators decide dispatch and rejection; Submit
-// only observes the rejection state and never queues a rejected request.
-// A non-positive rate keeps its default; a non-positive limit or latency goal
-// disables it. MustAdmit submissions bypass all of them. POSIX ignores them.
-
-// WithReadBandwidth sets the device's read bandwidth in bytes per second.
-func WithReadBandwidth(bytesPerSecond int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { setRate(&p.device.reads.bytesPerSecond, bytesPerSecond) }
-}
-
-// WithReadIOPS sets the device's read operations per second at small sizes.
-func WithReadIOPS(iops int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { setRate(&p.device.reads.iops, iops) }
-}
-
-// WithWriteBandwidth sets the device's write bandwidth in bytes per second.
-func WithWriteBandwidth(bytesPerSecond int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { setRate(&p.device.writes.bytesPerSecond, bytesPerSecond) }
-}
-
-// WithWriteIOPS sets the device's write operations per second at small sizes.
-func WithWriteIOPS(iops int64) DiskPolicyOption {
-	return func(p *DiskPolicy) { setRate(&p.device.writes.iops, iops) }
-}
-
-func setRate(rate *int64, value int64) {
-	if value > 0 {
-		*rate = value
-	}
-}
-
-// WithLatencyGoal caps the modeled service time of dispatched reads and of
-// dispatched writes, each class separately, across all rings sharing the
-// policy. A coordinator queues work that does not fit, except that it always
-// dispatches when it has none of that class in flight itself. A blocked ring
-// therefore always has its own completion to wake it, its wait is bounded by
-// its own I/O, and the cap is exceeded by at most one chain per ring.
-// Default: DefaultLatencyGoal.
-func WithLatencyGoal(goal time.Duration) DiskPolicyOption {
-	return func(p *DiskPolicy) {
-		p.device.reads.latency = max(0, goal)
-		p.device.writes.latency = max(0, goal)
-	}
-}
-
-// WithoutReadIOBudget admits reads without charging the I/O budget. Writes
-// retain their configured budget. Ring capacity and operation ordering still apply.
-func WithoutReadIOBudget() DiskPolicyOption {
-	return func(p *DiskPolicy) { p.device.reads.latency = 0 }
-}
-
-// WithoutIOBudget disables in-flight service-time limits.
-func WithoutIOBudget() DiskPolicyOption {
-	return WithLatencyGoal(0)
-}
-
-// WithWriteBacklogLimit closes write admission while the modeled service
-// time of accepted, unfinished writes is at least limit. It bounds how long an
-// admitted write can queue: about limit at the modeled bandwidth. Each write in
-// a chain counts through ticket completion, including Durable sync. Staged work
-// can overshoot before a coordinator observes it. Default: disabled.
-func WithWriteBacklogLimit(limit time.Duration) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.writeBudget.limit = int64(max(0, limit)) }
-}
-
-// WithWriteBacklogRecovery makes reaching the write backlog limit close write
-// admission for a timed pause, backlog minus target: the modeled time to drain
-// to target. Zero targets a full drain; a negative target (the default)
-// disables timed recovery, and the circuit reopens as soon as the backlog falls
-// below the limit. It requires a write backlog limit.
-func WithWriteBacklogRecovery(target time.Duration) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.writeBudget.recovery = int64(max(-1, target)) }
-}
-
-// WithReadBacklogLimit is the read counterpart of WithWriteBacklogLimit.
-func WithReadBacklogLimit(limit time.Duration) DiskPolicyOption {
-	return func(p *DiskPolicy) { p.readBudget.limit = int64(max(0, limit)) }
 }

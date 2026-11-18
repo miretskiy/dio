@@ -58,6 +58,7 @@ const (
 	rawSQNeedWakeup      rawSQFlags      = C.IORING_SQ_NEED_WAKEUP
 	rawSQCQOverflow      rawSQFlags      = C.IORING_SQ_CQ_OVERFLOW
 	rawSQTaskrun         rawSQFlags      = C.IORING_SQ_TASKRUN
+	rawUringCmdFixed     uint32          = C.IORING_URING_CMD_FIXED
 	rawEnterGetEvents    rawEnterFlags   = C.IORING_ENTER_GETEVENTS
 	rawEnterSQWakeup     rawEnterFlags   = C.IORING_ENTER_SQ_WAKEUP
 
